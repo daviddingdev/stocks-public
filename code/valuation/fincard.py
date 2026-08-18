@@ -228,7 +228,15 @@ def resolve_cik(tk, override=None):
     except Exception:
         raw = _get("https://www.sec.gov/files/company_tickers.json")
         m = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in raw.values()}
-    for cand in (tk, tk[:-1] + "A", tk[:-1] + "K", tk[:-1] + "B", tk[:-1]):
+    # The EXACT ticker is always tried, whatever its length. The `>= 2` guard below exists
+    # for the DERIVED fallbacks (a class-share guess like tk[:-1] on a 2-letter ticker is a
+    # 1-character shot in the dark), and applying it to the exact ticker too meant no
+    # one-letter ticker could ever resolve. `L` is Loews Corp, CIK 60086, an S&P 500 name
+    # the Bench surfaced with evidence — it failed to card every night, silently, as
+    # "no CIK".
+    if m.get(tk):
+        return m[tk]
+    for cand in (tk[:-1] + "A", tk[:-1] + "K", tk[:-1] + "B", tk[:-1]):
         if len(cand) >= 2 and m.get(cand):
             return m[cand]
     raise SystemExit(f"{tk}: no CIK (pass --cik N)")
