@@ -135,22 +135,22 @@ def run():
     state = _j(STATE_F, {})
 
     # --- position context: who holds what, in which book, at what weight ---
-    brokera_pos = {t: m for t, m in _j(CONF / "positions.json", {}).items() if (m.get("shares") or 0) > 0}
-    brokera_total = _j(CONF / "account.json", {}).get("total_value") or 0
+    jpm_pos = {t: m for t, m in _j(CONF / "positions.json", {}).items() if (m.get("shares") or 0) > 0}
+    jpm_total = _j(CONF / "account.json", {}).get("total_value") or 0
     ag_pf = _j(DATA / "portfolio.json", {})
     ag_pos = {p["symbol"]: p for p in ag_pf.get("positions", []) if p.get("symbol")}
     ag_total = ag_pf.get("total_value") or 0
-    held = list(dict.fromkeys(list(brokera_pos) + list(ag_pos)))
+    held = list(dict.fromkeys(list(jpm_pos) + list(ag_pos)))
     fired = 0
 
     def impact(tk, price, prev):
         """One line, both books: '<book> <value> (<share of total>), day <change>' each."""
         parts, books = [], []
-        if tk in brokera_pos:
-            sh = brokera_pos[tk].get("shares") or 0
+        if tk in jpm_pos:
+            sh = jpm_pos[tk].get("shares") or 0
             v = sh * price
             day = sh * (price - prev)
-            w = f" ({v / brokera_total * 100:.1f}% of book)" if brokera_total else ""
+            w = f" ({v / jpm_total * 100:.1f}% of book)" if jpm_total else ""
             parts.append(f"BROKERA ${v / 1000:,.1f}k{w}, day {'-' if day < 0 else '+'}${abs(day):,.0f}")
             books.append("BROKERA")
         if tk in ag_pos:
@@ -228,7 +228,7 @@ def run():
     # held names get a direct calendar query so David's earnings alerts survive.
     earn_rows = list(feed.get("earnings", []))
     feed_syms = {e.get("symbol") for e in earn_rows}
-    for tk in brokera_pos:
+    for tk in jpm_pos:
         if tk in feed_syms:
             continue
         resp = feeds.fh_get("calendar/earnings", symbol=tk,
@@ -328,7 +328,7 @@ def run():
 
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "
-          f"({len(brokera_pos)} brokera, {len(ag_pos)} agent holdings watched)")
+          f"({len(jpm_pos)} brokera, {len(ag_pos)} agent holdings watched)")
 
 
 if __name__ == "__main__":
