@@ -124,11 +124,15 @@ before any order, preview before place, every decision journalled. The carve-out
 test whether the process holds when nobody is checking each step; it does not loosen the
 rule on the main book, and the two never share a code path.
 
-## The code
+## Read next
 
-Four components in [`code/`](code/), copied verbatim: the valuation toolkit, the
-terms-extraction pass with the verbatim-quote guardrail, the filing navigation indexer,
-and the local news scorer. See [`code/README.md`](code/README.md).
+- **[METHOD.md](METHOD.md)** — how a name gets from "something looks odd" to a decision,
+  and the rules that stop the process fooling itself. The code is downstream of these.
+- **[AGENT.md](AGENT.md)** — the autonomous carve-out: its non-negotiables, and the
+  org-chart design that has free overnight staff prepare the expensive session's desk.
+- **[`code/`](code/)** — thirteen components, ~3,200 lines, copied verbatim from the
+  private repo and **re-copied automatically every day**, so this tracks what actually
+  runs rather than what I remembered to paste. See [`code/README.md`](code/README.md).
 
 ## Stack
 
