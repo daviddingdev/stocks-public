@@ -36,11 +36,32 @@ signal that it is testing rather than agreeing with whoever wrote it.
 
 ## The pipeline
 
-```
-sourcing → evidence pack → teardown → adversarial review → recommendation
-              ↑                             ↓
-        local models                 overturned / hardened
-     (navigation + extraction)       claims, with citations
+```mermaid
+flowchart TB
+  S["sourcing<br/><small>by mechanism, not by screen</small>"]:::h
+  E["evidence pack<br/><small>primary filings, byte offsets, index</small>"]:::c
+  L["local models<br/><small>navigation notes · pre-digest · news scoring</small>"]:::ai
+  T["teardown<br/><small>independent model, explicit bear case</small>"]:::ai
+  R["adversarial review<br/><small>attack every claim against the filings</small>"]:::adv
+  V{"survives?"}:::d
+  W["hardened / overturned<br/>with citations"]:::c
+  REC["recommendation"]:::out
+  G[["code guardrails<br/><small>verbatim-quote check · code does every comparison</small>"]]:::g
+
+  S --> E --> T --> R --> V
+  E --> L -->|"additive only, never a filter"| T
+  V -->|"no"| W --> T
+  V -->|"yes"| REC
+  G -.->|"enforced on"| T
+  G -.->|"enforced on"| R
+
+  classDef h fill:#5c4a1f,stroke:#fab219,color:#fdf3d9
+  classDef c fill:#1f3a5c,stroke:#3987e5,color:#e8f0fb
+  classDef ai fill:#3b2a5c,stroke:#9d7be8,color:#f0eafd
+  classDef adv fill:#5c1f1f,stroke:#e53987,color:#fbe8f0
+  classDef d fill:#2e2e2c,stroke:#8a897f,color:#c3c2b7
+  classDef out fill:#1f4a1f,stroke:#0ca30c,color:#e3f7e3
+  classDef g fill:#123f46,stroke:#2ba8b8,color:#dff5f8
 ```
 
 **Sourcing by mechanism, never by screen.** The question is always *who is selling for a
@@ -65,6 +86,25 @@ none — confidently, in the exact format the pipeline expected. It was rejected
 spot, and every local model since is benchmarked with a grep-verifiable test: **every
 figure it emits must appear verbatim in the text it was given.**
 
+The guardrail that matters most, drawn as it actually runs — the model never gets to
+assert a number, only to point at one:
+
+```mermaid
+sequenceDiagram
+  participant J as job (plain code)
+  participant M as local model
+  participant S as source text
+  J->>M: extract the figures / claims from this slice
+  M-->>J: structured JSON + a verbatim quote per claim
+  J->>S: does that quote appear, character for character?
+  alt quote not found
+    J->>J: drop the claim — it was invented
+  else quote found
+    J->>J: keep it, and do every comparison in code
+  end
+  J-->>J: report only what survived
+```
+
 ## Guardrails enforced by code, not by prompt
 
 - A claimed contradiction must carry a **verbatim quote that actually appears in the
@@ -83,6 +123,12 @@ carve-out where an agent operates autonomously under a written mandate — pre-t
 before any order, preview before place, every decision journalled. The carve-out exists to
 test whether the process holds when nobody is checking each step; it does not loosen the
 rule on the main book, and the two never share a code path.
+
+## The code
+
+Four components in [`code/`](code/), copied verbatim: the valuation toolkit, the
+terms-extraction pass with the verbatim-quote guardrail, the filing navigation indexer,
+and the local news scorer. See [`code/README.md`](code/README.md).
 
 ## Stack
 
