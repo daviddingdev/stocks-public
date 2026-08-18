@@ -4,12 +4,23 @@ Eighteen components of the engine, ~5,000 lines, copied verbatim from the privat
 re-copied by an automated daily job — so what you are reading is what ran last night, not a
 snapshot someone remembered to update.
 
-Public companies are named freely here: which filings the engine has parsed and which
-parsing bugs they exposed is the interesting part, and it says nothing about what is owned.
-What is absent is deliberate — no positions, no sizes, no account values, no broker. One
-module was pulled from this repo for exactly that reason: it uses a broker's name as a
-runtime label, which is structural rather than a comment, so it stays private rather than
-being reworded to qualify.
+**Public companies are named freely.** Which filings the engine has parsed, and which
+parsing bugs they exposed, is the interesting part — and it says nothing about what is
+owned. Filed figures are public facts and appear as filed.
+
+**Personal identifiers are pseudonymised, consistently and on purpose.** Brokers read as
+`BrokerA` / `BrokerB`, the data aggregator as `AggregatorA`, host addresses and account
+digits as placeholders. The mapping is stable, declared in one config file, applied to
+every file on the way out, and applied *before* the leak scan — so a name the map missed
+fails the gate and the file is withheld rather than published half-masked. Every published
+Python file is re-parsed afterwards, so a substitution can never ship code that no longer
+compiles.
+
+That is the only transformation performed. Nothing else is edited, reordered, or tidied:
+what you are reading is otherwise the file that ran last night.
+
+Absent entirely, rather than masked: positions, sizes, account values, P&L. A pseudonym is
+right for a name; it would be a lie for a number.
 
 The layout mirrors the private one.
 

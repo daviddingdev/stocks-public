@@ -156,6 +156,25 @@ ROLES = [
         "escalates_to": "pm",
     },
     {
+        "id": "hunt", "name": "Bug hunter — adversarial defect search",
+        "who": "Opus · NO broker access",
+        "cadence": "08:30 UTC Thu + Sat (i.e. after Wed and Fri nights). Added 2026-08-18, "
+                   "explicitly TEMPORARY — David: \"while we are still early in this process\"",
+        "purpose": "Finds defects nobody knows about yet — the opposite job to the COO, which "
+                   "asks whether KNOWN problems have owners. Rotates through five areas on a "
+                   "coverage ledger so it cannot re-hunt the same ground, and every finding must "
+                   "carry a reproduction: exact command, observed output, expected output, "
+                   "responsible line. Exists because every serious defect this book has had was "
+                   "invisible to every gate that was green at the time.",
+        "model": "opus",
+        "reads": ["_engine/agent/journal/ops/hunt_coverage.json", "the code in its target area"],
+        "writes": ["_engine/agent/journal/ops/<date>_hunt.md",
+                   "_engine/agent/journal/ops/hunt_coverage.json"],
+        "charter": ["same surface as the fixer, and the blast-radius gate is mandatory if it "
+                    "edits anything"],
+        "escalates_to": "pm",
+    },
+    {
         "id": "triggers", "name": "triggers — coded escalation",
         "who": "pure code · zero Claude tokens unless a rule trips",
         "cadence": "every 5 min, US market hours",

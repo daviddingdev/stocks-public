@@ -1007,15 +1007,39 @@ def build(tk, cik_override=None):
     if len(_missing) >= 3:
         _ns = [k for k in (cf.get("facts") or {})
                if k not in ("us-gaap", "dei", "srt", "invest", "ecd", "ffd")]
+        # An extension namespace is NOT a taxonomy. The first version of this check called
+        # any non-standard namespace one, so TBCV — a SPAC with a `spac:` extension — was
+        # reported as "reports under spac, not us-gaap", which is meaningless. Only
+        # `ifrs-full` is an actual alternate accounting taxonomy.
+        _tax = [n for n in _ns if n.startswith("ifrs")]
         card["flags"] = [f for f in card["flags"] if not f.endswith("no XBRL tag found")]
-        card["flags"].append(
-            (f"TAXONOMY: this filer reports under {', '.join(_ns)}, not us-gaap — "
-             f"{len(_missing)} core concepts ({', '.join(_missing)}) are unavailable and every "
-             f"derived value is missing. Needs an {_ns[0]} tag map: a DATA-SOURCE gap, not a "
-             f"mis-mapped tag.") if _ns else
-            (f"NO USABLE FACTS: {len(_missing)} core us-gaap concepts missing "
-             f"({', '.join(_missing)}) and no alternate taxonomy present. Nothing derived on "
-             f"this card can be trusted."))
+        if _tax:
+            # OUT OF SCOPE, decided 2026-08-18 after measuring rather than assuming. An IFRS
+            # tag map was considered and rejected: the only two IFRS names carded were SPOT,
+            # a foreign private issuer that files 6-K/20-F and therefore has NO QUARTERLY
+            # structured data at all — so a tag map would still not produce a usable card,
+            # because every derived value in this book is TTM — and MDXH, whose last 10-Q was
+            # 2025-08-28, a year stale. Neither is held, in the universe, or on the bench.
+            # Building a second dictionary to maintain forever for two dead names is cost
+            # without a reader.
+            card["flags"].append(
+                f"OUT OF SCOPE — IFRS filer ({', '.join(_tax)}). This book's number pipeline "
+                f"is us-gaap + quarterly (10-Q/10-K) by design; foreign private issuers report "
+                f"on 20-F/6-K, so there is no quarterly series to build TTM from even with a "
+                f"tag map. Do not underwrite from this card. Reconsider only if a name we "
+                f"actually want to own turns out to be an FPI.")
+        elif _ns:
+            card["flags"].append(
+                f"CORE CONCEPTS MISSING: {len(_missing)} of the six every us-gaap filer must "
+                f"report ({', '.join(_missing)}) are absent. The issuer tags heavily under its "
+                f"own `{_ns[0]}:` namespace ({sum(1 for _ in _ns)} extension ns), which "
+                f"companyfacts drops — but that is an EXTENSION, not a different accounting "
+                f"taxonomy. Nothing derived here can be trusted.")
+        else:
+            card["flags"].append(
+                f"NO USABLE FACTS: {len(_missing)} core us-gaap concepts missing "
+                f"({', '.join(_missing)}) and no alternate taxonomy present. Nothing derived on "
+                f"this card can be trusted.")
 
     flow_end = (F.get("cfo") or F.get("revenue") or {}).get("latest_quarter_end") \
         or (F.get("cfo") or F.get("revenue") or {}).get("period", "")[-10:]
