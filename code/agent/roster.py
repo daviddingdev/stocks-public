@@ -190,8 +190,12 @@ ROLES = [
         "id": "contract", "name": "contract — the book's own invariants",
         "who": "pure code",
         "cadence": "every PM session + the COO review",
-        "purpose": "13 checks the book must always satisfy (re-underwrite age, memo existence, "
-                   "journal size, anchor provenance, book arithmetic). A violation is a defect.",
+        "purpose": "14 checks the book must always satisfy (re-underwrite age, memo existence, "
+                   "journal size, anchor provenance, book arithmetic, open BLOCKING unknowns, "
+                   "unanswered patch requests). A violation is a defect. Its sibling "
+                   "`sweepcheck.py` guards the number pipeline instead of the book: the "
+                   "accounting identity across every card, and a before/after diff that any "
+                   "pipeline change must pass before it ships.",
         "reads": ["_engine/agent/journal", "_engine/agent/data"],
         "writes": ["stdout — violations"],
         "charter": [],

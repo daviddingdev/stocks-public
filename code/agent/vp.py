@@ -372,6 +372,7 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     # Freshness of every desk input, on the two clocks that matter — market time (stale in
     # minutes, and only while the market is open) and filing time (updates once a quarter,
     # current until the issuer files again). Non-fatal: it reports, the PM decides.
+    stages.append(run("identity", ["python3", "sweepcheck.py", "identity"], 300))
     stages.append(run("asof", ["python3", "asof.py", "check"], 300))
     stages.append(run("filings", ["python3", "asof.py", "filings"], 600))
     path, nfind = brief(stages)
