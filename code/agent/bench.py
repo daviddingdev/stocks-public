@@ -115,8 +115,12 @@ def ask_json(prompt, model, num_predict=400, timeout=1200):
                        "options": {"num_predict": num_predict, "temperature": 0.2},
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(OLLAMA, body, {"Content-Type": "application/json"})
+    t0 = time.time()
     with gpu.slot(job="the Bench", model=model):
-        raw = json.loads(urllib.request.urlopen(req, timeout=timeout).read())["message"]["content"]
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    gpu.record_usage(job="the Bench", model=model, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
+    raw = d["message"]["content"]
     m = _JSON_RE.search(raw or "")
     if not m:
         return None, raw
@@ -143,6 +147,19 @@ CORPUS = DATA / "bench_corpus"
 UNIVERSE = DATA / "bench_universe.json"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # SEC contact identity, config-driven
+
+
+def _stamp():
+    """Provenance stamp so this file's CONTENT drift is measurable later, not just its age."""
+    try:
+        import sys as _s, os as _o
+        _s.path.insert(0, _o.path.dirname(_o.path.abspath(__file__)))
+        import asof
+        return asof.stamp()
+    except Exception:
+        return ""
+
+
 REV_TAGS = ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax")
 
 
@@ -550,7 +567,7 @@ def brief(top=25):
         L += ["## Already on your book or already triaged", "",
               ", ".join(f"**{r['ticker']}** ({'held' if r['ticker'].upper() in held else seen.get(r['ticker'].upper())})"
                         for r in already[:40]), ""]
-    BENCH_BRIEF.write_text("\n".join(L))
+    BENCH_BRIEF.write_text("\n".join(L) + _stamp())
     print(f"bench_brief.md: {len(rows)} names, {len(fresh)} new to the PM")
     return BENCH_BRIEF
 

@@ -29,6 +29,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _stamp():
+    """Provenance stamp so this file's CONTENT drift is measurable later, not just its age."""
+    try:
+        import asof
+        return asof.stamp()
+    except Exception:
+        return ""
+
+
+
 HERE = Path(__file__).resolve().parent
 ENGINE = HERE.parent
 ROOT = ENGINE.parent
@@ -55,7 +66,8 @@ ROLES = [
         "writes": ["_engine/agent/journal/BOOK.md", "_engine/agent/journal/decisions.md",
                    "_engine/agent/data/thesis.json", "_engine/agent/universe.txt"],
         "charter": ["everything except: it may not silently overrule DIRECTIVES.md"],
-        "manages": ["vp", "fixer", "coo", "bench", "cannibal", "numwatch", "scout"],
+        "manages": ["vp", "numbers", "signals", "coo", "hunt", "bench", "cannibal",
+                    "numwatch", "scout"],
     },
     {
         "id": "vp", "name": "VP — night sweep and prep desk",
@@ -118,25 +130,47 @@ ROLES = [
         "charter": [],
     },
     {
-        "id": "fixer", "name": "Fixer — overnight data quality",
+        "id": "numbers", "name": "Numbers Engineer — accounting forensics (was: Fixer)",
         "who": "Sonnet · NO broker access",
         # Was Opus. David 2026-08-18: "Fixer should go down to sonnet model rather than opus."
         # This is the per-job sign-off PROJECT_STANDARDS §2 requires for a model downgrade.
-        # Defensible: the fixer's work is mechanical root-cause repair against a queue, every
-        # change proven by a re-scan, and its judgment calls are explicitly deferred to the PM.
+        # Defensible: the work is mechanical root-cause repair against a queue, every change
+        # proven by a re-scan, and its judgment calls are explicitly deferred to the PM.
+        # RENAMED fixer -> numbers 2026-08-19 (ORG_PLAN): the org now has two engineers split
+        # by DOMAIN, and "fixer" said nothing about which domain. `fixer` stays a working
+        # alias everywhere (ops.py CLI, asks.py addresses) so nothing breaks mid-transition.
         "model": "sonnet",
         "cadence": "07:05 UTC Tue–Sat",
-        "purpose": "Works the quality queue to zero open. Fixes the number/evidence pipeline at "
-                   "the root — tag maps, extraction prompts, watchdog logic — and PROVES each fix "
-                   "survives a re-scan. Never adjudicates a thesis question.",
+        "purpose": "Owns the NUMBER pipeline (owners.py: subsystem `numbers`) — XBRL to card "
+                   "to dossier to the watchdog. Works the quality queue and its ask inbox to "
+                   "zero, fixes at the root, and PROVES each fix survives a re-scan. Never "
+                   "adjudicates a thesis question.",
         "reads": ["_engine/agent/data/quality_queue.json", "_engine/agent/names"],
         "writes": ["_engine/agent/journal/ops/<date>_fixer.md",
                    "_engine/agent/data/patch_requests.json"],
-        # WIDENED 2026-08-18 — see CHARTER_NOTE below.
-        "charter": ["_engine/valuation/fincard.py", "_engine/valuation/query.py",
-                    "_engine/agent/dossier.py", "_engine/agent/numwatch.py",
-                    "_engine/agent/quality.py", "_engine/agent/refresh_cards.py",
-                    "_engine/agent/scout.py", "_engine/agent/cannibal.py"],
+        # charter comes from owners.py (single source of truth) — see charter() below.
+        "charter": [],
+        "escalates_to": "pm",
+    },
+    {
+        "id": "signals", "name": "Signals Engineer — signal-vs-noise",
+        "who": "Sonnet · NO broker access",
+        # NEW 2026-08-19 (ORG_PLAN, approved by David): bench/feeds/triggers/scout/cannibal —
+        # ~2,000 lines of origination and intel code — had no owner at all. Sonnet for the
+        # same reason the Numbers Engineer is: mechanical repair against evidence, judgment
+        # deferred to the PM. Scheduled 30 min after Numbers so no new usage window opens
+        # and the two never edit concurrently.
+        "model": "sonnet",
+        "cadence": "07:35 UTC Tue–Sat",
+        "purpose": "Owns the SIGNAL pipeline (owners.py: subsystem `signals`) — scout, feeds, "
+                   "relevance, cannibal, the Bench, insider clusters, trigger RULES. Its "
+                   "question every session: is each feed actually saying something, or alive "
+                   "and mute? A silent pipeline is its defect even when no row says so.",
+        "reads": ["_engine/agent/data/feed.json", "_engine/agent/data/candidates.json",
+                  "_engine/agent/data/bench_brief.md", "_engine/agent/data/cannibal.json"],
+        "writes": ["_engine/agent/journal/ops/<date>_signals.md",
+                   "_engine/agent/data/patch_requests.json"],
+        "charter": [],
         "escalates_to": "pm",
     },
     {
@@ -152,8 +186,11 @@ ROLES = [
         "reads": ["_engine/agent/data/quality_queue.json", "_engine/agent/journal",
                   "_engine/logs"],
         "writes": ["_engine/agent/journal/ops/<date>_coo.md"],
-        "charter": ["same surface as the fixer — prefers assigning over hot-fixing on a weekend"],
-        "escalates_to": "pm",
+        # charter from owners.py: the integrity layer + the desk code (contract, sweepcheck,
+        # asof, unknowns, roster, asks, owners, COMMS.md, vp.py, ops.py) — prefers assigning
+        # to an engineer over hot-fixing on a weekend.
+        "charter": [],
+        "escalates_to": "david",
     },
     {
         "id": "hunt", "name": "Bug hunter — adversarial defect search",
@@ -161,17 +198,19 @@ ROLES = [
         "cadence": "08:30 UTC Thu + Sat (i.e. after Wed and Fri nights). Added 2026-08-18, "
                    "explicitly TEMPORARY — David: \"while we are still early in this process\"",
         "purpose": "Finds defects nobody knows about yet — the opposite job to the COO, which "
-                   "asks whether KNOWN problems have owners. Rotates through five areas on a "
-                   "coverage ledger so it cannot re-hunt the same ground, and every finding must "
-                   "carry a reproduction: exact command, observed output, expected output, "
-                   "responsible line. Exists because every serious defect this book has had was "
-                   "invisible to every gate that was green at the time.",
+                   "asks whether KNOWN problems have owners. OWNS NOTHING, DELIBERATELY: an "
+                   "owner auditing its own area is the self-verification problem, and the hunt "
+                   "is the role that reads without a boundary — every two-strikes ask (declined "
+                   "or deferred twice by its owner) auto-routes here. Rotates through six areas "
+                   "on a coverage ledger (the sixth, `seams`, is what falls BETWEEN owners), "
+                   "and every finding must carry a reproduction: exact command, observed "
+                   "output, expected output, responsible line.",
         "model": "opus",
         "reads": ["_engine/agent/journal/ops/hunt_coverage.json", "the code in its target area"],
         "writes": ["_engine/agent/journal/ops/<date>_hunt.md",
                    "_engine/agent/journal/ops/hunt_coverage.json"],
-        "charter": ["same surface as the fixer, and the blast-radius gate is mandatory if it "
-                    "edits anything"],
+        "charter": ["may fix within EITHER engineer's surface (owners.py), blast-radius gate "
+                    "mandatory if it edits anything"],
         "escalates_to": "pm",
     },
     {
@@ -227,7 +266,8 @@ do what makes sense... the PM should manage its own employees").** The fixer's a
 surface used to be four files, and `numwatch.py` was not among them — so the fixer could
 diagnose its own instrument misfiring and was forbidden to fix it. On 2026-08-18 that had
 grown to ~100 queue items behind six known one-file edits. The surface now covers the whole
-number/evidence pipeline (the files listed above), because none of them decides a trade.
+number/evidence pipeline, and since 2026-08-19 every surface is DERIVED from the ownership
+map in `owners.py` — one source of truth; a file cannot be owned by two roles or by none.
 
 What stayed hard-locked, and always will: `loop.py`, `MANDATE.md`, `triggers.py`, `thesis.json`,
 journal memos — anything that decides or records a trade.
@@ -286,6 +326,7 @@ def claude_model(role_id, default="opus"):
     place a role's cost/capability is set — ops.py and vp.py read it rather than each
     carrying its own --model flag, which is how the fixer stayed on Opus for weeks after
     its work had become mechanical."""
+    role_id = {"fixer": "numbers"}.get(role_id, role_id)
     for r in ROLES:
         if r["id"] == role_id:
             return r.get("model") or default
@@ -293,6 +334,17 @@ def claude_model(role_id, default="opus"):
 
 
 def charter(role_id):
+    """The allowed-edit surface. For roles that own subsystems this comes from owners.py —
+    ONE source of truth, so a file cannot be owned by two roles or by none (ORG_PLAN build
+    step 3). The static list in ROLES is only a fallback for roles owners.py doesn't know."""
+    role_id = {"fixer": "numbers"}.get(role_id, role_id)
+    try:
+        import owners
+        surface = owners.charter(role_id)
+        if surface:
+            return surface
+    except Exception:
+        pass
     for r in ROLES:
         if r["id"] == role_id:
             return r.get("charter", [])
@@ -336,27 +388,41 @@ def brief():
         L.append(f"- **Hands you:** {writes}")
         if r.get("runs"):
             L.append(f"- **Runs:** {', '.join(r['runs'])}")
-        if r.get("charter"):
-            L.append(f"- **May edit:** {', '.join(f'`{c}`' for c in r['charter'])}")
+        surface = charter(r["id"])
+        if surface:
+            L.append(f"- **May edit** (from `owners.py`): "
+                     f"{', '.join(f'`{c}`' for c in surface)}")
         if r.get("escalates_to"):
-            L.append(f"- **Escalates to:** {r['escalates_to'].upper()} "
-                     f"(via `data/patch_requests.json`) — that is you.")
+            esc = r["escalates_to"]
+            L.append(f"- **Escalates to:** {esc.upper()} (`asks.py escalate`)"
+                     + (" — that is you." if esc == "pm" else ""))
         L.append("")
 
     L += ["## Your authority over this staff", "",
-          "- **You may change any of their instructions.** The prompts live in `ops.py` (fixer, COO)",
-          "  and `vp.py` (the night sweep); the org chart itself is `roster.py`. If a role is",
-          "  producing noise, say so in your session log and change it — do not work around it",
-          "  session after session.",
-          "- **Patch requests are yours to decide.** `data/patch_requests.json` holds changes the",
-          "  fixer diagnosed and verified but is not permitted to make. Approve, reject with a",
+          "- **You may change any of their instructions.** The prompts live in `ops.py` (the two",
+          "  engineers, the COO, the hunt) and `vp.py` (the night sweep); the org chart itself is",
+          "  `roster.py`, and who owns which code is `owners.py`. If a role is producing noise,",
+          "  say so in your session log and change it — do not work around it session after session.",
+          "- **The comms protocol is `_engine/agent/COMMS.md`** — one page, and it is short.",
+          "  Anything one role needs from another is a row with an owner and an age, never a",
+          "  paragraph with a name in it. Run `asks.py inbox <role>` first, every session.",
+          "- **Asks route themselves.** `asks.py open --about <subsystem> --ask ...` resolves the",
+          "  owner from `owners.py`; `--to` is the override, not the norm. A row with an owner and",
+          "  an age gets worked; a paragraph in BOOK.md does not — that section had NO reader until",
+          "  2026-08-19, which is why the same watchdog defect went unfixed three sessions running.",
+          "- **Read the board, not just the list**: `asks.py board` groups open asks by owner and",
+          "  ages them on the LAST STATE CHANGE — an ask acked and untouched for a week looks as",
+          "  bad as it is. `asks.py trace <id>` shows any ask's full history when you need to know",
+          "  where a request actually stalled.",
+          "- **Patch requests are yours to decide.** `data/patch_requests.json` holds changes an",
+          "  engineer diagnosed and verified but is not permitted to make. Approve, reject with a",
           "  reason, or escalate to David. An unanswered request is you not doing your job.",
           "- **Adding a role, or retiring one, is a proposal to David** — write it in BOOK.md under",
           "  Research wanted with the mechanism and the cost.", "",
           "## Charter note", "", CHARTER_NOTE]
 
     BRIEF.parent.mkdir(parents=True, exist_ok=True)
-    BRIEF.write_text("\n".join(L))
+    BRIEF.write_text("\n".join(L) + _stamp())
     return BRIEF
 
 

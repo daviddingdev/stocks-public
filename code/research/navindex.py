@@ -11,6 +11,7 @@ retain full raw access; nothing here filters or replaces primary text.
 CLI: navindex.py <path-to-_evidence-dir>
 """
 import json
+import time
 import os
 import sys
 import urllib.request
@@ -40,9 +41,13 @@ def ask(text):
                                     {"role": "user", "content": text}],
                        "options": {"num_predict": 300, "temperature": 0.2}}).encode()
     req = urllib.request.Request(OLLAMA, data=body, headers={"Content-Type": "application/json"})
+    t0 = time.time()
     with gpu.slot(job="navindex", model=MODEL):
         with urllib.request.urlopen(req, timeout=300) as r:
-            return json.loads(r.read())["message"]["content"].strip()
+            d = json.loads(r.read())
+    gpu.record_usage(job="navindex", model=MODEL, prompt_tokens=d.get("prompt_eval_count"),
+                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
+    return d["message"]["content"].strip()
 
 
 def annotate(ev_dir):

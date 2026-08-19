@@ -74,12 +74,34 @@ def _j(p, default):
         return default
 
 
+_CORP_SUFFIX = {"inc", "corp", "corporation", "llc", "lp", "llp", "ltd", "co",
+                "company", "holdings", "holding", "group", "the", "plc"}
+
+
+def _name_tokens(name):
+    norm = re.sub(r"[^a-z0-9 ]", "", (name or "").lower())
+    return {t for t in norm.split() if t not in _CORP_SUFFIX}
+
+
+def _self_filed_13d(filer, subject):
+    """Issuer self-filed / SPAC-sponsor 13Ds: every meaningful filer-name token
+    also appears in the subject name (2026-08-19, fixer-002 — the PM hand-closed
+    67 of these as mechanically identifiable noise: filer name token-subset of
+    subject name, e.g. "Catalyst Acquisition Corp." filing on itself)."""
+    if not filer or not subject or subject == "?":
+        return False
+    ftoks = _name_tokens(filer)
+    return bool(ftoks) and ftoks <= _name_tokens(subject)
+
+
 def _events():
     """Stage 0: normalized events with stable ids from the feeds."""
     feed = _j(DATA / "feed.json", {})
     ev = []
     sit = feed.get("situations") or {}
     for r in (sit.get("sc13d") or []):
+        if _self_filed_13d(r.get("company"), r.get("subject")):
+            continue
         tk = r.get("subject_ticker")
         d = r.get("date", "")
         d = f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d

@@ -51,15 +51,25 @@ FLOW = {
     "sga": ["SellingGeneralAndAdministrativeExpense",
             "GeneralAndAdministrativeExpense"],
     "op_income": ["OperatingIncomeLoss"],
+    # NOT read into op_income directly (CostsAndExpenses is a subtotal, not equivalent
+    # in every issuer's statement layout) — used only as the op_income_calc fallback
+    # below, for issuers whose income statement goes straight from this subtotal to
+    # Other Income/Expense with no OperatingIncomeLoss line at all (CXW post its 2021
+    # REIT->C-corp conversion: Revenue -> Costs and Expenses, Total -> Other Income/
+    # Expense -> pretax income, confirmed against the statement face, 2026-08-18).
+    "costs_and_expenses": ["CostsAndExpenses"],
     # InterestAndDebtExpense last: it is the same "cost of borrowing" line under a
     # different name (ETD prints "Interest and other financing costs" and tags it that
     # way; InterestExpense died at 2024-06-30 and the card flagged a retired tag).
     # NEVER add InterestIncomeExpenseNonoperatingNet / InterestIncomeExpenseNet here —
     # those are NET of interest income and carry the OPPOSITE sign (NCLH -336.9M,
     # SYY -512M); they would invert interest_coverage.
+    # InterestExpenseBorrowings: WELL (a REIT) switched to this tag at 2026-03-31
+    # ($192.715M) from InterestExpenseDebt (last point 2024-09-30, $419.79M for 9mo) —
+    # same "cost of borrowing" line, continuous magnitude across the switch (2026-08-18).
     "interest_expense": ["InterestExpense", "InterestExpenseDebt",
                          "InterestExpenseNonoperating", "InterestExpenseOperating",
-                         "InterestAndDebtExpense"],
+                         "InterestAndDebtExpense", "InterestExpenseBorrowings"],
     "pretax_income": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
                       "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
     "tax": ["IncomeTaxExpenseBenefit"],
@@ -74,16 +84,33 @@ FLOW = {
     "shares_diluted_wavg": ["WeightedAverageNumberOfDilutedSharesOutstanding"],  # shares
     "cfo": ["NetCashProvidedByUsedInOperatingActivities",
             "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+    # PaymentsForProceedsFromProductiveAssets: RYAM's successor to PaymentsToAcquire-
+    # PropertyPlantAndEquipment (died 2021-12-31) — same cash-capex line, continuous
+    # magnitude (~$95-116M/yr both sides of the switch, 2026-08-18).
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquirePropertyAndEquipment",
               "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements",
-              "PaymentsToDevelopRealEstateAssets"],
+              "PaymentsToDevelopRealEstateAssets", "PaymentsForProceedsFromProductiveAssets"],
+    # CostDepreciationAmortizationAndDepletion (MTX) and CostOfGoodsAndServicesSold-
+    # DepreciationAndAmortization (PEG, a regulated utility's "Cost, Depreciation and
+    # Amortization" line) are the same D&A figure filed under a cost-statement caption
+    # instead of a standalone D&A line; Depreciation LAST and only once amortization has
+    # gone to zero (FTK fully wrote off goodwill/intangibles by 2021 — nothing left to
+    # amortize, so the company now tags pure depreciation and that alone equals D&A for
+    # this issuer). Measured 2026-08-18.
     "dna": ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
-            "DepreciationAmortizationAndAccretionNet"],
+            "DepreciationAmortizationAndAccretionNet",
+            "CostDepreciationAmortizationAndDepletion",
+            "CostOfGoodsAndServicesSoldDepreciationAndAmortization", "Depreciation"],
     # AllocatedShareBasedCompensationExpense is the income-statement total for the same
     # expense the cash-flow add-back reports; issuers that stop tagging the add-back keep
     # tagging this one (ARES 386.4M, DAN 19M, FLEX 51M all current at 2026-06 while
-    # ShareBasedCompensation sat at 2011-2014 values and read as a retired tag)
-    "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
+    # ShareBasedCompensation sat at 2011-2014 values and read as a retired tag).
+    # AdjustmentsToAdditionalPaidInCapitalSharebasedCompensationRequisiteServicePeriod-
+    # RecognitionValue last: ALGT tags SBC only in its equity-roll-forward statement
+    # ("Share-based compensation" line, $13.529M at 2026-06-30) once it stopped tagging
+    # ShareBasedCompensation quarterly after 2019-Q3 (2026-08-18).
+    "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense",
+            "AdjustmentsToAdditionalPaidInCapitalSharebasedCompensationRequisiteServicePeriodRecognitionValue"],
     "buybacks": ["PaymentsForRepurchaseOfCommonStock"],
     "dividends_paid": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
     "acquisitions": ["PaymentsToAcquireBusinessesNetOfCashAcquired"],
@@ -140,15 +167,28 @@ INSTANT = {
     # SYY captions the line "Accounts receivable, less allowances" (5,755M at 2026-03-28)
     # and tags it AccountsNotesAndLoansReceivableNetCurrent; ReceivablesNetCurrent last
     # filed in 2011 and read as a retired tag.
+    # AccountsAndOtherReceivablesNetCurrent last: OLN and VHI both merged AR into a
+    # combined "accounts and other receivables" line (OLN $988.6M at 2026-06-30, VHI
+    # $434.2M at 2026-06-30) after their split AR/other tags went stale (2026-08-18).
     "receivables": ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent",
-                    "AccountsNotesAndLoansReceivableNetCurrent"],
+                    "AccountsNotesAndLoansReceivableNetCurrent",
+                    "AccountsAndOtherReceivablesNetCurrent"],
     # SYY tags its single "Inventories" line (5,291M at 2026-03-28) with the finished-goods
     # tag; InventoryNet stops in 2011. Listed after InventoryNet so an issuer filing both
     # the total and the component keeps the TOTAL.
-    "inventory": ["InventoryNet", "InventoryFinishedGoodsNetOfReserves"],
+    # InventoryRawMaterialsAndSupplies last: PEG (a regulated utility) has no finished-
+    # goods inventory — its balance-sheet "Materials and supplies" line is the utility
+    # equivalent (fuel/spare-parts stock), $868M at 2026-06-30 (2026-08-18).
+    "inventory": ["InventoryNet", "InventoryFinishedGoodsNetOfReserves",
+                 "InventoryRawMaterialsAndSupplies"],
     "current_assets": ["AssetsCurrent"],
+    # PublicUtilitiesPropertyPlantAndEquipmentNet last: PEG's balance sheet has never
+    # used the generic industrial PP&E tag — it captions the line "Property, plant and
+    # equipment, net" but tags it with the utility-specific concept, $42.931B at
+    # 2026-06-30 (2026-08-18).
     "ppe_net": ["PropertyPlantAndEquipmentNet",
-                "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization"],
+                "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+                "PublicUtilitiesPropertyPlantAndEquipmentNet"],
     "goodwill": ["Goodwill"],
     "intangibles": ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
     "total_assets": ["Assets"],
@@ -173,8 +213,15 @@ INSTANT = {
                      "OtherLongTermDebtCurrent"],
     "operating_lease_liab": ["OperatingLeaseLiability"],
     "total_liabilities": ["Liabilities"],
+    # PartnersCapital{,IncludingPortionAttributableToNoncontrollingInterest} last: an LP
+    # (GEL — Genesis Energy LP) has no "stockholders'" equity at all, corporate-only
+    # StockholdersEquity tags stopped in 2015, and the parent-only PartnersCapital tag
+    # is ALSO stale (2015) while the NCI-inclusive one is current ($127.68M at
+    # 2026-06-30) — same parent-vs-NCI precedence as the StockholdersEquity pair above,
+    # just for the partnership form (2026-08-18).
     "equity": ["StockholdersEquity",
-               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+               "PartnersCapital", "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest"],
 }
 # totals some issuers tag only ANNUALLY while tagging the current/noncurrent split
 # every quarter — the total then looks like a retired tag (SONO OperatingLease-
@@ -206,6 +253,29 @@ MANUAL = {
             "quote": "Purchases of property and equipment and scooter fleet ( 50,718 ) ( 20,786 )",
             "doc": "10-Q filed 2026-08-07 (H1 legs) + 10-K filed 2026-02-11 ('( 52,822 )') — cash-flow statements",
             "entered": "2026-08-14",
+        },
+    },
+    "MDGL": {
+        # MDGL tags Cost of sales with the standard us-gaap:CostOfGoodsAndServicesSold
+        # concept (already in FLOW["cogs"]) but ONLY under
+        # StatementBusinessSegmentsAxis=mdgl:ReportableSegmentMember — MDGL has exactly
+        # one reportable segment, so the segment figure equals the consolidated figure,
+        # but companyfacts drops every dimensional fact regardless (same mechanism as
+        # the ARI/LYFT extension-tag drops, just a dimension instead of a namespace),
+        # which is why the companyfacts pull reads this concept as retired at
+        # 2025-03-31 ($6,233K) while the face of the income statement carries it
+        # current every quarter. Confirmed by reading ix:nonFraction tags directly off
+        # the filed 10-Q/10-K (companyfacts never serves this fact at all).
+        "cogs": {
+            "value": 109_424_000,
+            "period": "TTM 2025-07-01..2026-06-30 (FY2025 56,148 + H1'26 66,854 - H1'25 13,578)",
+            "period_end": "2026-06-30",
+            "formula": "FY2025 56,148,000 + H1-2026 66,854,000 - H1-2025 13,578,000",
+            "quote": "Cost of sales 40,007 9,065 66,854 13,578 (10-Q, Q2/H1 2026 vs 2025); "
+                     "Cost of sales 56,148 6,233 (10-K, FY2025 vs FY2024)",
+            "doc": "10-Q filed 2026-07-30 (H1'26/H1'25 legs) + 10-K filed 2026-02-19 (FY2025 total) "
+                   "— income statements",
+            "entered": "2026-08-19",
         },
     },
 }
@@ -312,21 +382,36 @@ def _ttm(quarters, annuals, ytd=None, mode="sum"):
             return (sum(x["value"] for x in run) / len(run),
                     f"avg of {len(run)} direct quarter(s) {run[-1]['start']}..{run[0]['end']}",
                     run[0]["end"])
-    elif len(quarters) >= 4:
+    q_result = None
+    if len(quarters) >= 4:
         qs = quarters[:4]
         if _contig(qs) and 350 <= _days(qs[3]["start"], qs[0]["end"]) <= 380:
             how = "incl. ytd-diff derived" if any(q.get("derived") for q in qs) else "4 direct 10-Q quarters"
-            return sum(x["value"] for x in qs), f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})", qs[0]["end"]
+            q_result = (sum(x["value"] for x in qs), f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})", qs[0]["end"])
+    a_result = None
     if annuals:
         a = annuals[0]
-        return a["value"], f"FY {a['start']}..{a['end']} (no verified TTM — annual used)", a["end"]
+        a_result = (a["value"], f"FY {a['start']}..{a['end']} (no verified TTM — annual used)", a["end"])
+    y_result = None
     if ytd:
         # newly-registered issuer: only one YTD period on file, no prior quarters/FY to
         # build a TTM or even a clean quarter from — carry the YTD figure honestly labeled
         # rather than drop it (MBGL: single 10-Q on file, caught by fincheck 2026-08-13)
         y = ytd[0]
-        return y["value"], f"YTD {y['start']}..{y['end']} (single period on file — no TTM/FY yet)", y["end"]
-    return None, None, None
+        y_result = (y["value"], f"YTD {y['start']}..{y['end']} (single period on file — no TTM/FY yet)", y["end"])
+    # None of these three shapes is automatically the FRESHEST answer — an issuer that
+    # switches disclosure cadence leaves an old-but-structurally-valid candidate sitting
+    # next to fresher data in a shape the code used to rank below it. LEU's sbc: 4
+    # contiguous quarters exist but stop in 2017, 8 years behind the FY2025 annual.
+    # ALGT's sbc: the only FY-duration filing of this tag is from 2020 (this tag is a
+    # 10-Q-only equity-rollforward line — no fresher annual will EVER exist), while
+    # 2026-06-30 YTD data sat right there, ranked last by the old fixed priority order.
+    # Listed in this order so a tie on end-date still prefers the higher-quality shape
+    # (a verified 4-quarter TTM over a single annual over a partial-year YTD).
+    candidates = [c for c in (q_result, a_result, y_result) if c is not None]
+    if not candidates:
+        return None, None, None
+    return max(candidates, key=lambda c: c[2])
 
 
 def _prior_ttm(quarters, annuals, mode="sum"):
@@ -383,9 +468,35 @@ EPISODIC_FLOWS = {
     "buybacks",         # a company can simply not repurchase
     "dividends_paid",   # non-payers report nothing, forever
 }
+# concepts that exist ONLY as an internal fallback input for a derived value (never
+# read directly, never shown as a headline figure) — a stale one must still be
+# excluded from ttm_vals (an op_income_calc built on a 5-year-old CostsAndExpenses
+# would be as wrong as using a stale op_income directly), but raising its own flag is
+# pure noise for the ~85% of tickers that never touch it: costs_and_expenses matters
+# only to CXW's op_income_calc fallback, and adding it to FLOW put a "STALE" flag on
+# BKH/CIFR/FCELB/FIS/KLAC/LBRDP that had never used the concept before (2026-08-18).
+AUX_ONLY_FLOWS = {"costs_and_expenses"}
 
 # Concepts any US-GAAP filer must report. Their absence is a TAXONOMY problem (usually an
 # IFRS filer) rather than a tag-mapping problem — see the check at the end of build().
+# Balance-sheet and income-statement DETAIL that no derived value on any card consumes.
+# Determined empirically from the `formula` string of every derived value across all 85
+# cards, then checked by hand — the empirical pass alone is NOT enough: ebitda_approx writes
+# "D&A" rather than "dna" and would have been wrongly listed here.
+#
+# Concepts that ARE consumed and therefore keep flagging loudly: interest_expense
+# (interest_coverage), gross_profit (gross_margin_pct), dna (ebitda_approx), sbc
+# (sbc_pct_revenue), total_assets and total_liabilities (the footing identity), and
+# everything feeding net_cash / EV / FCF / BVPS.
+#
+# A stale `goodwill` tag changes no number this book acts on. Raising it to the same flag
+# list as a stale `debt_lt` is how a flag list becomes wallpaper — 50 of 99 open rows on
+# 2026-08-18 were exactly this. Recorded on the figure, left off the card's flags.
+DISPLAY_ONLY = {
+    "goodwill", "intangibles", "receivables", "inventory", "ppe_net", "operating_lease_liab",
+    "lt_investments", "rnd", "sga", "acquisitions", "eps_diluted", "shares_diluted_wavg",
+}
+
 UNIVERSAL = ("revenue", "net_income", "cfo", "cash", "equity", "total_assets")
 
 
@@ -453,6 +564,65 @@ def _plausible(name, value, F):
         if ta and value > ta:
             return False, f"{value:,.0f} exceeds total assets {ta:,.0f}"
     return True, ""
+
+
+# dei:EntityCommonStockSharesOutstanding is a MANDATORY cover-page tag every 10-Q/10-K
+# carries, so a stale companyfacts value looks like a data gap but almost never is one:
+# companyfacts serves only the NON-dimensional default-context fact, and a multi-class
+# issuer tags shares outstanding PER CLASS with a dimension (ClassOfStockAxis or
+# similar), which companyfacts drops entirely — the same drop-dimensional-facts
+# behavior documented above for balance-sheet concepts, just on a dei tag instead of a
+# us-gaap one. Measured 2026-08-18: VICR's last non-dimensional fact was 2015-04-24
+# (26,978,949 shares) while its 2026-07-29 10-Q carries two dimensional facts totaling
+# 46,106,732 — computed market cap corrected from a 0.63 Finnhub ratio to 1.07. Same
+# shape confirmed for GEL (2014-02-24 -> current, ratio 0.73 -> 1.00), LEU (2022-03-01
+# -> current, 0.65 -> 0.95), ATROB (2023-03-06 -> current, 0.75 -> 1.00), TBLA
+# (2024-10-31 -> current, transitioned to dimensional reporting since).
+def _shares_out_rescue(cik, tk):
+    """Read the latest 10-Q/10-K's own XBRL instance for every
+    EntityCommonStockSharesOutstanding fact (any dimension) at the freshest instant
+    found. Returns (value, asof, n_classes) or None. Never raises.
+
+    Summing every class is right for a genuine dual/multi-class COMMON structure
+    (VICR/GEL/LEU/ATROB: each class carries identical economic rights, so total
+    shares x one class's price IS the market cap) but wrong for an Up-C-style
+    holding company where "classes" are structurally different instruments — ARES
+    tags five dei figures (223.96M / 3.49M / 1,000 / 102.83M / 30M) and only the
+    223.96M is the publicly-traded Class A; the other four are non-economic voting
+    shares and AOG/LP-style units that do not price 1:1 with Class A. Summing all
+    five overcorrected ARES's market-cap check from a 0.46 Finnhub ratio to 1.60 —
+    WORSE than the stale figure it replaced (2026-08-18). Fetch Finnhub's own
+    market-cap figure (second-source cross-check only, per doctrine) and pick
+    whichever of {sum of all classes, largest class alone} lands closer — never
+    assume the sum is right just because there is more than one class."""
+    try:
+        import sys as _s, pathlib as _p
+        _s.path.insert(0, str(_p.Path(__file__).resolve().parent))
+        import xbrlfacts as X
+        acc, form, fdate, _doc = X.latest_filing(cik)
+        if not acc:
+            return None
+        fs = X.facts(cik, acc)
+    except Exception:
+        return None
+    hits = [f for f in fs if f.get("tag") == "EntityCommonStockSharesOutstanding"
+            and f.get("instant") and f.get("number")]
+    if not hits:
+        return None
+    newest = max(h["instant"] for h in hits)
+    at_newest = [h for h in hits if h["instant"] == newest]
+    n = len(at_newest)
+    total = sum(h["number"] for h in at_newest)
+    if n == 1:
+        return total, newest, n
+    largest = max(h["number"] for h in at_newest)
+    px, fh_mc = _price(tk), _finnhub_mktcap(tk)
+    if px and fh_mc:
+        err_sum = abs(px * total - fh_mc) / fh_mc
+        err_largest = abs(px * largest - fh_mc) / fh_mc
+        if err_largest < err_sum:
+            return largest, newest, 1
+    return total, newest, n
 
 
 def _rescue_instant(card, F, cik, wanted, asof):
@@ -545,28 +715,128 @@ def _rescue_instant(card, F, cik, wanted, asof):
 # direction; understating debt is the direction that has already cost us twice.
 ZERO_PROVABLE = ("debt_lt", "debt_current")
 
+# noncontrolling-interest / mezzanine equity carried OUTSIDE parent-only StockholdersEquity
+# but INSIDE the balance-sheet identity (assets = liabilities + NCI + temporary equity +
+# parent equity). Fetched ONLY for the footing check below — never allowed to touch F["equity"],
+# which must stay parent-only (same reason ProfitLoss stays a net_income fallback, never first:
+# ROE/BVPS/price-to-book are shareholder-facing and NCI is not the shareholders' equity).
+#
+# Measured 2026-08-18 across 15 "BALANCE SHEET DOES NOT FOOT" flags: the gap matched this
+# figure to the dollar for L (917.0M), DAN (63.0M), WBD (1,157.0M), GETY (48.244M),
+# MTX (31.9M), HGV (156.0M), MAC (80.275M), QVCG (74.0M), SXC (27.9M), HUT (311.410M),
+# LB (476.275M), ARES (4,634.2M, 0.1% residual), HY (20.0M, NCI + redeemable NCI both
+# needed), FCELB (68.939M, NCI + temporary equity both needed) — every REIT/insurer/holdco
+# with joint-venture or OP-unit noncontrolling interests, or a redeemable-preferred mezzanine
+# line, was flagging a false "does not foot" because the identity was tested against
+# shareholders' equity alone instead of total equity.
+MEZZANINE_TAGS = ("MinorityInterest", "TemporaryEquityCarryingAmountAttributableToParent",
+                  "RedeemableNoncontrollingInterestEquityCarryingAmount")
 
-def _zero_proof(card, F, names, tol=0.01):
-    """Turn 'stale, unknown' into 'zero, proven' where the balance sheet foots without it.
-    Returns the concepts proven zero."""
+
+def _mezzanine_equity(gaap, asof, parent_eq):
+    """Sum of NCI/temporary-equity concepts reported AT the balance-sheet date. Read from
+    the ALREADY-FETCHED companyfacts blob, not a fresh companyconcept call: the per-tag
+    companyconcept endpoint served an empty units.USD for WELL's MinorityInterest (939.184M
+    at 2026-03-31) while the very same figure sat right there in bulk companyfacts —
+    an SEC API inconsistency, not a data gap (2026-08-18). Returns None (not 0) when
+    nothing is found, so the caller can tell 'no mezzanine equity' from 'not present'."""
+    total, found, got_minority = 0.0, False, False
+    for tag in MEZZANINE_TAGS:
+        rows = [r for r in gaap.get(tag, {}).get("units", {}).get("USD", [])
+                if r.get("end") == asof and r.get("val") is not None]
+        if rows:
+            total += max(rows, key=lambda r: r.get("filed") or "")["val"]
+            found = True
+            if tag == "MinorityInterest":
+                got_minority = True
+    if not got_minority:
+        # ARES: 732 facts live under its own `ares:` extension namespace (companyfacts
+        # drops it) and NCI never gets its own us-gaap MinorityInterest tag — only the
+        # COMBINED total. Where that happens, back the NCI portion out of the combined
+        # tag instead of losing it: NCI = (parent + NCI) - parent.
+        rows = [r for r in gaap.get("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", {})
+                .get("units", {}).get("USD", [])
+                if r.get("end") == asof and r.get("val") is not None]
+        if rows:
+            incl = max(rows, key=lambda r: r.get("filed") or "")["val"]
+            total += incl - parent_eq
+            found = True
+    return total if found else None
+
+
+def _foot_check(card, F, gaap, tol=0.01, flag=True):
+    """Does the balance sheet foot? Runs on EVERY card, always.
+
+    This logic used to live only inside _zero_proof, which only runs when some concept is
+    missing or stale — so a card with every concept PRESENT but one of them WRONG was never
+    checked at all. That is how GEL shipped on 2026-08-18 carrying equity of $127,680,000
+    against $5.41B of assets and $4.96B of liabilities (the identity implies ~$452.8M; the
+    card had grabbed a component of an MLP's partners' capital rather than the total) with
+    ZERO flags on it. sweepcheck caught it from outside the card; the card itself was silent,
+    and a silent card is what the PM underwrites from.
+
+    Returns (foots, implied, gap, err, equity_used) — equity_used may include mezzanine.
+    `flag=False` lets a caller reuse the arithmetic without double-flagging."""
     ta = (F.get("total_assets") or {}).get("value")
     eq = (F.get("equity") or {}).get("value")
-    tl = (F.get("total_liabilities") or {}).get("value")
+    tl_fig = F.get("total_liabilities") or {}
+    tl = tl_fig.get("value")
     asof = (F.get("total_assets") or {}).get("asof")
     if not (ta and eq and tl) or ta - eq <= 0:
-        return []
+        return None, None, None, None, eq
+    if tl_fig.get("STALE"):
+        # total_liabilities is itself a retired/stale tag (FLS: last filed 2014-12-31,
+        # 4199d behind) — testing the identity against a number the card already
+        # quarantined produces a bogus gap, not a real footing defect. That STALE flag
+        # already tells the reader "excluded from derived values"; a second, contradictory
+        # "does not foot" flag built on the same excluded number is noise, not signal.
+        return None, None, None, None, eq
     implied = ta - eq
     gap = implied - tl
     err = abs(gap) / implied
     if err > tol:
-        # The statement does not foot. Do not assert anything — quantify what is missing,
-        # which is far more useful than "stale" and is the ARI/HUT signature.
-        card["flags"].append(
-            f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but stated "
-            f"liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%). That gap is "
-            f"liabilities we cannot see — net cash and EV are understated by roughly that "
-            f"much. Do not treat this card's leverage as known.")
+        mezz = _mezzanine_equity(gaap, asof, eq)
+        if mezz:
+            implied2 = ta - (eq + mezz)
+            gap2 = implied2 - tl
+            err2 = abs(gap2) / implied2 if implied2 else err
+            if err2 <= tol:
+                card.setdefault("_doc_footing",
+                    f"balance sheet foots once {mezz:,.0f} of noncontrolling/temporary "
+                    f"equity (outside parent-only StockholdersEquity) is added back — "
+                    f"see MEZZANINE_TAGS in fincard.py")
+                implied, gap, err = implied2, gap2, err2
+                eq = eq + mezz  # for the zero-proof note below: total equity, not parent-only
+            else:
+                flag and card["flags"].append(
+                    f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but "
+                    f"stated liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%) "
+                    f"— even after adding {mezz:,.0f} of noncontrolling/temporary equity "
+                    f"(still {gap2:,.0f} / {err2 * 100:.1f}% short). That gap is liabilities "
+                    f"we cannot see — net cash and EV are understated by roughly that much. "
+                    f"Do not treat this card's leverage as known.")
+                return False, implied, gap, err, eq
+        else:
+            # The statement does not foot. Do not assert anything — quantify what is missing,
+            # which is far more useful than "stale" and is the ARI/HUT signature.
+            flag and card["flags"].append(
+                f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but stated "
+                f"liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%). That gap is "
+                f"liabilities we cannot see — net cash and EV are understated by roughly that "
+                f"much. Do not treat this card's leverage as known.")
+            return False, implied, gap, err, eq
+    return True, implied, gap, err, eq
+
+
+def _zero_proof(card, F, names, gaap, tol=0.01):
+    """Turn 'stale, unknown' into 'zero, proven' where the balance sheet foots without it.
+    The footing arithmetic is _foot_check's; this only acts on its verdict."""
+    foots, implied, gap, err, eq = _foot_check(card, F, gaap, tol, flag=False)
+    if not foots:
         return []
+    ta = (F.get("total_assets") or {}).get("value")
+    tl = (F.get("total_liabilities") or {}).get("value")
+    asof = (F.get("total_assets") or {}).get("asof")
     proven = []
     for n in names:
         if n not in ZERO_PROVABLE:
@@ -667,18 +937,27 @@ def build(tk, cik_override=None):
     #   * every entry carries a verbatim quote + the document it came from
     #   * source is stamped MANUAL and a flag is raised on every card that uses one
     for name, ov in (MANUAL.get(tk.upper()) or {}).items():
-        if name in F or name not in FLOW:
-            continue                       # XBRL wins; never override a tagged figure
+        if name not in FLOW:
+            continue
+        existing = F.get(name)
+        # XBRL wins whenever it is AT LEAST AS FRESH as the manual figure — MANUAL exists
+        # to beat a stale/absent XBRL pass, never to override a current tag. MDGL's cogs is
+        # PRESENT in F (companyfacts served a genuine 2024-12-31 CostOfGoodsAndServicesSold
+        # point) but that point is 546+ days stale because the fresher quarters are filed
+        # only under a segment dimension companyfacts drops — "name in F" alone would have
+        # skipped this override forever, so freshness (not mere presence) is the test.
+        if existing and (existing.get("period_end") or "") >= (ov.get("period_end") or ""):
+            continue
         F[name] = {"value": ov["value"], "unit": FLOW_UNITS.get(name, "USD"),
                    "period": ov["period"], "period_end": ov["period_end"],
-                   "tag": "MANUAL (untagged in XBRL)", "source": "MANUAL — PM-verified",
+                   "tag": "MANUAL (not read by the XBRL pass)", "source": "MANUAL — PM-verified",
                    "quote": ov["quote"], "doc": ov["doc"], "entered": ov["entered"],
                    "formula": ov.get("formula")}
         ttm_vals[name] = ov["value"]
         card["flags"].append(
-            f"{name}: MANUAL figure — untagged in XBRL, keyed from the printed statement "
-            f"({ov['doc']}, entered {ov['entered']}). Quote on the figure. Derived values "
-            f"built on it inherit this: verify the quote before quoting the derivation.")
+            f"{name}: MANUAL figure — not read by the XBRL pass, keyed from the printed "
+            f"statement ({ov['doc']}, entered {ov['entered']}). Quote on the figure. Derived "
+            f"values built on it inherit this: verify the quote before quoting the derivation.")
 
     # quarantine stale flows: a concept whose data ends >270 days before the freshest
     # concept was likely reported under a retired tag — keep the figure (flagged) but
@@ -689,11 +968,13 @@ def build(tk, cik_override=None):
     for n, e in ends.items():
         if e and newest_end and _days(e, newest_end) > 270:
             F[n]["STALE"] = f"data ends {e}, {_days(e, newest_end)}d behind freshest concept — tag likely retired"
-            if n in EPISODIC_FLOWS:
+            if n in EPISODIC_FLOWS or n in DISPLAY_ONLY:
                 # Not a defect: the company stopped doing the thing. Recorded, not flagged.
                 F[n]["not_reported"] = (f"last reported {e}; nothing since. For {n} that normally "
                                         f"means the company did none — not that the tag moved.")
                 F[n].pop("STALE", None)
+            elif n in AUX_ONLY_FLOWS:
+                pass  # excluded from ttm_vals below, but no standalone flag — see AUX_ONLY_FLOWS
             else:
                 card["flags"].append(f"{n}: STALE ({F[n]['STALE']}) — excluded from derived values")
             del ttm_vals[n]
@@ -758,7 +1039,11 @@ def build(tk, cik_override=None):
     for n, e in inst_ends.items():
         if e and inst_newest and _days(e, inst_newest) > 270:
             F[n]["STALE"] = f"data ends {e}, {_days(e, inst_newest)}d behind freshest concept — tag likely retired"
-            card["flags"].append(f"{n}: STALE ({F[n]['STALE']}) — excluded from derived values")
+            if n in DISPLAY_ONLY:
+                F[n]["not_used"] = ("stale, and no derived value reads it — recorded rather "
+                                    "than flagged (see DISPLAY_ONLY in fincard.py)")
+            else:
+                card["flags"].append(f"{n}: STALE ({F[n]['STALE']}) — excluded from derived values")
             stale_instant.add(n)
 
     # Before accepting "missing" or "stale" as the answer, read the filing. One HTTP fetch,
@@ -777,7 +1062,7 @@ def build(tk, cik_override=None):
         # PROVE is zero. Run last, on what is still unresolved.
         try:
             _left = [n for n in _wanted if F.get(n, {}).get("source") != "filing-extension"]
-            for n in _zero_proof(card, F, _left):
+            for n in _zero_proof(card, F, _left, gaap):
                 stale_instant.discard(n)
         except Exception as e:
             card["flags"].append(f"zero-proof failed ({type(e).__name__}: {str(e)[:60]})")
@@ -794,6 +1079,25 @@ def build(tk, cik_override=None):
             if r.get("end"):
                 seen_sh[r["end"]] = r["val"]
         S["shares_out"] = {"points": [{"asof": k, "value": seen_sh[k]} for k in sorted(seen_sh)[-16:]]}
+
+    # multi-class rescue: trigger whenever companyfacts served nothing, or something
+    # more than 270 days old — see _shares_out_rescue's docstring for why that happens.
+    _cur_end = F.get("shares_out", {}).get("asof")
+    if not _cur_end or _days(_cur_end, now[:10]) > 270:
+        _resc = _shares_out_rescue(cik, tk)
+        if _resc:
+            _val, _asof, _n = _resc
+            if not _cur_end or _asof > _cur_end:
+                F["shares_out"] = {
+                    "value": _val, "unit": "shares", "asof": _asof,
+                    "tag": f"dei:EntityCommonStockSharesOutstanding ({_n} class(es), filing-summed)",
+                    "source": "filing-extension",
+                    "note": (f"companyfacts served no current non-dimensional shares fact "
+                             f"(multi-class issuer, or filer switched to per-class tagging) — "
+                             f"summed {_n} class(es) from the issuer's own latest 10-Q/10-K "
+                             f"instead of using a stale companyfacts figure.")}
+                card.setdefault("rescued", []).append(
+                    {"concept": "shares_out", "value": _val, "asof": _asof, "classes": _n})
 
     # preferred liquidation preference — COMMON book value must exclude it (BOOK.md
     # fincard defect (b), 2026-08-13: ARI printed BVPS 9.79 against 8.47 true, because
@@ -854,6 +1158,13 @@ def build(tk, cik_override=None):
                 f"current_assets / current_liabilities")
 
     rev, ni, opi = ttm_vals.get("revenue"), ttm_vals.get("net_income"), ttm_vals.get("op_income")
+    if opi is None and rev is not None and ttm_vals.get("costs_and_expenses") is not None:
+        opi = rev - ttm_vals["costs_and_expenses"]
+        put("op_income_calc", opi,
+            f"revenue {rev:,.0f} - costs_and_expenses {ttm_vals['costs_and_expenses']:,.0f}",
+            "issuer's income statement has no OperatingIncomeLoss subtotal — this is "
+            "revenue minus the statement's own 'Total costs and expenses' line, the "
+            "subtotal that precedes Other Income/Expense on the face of the statement")
     cfo, capex = ttm_vals.get("cfo"), ttm_vals.get("capex")
     capex_note = ""
     if cfo is not None and capex is None:
@@ -1040,6 +1351,26 @@ def build(tk, cik_override=None):
                 f"NO USABLE FACTS: {len(_missing)} core us-gaap concepts missing "
                 f"({', '.join(_missing)}) and no alternate taxonomy present. Nothing derived on "
                 f"this card can be trusted.")
+
+    # Always, on every card — not only when something was missing.
+    _foot_check(card, F, gaap)
+
+    # DISPLAY_ONLY asserts these concepts feed nothing. If that stops being true the silence
+    # it buys becomes a hidden defect, so the claim verifies itself here rather than relying
+    # on anyone remembering the doctrine.
+    # Plain-string word boundary rather than a regex: `re` is deliberately not imported in
+    # this module and adding an import to a file two other sessions co-edit is a wider blast
+    # radius than this check is worth.
+    _f = " ".join(str((v or {}).get("formula") or "") for v in card["derived"].values()).lower()
+    for _sep in "()/-+,x":
+        _f = _f.replace(_sep, " ")
+    _f = f" {_f} "
+    for _c in DISPLAY_ONLY:
+        if f" {_c} " in _f:
+            card["flags"].append(
+                f"DOCTRINE BREACH: `{_c}` is DISPLAY_ONLY in fincard.py (staleness recorded, "
+                f"not flagged) but a derived value on this card now consumes it. Remove it "
+                f"from DISPLAY_ONLY — a concept that feeds a number must flag.")
 
     flow_end = (F.get("cfo") or F.get("revenue") or {}).get("latest_quarter_end") \
         or (F.get("cfo") or F.get("revenue") or {}).get("period", "")[-10:]

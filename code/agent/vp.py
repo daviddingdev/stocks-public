@@ -39,6 +39,18 @@ import sys
 import time
 from pathlib import Path
 
+
+def _stamp():
+    """Provenance stamp so this brief's CONTENT drift is measurable later, not just its age.
+    On 2026-08-19 this brief read three hours old and described a six-hour-old world."""
+    try:
+        import asof
+        return asof.stamp()
+    except Exception:
+        return ""
+
+
+
 HERE = Path(__file__).resolve().parent
 ENGINE = HERE.parent
 ROOT = ENGINE.parent
@@ -239,7 +251,54 @@ def brief(stages=None):
     L.append("- the funnel: which leads earn real underwriting, which get dropped with a note")
     L.append("- anything a flag or STALE marker touches — a flagged number is not a number yet")
     L.append("")
-    _write(DATA / "vp_brief.md", "\n".join(L))
+    # brief() rewrites the file, which DROPS any VP review appended by a previous run —
+    # correct, because a review written against an older brief is exactly the staleness this
+    # system exists to catch. But silence would read as "there was no review", so say it.
+    L += ["", "---", "",
+          "_**VP review (judgment layer) has not run against this brief.** The sixteen coded "
+          "stages above are complete; the Sonnet pass that triages them for you is separate "
+          "and appends below when it finishes. If you are reading this line, it has not — "
+          "treat the stage output as raw and do your own triage._"]
+    # ASKS, BEFORE THE TRADING DAY (David 2026-08-19: the VP should "ensure all asks are
+    # addressed for the PM before the trading day and highlight areas not addressed"). The PM
+    # wakes at 14:05Z; this brief is written at 20:40Z the evening before, so it is the last
+    # checkpoint between an ask being filed and the PM trading without having seen it.
+    try:
+        import asks as _asks
+        _open = [a for a in _asks.load()["asks"] if a["status"] == "open"]
+        _pm = [a for a in _open if a["to"] == "pm"]
+        _unacked = [a for a in _pm if not a.get("acked")]
+        _stale = _asks.stale()
+        A = ["", "## Asks — what is waiting on you before the open", ""]
+        if not _open:
+            A.append("_Nothing open. Every ask filed by any role has been decided._")
+        else:
+            A.append(f"**{len(_pm)} addressed to YOU, {len(_unacked)} not yet acknowledged.** "
+                     f"{len(_open)} open across all roles.")
+            A.append("")
+            if _pm:
+                A += ["| id | from | age | ask |", "|---|---|---|---|"]
+                for a in _pm:
+                    mark = "" if a.get("acked") else " **← UNREAD**"
+                    A.append(f"| `{a['id']}` | {a['by']} | {_asks.age_days(a)}d | "
+                             f"{str(a['ask'])[:110]}{mark} |")
+                A.append("")
+            other = [a for a in _open if a["to"] != "pm"]
+            if other:
+                A.append("Open elsewhere — not yours to do, but you own the fact that they "
+                         "move: " + ", ".join(f"`{a['id']}`&rarr;{a['to']} "
+                                              f"({_asks.age_days(a)}d)" for a in other))
+            if _stale:
+                A += ["", f"**⚠ {len(_stale)} ask(s) past the 4-day line with a cron-driven "
+                          f"owner — contract C15 is failing on these:** "
+                          + ", ".join(a["id"] for a in _stale)]
+        L += A
+    except Exception as _e:
+        L += ["", "## Asks", "",
+              f"_asks channel unavailable ({type(_e).__name__}) — check `asks.py` before "
+              f"assuming nothing is waiting._"]
+
+    _write(DATA / "vp_brief.md", "\n".join(L) + _stamp())
     return DATA / "vp_brief.md", total_open
 
 
@@ -374,6 +433,10 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     # current until the issuer files again). Non-fatal: it reports, the PM decides.
     stages.append(run("identity", ["python3", "sweepcheck.py", "identity"], 300))
     stages.append(run("asof", ["python3", "asof.py", "check"], 300))
+    # Content drift: which desk documents describe a world that has since moved. File age
+    # cannot see this — on 2026-08-19 every input read "ok" while the brief described a
+    # six-hour-old world.
+    stages.append(run("drift", ["python3", "asof.py", "drift"], 300))
     stages.append(run("filings", ["python3", "asof.py", "filings"], 600))
     path, nfind = brief(stages)
     # The review reads the brief, so it must run after brief() writes it — and it appends
