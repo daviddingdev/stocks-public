@@ -25,8 +25,13 @@ CLI:
   bench.py fill [--limit N]        build read-tasks from the readable set
   bench.py work [--minutes M] [--model fast|dense] [--worker NAME]
   bench.py status                  queue counts + throughput
-  bench.py rank                    -> data/bench.json, ranked by EVIDENCE not multiples
-  bench.py question "<text>"       set the nightly question (the PM owns this)
+  bench.py rank                    -> data/bench.json, ranked by a coded specificity score
+                                    (bench.py-030) — not model confidence, not multiples
+  bench.py question "<text>"       set the nightly ask only (shorthand for --ask)
+  bench.py question --ask "..." [--rule "..."] [--channel "..."] [--schema "..."]
+                                    set any/all of the question's fields (the PM owns this) —
+                                    always update rule+channel together with ask if the new
+                                    ask changes what "gap found" should mean
 """
 import datetime as dt
 import json
@@ -433,8 +438,48 @@ def status():
     print(f"question: {question()['channel']} (set_by {question().get('set_by')})")
 
 
+# bench.py-030 (pm, 2026-08-20): the model's own "confidence" field is saturated —
+# 494 rows sampled 2026-08-21 landed 8/9/10 only, with 84% at exactly 9, so the page-one
+# ranking (best desc) was really ordering by quote COUNT, not by strength, and the header's
+# claim to rank "by EVIDENCE" was false in practice. The PM's own diagnostic: check whether
+# the per-quote judgment has variance BEFORE building a new score on top of it — it does not
+# discriminate at the top, so per the PM's instruction ("if the local model cannot produce a
+# discriminating score... rank on something coded instead") this replaces confidence as the
+# RANKING key with a coded specificity score: does the quote carry a concrete, checkable
+# figure (a dollar amount or percentage) AND name an actual change to a prior arrangement
+# (terminated, impaired, breached, written off, ...)? A quote with both is a checkable,
+# consequential fact — the kind the PM asked this channel to surface, rare by construction
+# (14/494 rows scored the max on the corpus this was tuned against). Model confidence is
+# kept on each evidence item for reference; it no longer drives order.
+_NUM_RE = re.compile(r"(\$[\d,.]+\s?(million|billion|thousand)?|\d[\d,]*\.?\d*\s?%)", re.I)
+_CHANGE_RE = re.compile(
+    r"\b(terminat\w*|discontin\w*|withdr\w*|ceas\w*|expir\w*|cancel\w*|breach\w*|default\w*|"
+    r"impair\w*|write.?off\w*|restat\w*|resign\w*|depart\w*|non.?renewal|not\s+renew\w*|"
+    r"declin\w*|delist\w*|bankrupt\w*|covenant\s+violat\w*|going\s+concern|material\s+weakness)\b",
+    re.I)
+_DATE_RE = re.compile(r"\b(20\d{2}|january|february|march|april|may|june|july|august|september|"
+                      r"october|november|december)\b", re.I)
+
+
+def _specificity(quote):
+    """0-10, coded — see bench.py-030 note above `rank()`. Rare at the top by design."""
+    if not quote:
+        return 0
+    s = 0
+    if _NUM_RE.search(quote):
+        s += 4
+    if _CHANGE_RE.search(quote):
+        s += 4
+    if _DATE_RE.search(quote):
+        s += 1
+    wc = len(quote.split())
+    if 8 <= wc <= 70:
+        s += 1
+    return min(s, 10)
+
+
 def rank():
-    """bench.json — ranked by EVIDENCE FOUND, never by a multiple."""
+    """bench.json — ranked by a CODED specificity score (bench.py-030), never by a multiple."""
     q = _load()
     by = {}
     for t in q["tasks"].values():
@@ -442,22 +487,60 @@ def rank():
             continue
         r = t["result"]
         row = by.setdefault(t["ticker"], {"ticker": t["ticker"], "evidence": [], "best": 0})
-        row["evidence"].append({"quote": r.get("contradicting_disclosure"),
+        quote = r.get("contradicting_disclosure")
+        row["evidence"].append({"quote": quote,
                                 "narrative": r.get("narrative"),
                                 "why": r.get("why_it_matters"),
                                 "confidence": r.get("confidence"),
+                                "score": _specificity(quote),
                                 "doc": Path(t["file"]).name, "model": t.get("model")})
-        row["best"] = max(row["best"], int(r.get("confidence") or 0))
+        row["best"] = max(row["best"], _specificity(quote))
     out = sorted(by.values(), key=lambda x: (-x["best"], -len(x["evidence"])))
     _write(BENCH, {"built": _now(), "question": question(), "rows": out,
-                   "_doc": "Ranked by evidence found, not by multiples. A row is a LEAD; the "
-                           "full evidence gate is unchanged before any order."})
+                   "_doc": "Ranked by a coded specificity score (numeric figure + a change-to-"
+                           "prior-arrangement verb in the quote), not model confidence and not "
+                           "a multiple — see bench.py-030. A row is a LEAD; the full evidence "
+                           "gate is unchanged before any order."})
     print(f"bench.json: {len(out)} names with verbatim-verified evidence")
     for r in out[:10]:
         print(f"  {r['best']}/10 {r['ticker']:<6} {len(r['evidence'])} quote(s) · "
               f"{(r['evidence'][0]['quote'] or '')[:80]}")
     return out
 
+
+
+ALIAS_LISTING_TYPES = {"CDI", "ADR", "GDR"}
+
+
+def _alias_listing_type(tk):
+    """bench.py-027: AVHHL's card carried AVITA Medical's ASX depositary-interest price
+    ($1.42) against RCEL's own XBRL-derived share count, a ~7x market-cap error, because
+    Stage A's universe() picks one ticker per CIK from company_tickers.json and CIKs with
+    a depositary-receipt listing alongside their primary one can lose that pick to the DR.
+
+    The PM's proposed test — skip if Finnhub /stock/profile2?symbol=X resolves to a
+    DIFFERENT ticker — does NOT discriminate: verified empirically against all 6 known
+    non-primary-ticker cards, profile2 resolves ALL SIX (including the 5 genuine distinct
+    securities: ATROB, FCELB, HSCSW, LBRDP, NCRRP) to a different symbol. Shipping that
+    rule would have skipped cards for 5 real securities to catch 1 true alias.
+
+    Finnhub's /search 'type' field is narrower and DOES separate them on the same 6-name
+    check: AVHHL -> 'CDI' (a CHESS Depositary Interest — by definition a duplicate of a
+    primary listing elsewhere, never itself an XBRL-reporting entity); the other 5 came
+    back 'Common Stock' / 'Equity WRT' / 'PUBLIC' / ''. ADR/GDR are the same duplicate-
+    listing shape as CDI and get the same treatment on the same reasoning, though only
+    CDI is verified against a live case."""
+    try:
+        key = json.loads((ENGINE / "config" / "keys.json").read_text()).get("finnhub", "")
+        with urllib.request.urlopen(
+                f"https://finnhub.io/api/v1/search?q={tk}&token={key}", timeout=15) as r:
+            d = json.loads(r.read())
+        for row in d.get("result") or []:
+            if (row.get("symbol") or "").upper() == tk.upper():
+                return row.get("type") or ""
+    except Exception:
+        pass
+    return ""
 
 
 def cards(limit=15):
@@ -488,8 +571,12 @@ def cards(limit=15):
     if not todo:
         print("bench cards: every top lead already has a card")
         return []
-    built, failed = [], []
+    built, failed, skipped = [], [], []
     for tk in todo:
+        alias = _alias_listing_type(tk)
+        if alias in ALIAS_LISTING_TYPES:
+            skipped.append(f"{tk}({alias})")
+            continue
         (NAMES / tk).mkdir(parents=True, exist_ok=True)
         try:
             p = subprocess.run([str(ENGINE / ".venv/bin/python"), str(ENGINE / "valuation/fincard.py"),
@@ -499,7 +586,9 @@ def cards(limit=15):
         except Exception:
             failed.append(tk)
     print(f"bench cards: {len(built)} built, {len(failed)} failed"
-          + (f" ({', '.join(failed)})" if failed else ""))
+          + (f" ({', '.join(failed)})" if failed else "")
+          + (f", {len(skipped)} skipped as depositary-listing aliases ({', '.join(skipped)})"
+             if skipped else ""))
     return built
 
 
@@ -540,11 +629,14 @@ def brief(top=25):
     qn = b.get("question") or {}
     L = [f"# The Bench — overnight read, built {b.get('built', '?')}", "",
          "_Your local analyst read primary filings across the market all night, at zero Claude",
-         "token cost, and ranked what it found by EVIDENCE — a verbatim quote that contradicts a",
-         "stated narrative — never by a multiple. Every row below is a **LEAD**: the full evidence",
-         "gate is unchanged before any dollar moves. A quote here is verbatim-verified against the",
-         "filing named; the characterisation next to it is the local model's and is NOT._", "",
-         f"**Question asked:** {qn.get('channel', '?')}", "",
+         "token cost. Ranked by a CODED score (a concrete figure + a change-to-prior-arrangement",
+         "verb in the quote), not the model's own confidence — that field saturated at 9/10 across",
+         "the corpus and stopped separating anything (bench.py-030) — and never by a multiple.",
+         "Every row below is a **LEAD**: the full evidence gate is unchanged before any dollar",
+         "moves. A quote here is verbatim-verified against the filing named; the characterisation",
+         "next to it is the local model's and is NOT._", "",
+         f"**Question asked:** {qn.get('channel', '?')} "
+         f"(set by {qn.get('set_by', '?')}{' on ' + qn['set_at'] if qn.get('set_at') else ''})", "",
          f"**{len(rows)} names carry evidence · {len(fresh)} are new to you** "
          f"({len(held & {r['ticker'].upper() for r in rows})} already held, "
          f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel).",
@@ -595,8 +687,22 @@ if __name__ == "__main__":
     elif a == ["brief"]:
         brief()
     elif a == ["question"]:
-        t = sys.argv[2] if sys.argv[2:] else ""
-        q = question(); q["ask"] = t; q["set_by"] = "PM"; q["set_at"] = _now()
-        _write(QFILE, q); print("question set")
+        # bench.py-012: a bare positional used to set ONLY 'ask', leaving 'rule' and
+        # 'channel' stuck on DEFAULT_QUESTION's — e.g. rewriting the ask to stop asking
+        # for a narrative while the inherited rule still policed a narrative quote.
+        # --ask/--rule/--channel/--schema let the PM replace exactly the fields it means
+        # to; the positional form is kept as shorthand for --ask only.
+        q = question()
+        positional = sys.argv[2] if sys.argv[2:] and not sys.argv[2].startswith("--") else None
+        for flag, key in (("--ask", "ask"), ("--rule", "rule"),
+                          ("--channel", "channel"), ("--schema", "schema")):
+            v = arg(flag)
+            if v is not None:
+                q[key] = v
+        if positional is not None:
+            q["ask"] = positional
+        q["set_by"] = "PM"; q["set_at"] = _now()
+        _write(QFILE, q)
+        print(f"question set: channel={q['channel']!r} ask={q['ask'][:60]!r}... rule={q['rule'][:60]!r}...")
     else:
         sys.exit(__doc__)

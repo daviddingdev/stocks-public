@@ -25,6 +25,7 @@ CLI:
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -284,12 +285,23 @@ def _rel(p):
 
 
 def _stat(rel):
-    """Freshness of a written artifact. Globs and non-paths resolve to unknown, not to a guess."""
-    if "*" in rel or "<" in rel or not rel.startswith("_engine"):
+    """Freshness of a written artifact. A patterned path (`<date>_fixer.md`, `names/*/…`)
+    resolves to its NEWEST match — the four ops roles' only deliverable is a dated report,
+    and skipping those meant a dead role and a healthy role rendered identically on the
+    org chart while the brief's header promised the opposite (ask roster.py-019, found by
+    the Numbers Engineer 2026-08-20). Prose non-paths still resolve to unknown, not a guess."""
+    if not rel.startswith("_engine"):
         return None
-    p = ROOT / rel
-    if not p.exists():
-        return {"exists": False}
+    if "*" in rel or "<" in rel:
+        pat = re.sub(r"<[^>]*>", "*", rel)
+        matches = [p for p in ROOT.glob(pat) if p.is_file()]
+        if not matches:
+            return {"exists": False}
+        p = max(matches, key=lambda x: x.stat().st_mtime)
+    else:
+        p = ROOT / rel
+        if not p.exists():
+            return {"exists": False}
     m = p.stat().st_mtime
     return {"exists": True, "mtime": m,
             "age_min": int((dt.datetime.now().timestamp() - m) / 60),

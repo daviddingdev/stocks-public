@@ -122,6 +122,12 @@ wherever a decision depends on it, and ONLY there):
    raised the same watchdog defect three sessions running and nothing happened. Attach a
    REPRO whenever you have one; the one you gave for the $8.6 billion miss is what let it be
    fixed and verified in an hour.
+   A DATED EXPECTATION BELONGS ON DAVID'S CALENDAR CARD. Whenever your work produces a
+   date someone should watch — a filing deadline, a record date, a checkpoint, a "this
+   should exist by Friday" — append {{"date","what","expect","by"}} to {DATA}/dates.json.
+   It renders as "Coming up" at the top of David's Book tab (his request 2026-08-19: "just
+   so i know what to be expecting"). Thesis deadlines and acked-ask dues merge in
+   automatically — do not duplicate those.
    AN ASK TO DAVID IS A DECISION, NOTHING ELSE (David, 2026-08-19: "i prefer to make as
    little decisions as possible related to trading, prefer only architectural decisions that
    are truly not able to be made"). The CLI now refuses `--to david` without `--options 'A /

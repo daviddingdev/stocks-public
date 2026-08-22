@@ -84,10 +84,23 @@ def check_card(card):
     if nc is not None and not close(nc, cash + sti - dlt - dcur, 0.001):
         finds.append(f"net_cash derived {nc:,.0f} != recompute {cash + sti - dlt - dcur:,.0f}")
     fcf = (D.get("fcf") or {}).get("value")
-    cfo, capex = gv("cfo"), gv("capex")
-    if fcf is not None and cfo is not None and not close(fcf, cfo - (capex or 0), 0.001):
-        finds.append(f"fcf derived {fcf:,.0f} != CFO - capex recompute {cfo - (capex or 0):,.0f}")
-    if fcf is not None and capex is None:
+    cfo, capex, capex_sw = gv("cfo"), gv("capex"), gv("capex_software")
+    # capex_total mirrors fincard.py's own additive capex_software build (fincard.py-033) —
+    # this recompute must use the SAME formula the card used, or every card that legitimately
+    # sums PP&E + software capex false-fires here as a self-consistency break. Same span
+    # guard too: a "single period on file" figure (< a full TTM/FY) is never combined.
+    capex_sw_comparable = (
+        "single period on file" not in ((F.get("capex") or {}).get("period") or "")
+        and "single period on file" not in ((F.get("capex_software") or {}).get("period") or ""))
+    if capex is not None and capex_sw and capex_sw_comparable:
+        capex_total = capex + capex_sw
+    elif capex is None and capex_sw:
+        capex_total = capex_sw
+    else:
+        capex_total = capex
+    if fcf is not None and cfo is not None and not close(fcf, cfo - (capex_total or 0), 0.001):
+        finds.append(f"fcf derived {fcf:,.0f} != CFO - capex recompute {cfo - (capex_total or 0):,.0f}")
+    if fcf is not None and capex_total is None:
         finds.append("fcf computed with capex MISSING — value is CFO (upper bound); "
                      "any prose citing it as FCF is suspect")
     return finds
@@ -119,7 +132,11 @@ def extract_prose_numbers(text, label):
         "FCF, EBITDA, market cap, buybacks, distributions, valuations) from this trading memo "
         "excerpt. SKIP: share prices, per-share values under $100, the trader's own position "
         "sizes/P&L (a cost basis, a share-of-book percentage), dates, percentages. For each: the amount "
-        "EXACTLY as written and a 2-4 word label of what it claims to be. JSON "
+        "EXACTLY as written and a 2-4 word label of what it claims to be. If the number is "
+        "immediately followed by a parenthetical like '(anchor enterprise value)' or "
+        "'(net debt)', COPY that parenthetical verbatim as the label — do not paraphrase or "
+        "drop qualifying words such as anchor, net, gross, my, implied, cash, levered, "
+        "stressed; those words change what the number means. JSON "
         "{\"numbers\":[{\"text\":\"$824.4M\",\"label\":\"omitted borrowings\"}]}  Max 20.\n\n"
         + text[:11000], num_predict=900)
     out = []
@@ -163,7 +180,13 @@ FAMILIES = [
     # (2026-08-19).
     (("net debt",), ["net_cash"]),
     (("debt", "borrowings", "notes"), ["total_debt", "debt_lt", "debt_current"]),
-    (("market cap", "capitalization"), ["market_cap"]),
+    # "mkt cap"/"mcap": common trading-desk abbreviations for "market cap" that don't
+    # contain the phrase "market cap" as a substring, so the word-boundary match on that
+    # phrase alone never fires — same abbreviation gap "ev" was added to close for
+    # "enterprise value" (2026-08-18). Caught on TLS's own "$331,084k mkt cap" (matches
+    # the card's market_cap 331,083,975.27 to the dollar) and MBGL's "$5,980M mcap"
+    # (2026-08-20).
+    (("market cap", "capitalization", "mkt cap", "mcap"), ["market_cap"]),
     (("enterprise value", "ev"), ["enterprise_value"]),
     (("equity", "book value"), ["equity"]),
     (("buyback", "repurchase"), ["buybacks"]),
@@ -184,10 +207,93 @@ ERROR_WORDS = ("erroneous", "error", "incorrect", "misstated", "mistaken", "wron
 # the watchdog's.
 MODEL_WORDS = ("implied", "modelled", "modeled", "my ", "derived", "scenario", "assumes",
                "assumed", "bear case", "base case", "bull case", "back-of", "reverse dcf",
-               "sotp", "rnpv", "haircut", "stress", "stressed", "levered")
+               "sotp", "rnpv", "haircut", "stress", "stressed", "levered", "anchor",
+               "cash interest")
+# "anchor": an EV/valuation figure computed at the PM's OWN anchor price ("$9,608M
+# (anchor enterprise value)") is by design not equal to the card's live enterprise_value —
+# same class as "levered"/"stressed". "cash interest": the sum of stated coupon rate x
+# principal across a multi-tranche debt schedule (MBGL: 650e6*.05050 + 650e6*.05450 +
+# 700e6*.06050 = 110,600,000 exactly, verified against Note 4 Debt) is real and correct
+# but, like every MODEL_WORDS figure, absent from the filings BY DESIGN — no filing prints
+# the summed total, and no card concept holds cash-interest-paid (checked: MBGL's
+# companyfacts has no InterestPaidNet or equivalent tag at all), so it can never resolve to
+# anything but a false UNSOURCED/MISLABEL. numwatch-009 (2026-08-19): re-derived and
+# confirmed correct by hand; the watchdog cannot re-derive a multi-tranche coupon sum any
+# more than it re-derives a reverse DCF, so it is out of scope by the same logic.
 
 FORWARD_WORDS = ("guide", "guidance", "target", "estimate", "expected", "forecast",
                  "consensus", "e)", "fy26e", "fy27e", "projected", "trim")
+
+# a computed DELTA between two filing figures ("higher capex explains only $16.0M in the
+# quarter ($29.9M across H1)") is a legitimate PM number that by construction appears in no
+# single filing line — same class as MODEL_WORDS, just not a valuation derivation. LYFT's own
+# H1 capex delta (50,718 - 20,786 = 29,932K) fell through to the coincidental-card-concept
+# check and cried MISLABEL against a 2024 balance-sheet figure with no relationship to it
+# (numwatch.py-028, 2026-08-20). Re-derivation is the memo audit's job, not this watchdog's.
+DELTA_WORDS = ("delta", "swing", " vs ", "vs.", "up from", "down from", "increase", "decrease")
+
+# a delta signalled by PUNCTUATION rather than a WORD (numwatch.py-034, PM 2026-08-21):
+# (1) a leading sign directly on the figure — "H1: CFO +26.6M, capex +29.9M" — the same
+#     LYFT H1-capex delta DELTA_WORDS above documents, just spelled with a sign instead of
+#     a word. `literal.strip().startswith(("+", "-"))` alone is not enough: the extraction
+#     model's job is to copy the source "EXACTLY as written", but in practice it often
+#     normalizes "+29.9M" down to "$29.9M" before this code ever sees it, dropping the
+#     sign that was the whole signal. Checking CONTEXT (the raw source window) instead of
+#     the model's literal survives that normalization.
+# (2) either side of a "->" transition — "FCF 610.2 -> 606.9 = -0.5%" — both numbers
+#     express the CHANGE together; neither is independently asserted as a filing level.
+#     Confirmed as a live false MISLABEL, not just a hypothetical: 610.2 in this exact
+#     LYFT memo line traced to series:buybacks:3q-sum by coincidence before this fix.
+# A bare "- " at true line-start (a markdown bullet) must NOT match the sign case — the
+# `[A-Za-z]` anchor requires a letter immediately before the (optionally spaced) sign, and
+# a bullet dash has nothing but line-start whitespace there.
+_SIGN_PREFIX_RE = re.compile(r"[A-Za-z]\s*[+\-]\s*\$?\s*$")
+_ARROW_RE = re.compile(r"->|→")
+
+
+def _is_punctuation_delta(context, literal):
+    """True if `literal`'s occurrence in `context` is marked as a computed change by a
+    leading +/- sign or a '->' transition on either side — see DELTA_WORDS comment above."""
+    i = context.find(literal)
+    if i < 0:
+        return False
+    before, after = context[:i], context[i + len(literal):]
+    if _SIGN_PREFIX_RE.search(before):
+        return True
+    if _ARROW_RE.search(before[-6:]) or _ARROW_RE.search(after[:6]):
+        return True
+    return False
+
+
+def _rounding_interval(num_text):
+    """The dollar interval a memo's OWN precision implies: '$127.2M' asserts
+    127,150,000-127,249,999, because a filing figure of 127,232 (thousands) rounds to
+    127.2 exactly as printed. Returns (lo, hi) or None.
+
+    Exact digit-string matching cannot see this: rendering 127.2e6 back out as a string
+    ('127,200') will never equal the filing's own more-precise '127,232' — the memo
+    correctly rounded, and exact-match punished it for doing so (numwatch.py-028,
+    2026-08-20, LYFT insurance reserves)."""
+    m = re.search(r"([\d,]+\.?\d*)", num_text)
+    if not m:
+        return None
+    mantissa = m.group(1).replace(",", "")
+    try:
+        frac = float(mantissa)
+    except ValueError:
+        return None
+    scale = 1.0
+    low = num_text.lower()
+    if "b" in low or "billion" in low:
+        scale = 1e9
+    elif "m" in low or "million" in low:
+        scale = 1e6
+    elif "k" in low or "thousand" in low:
+        scale = 1e3
+    v = frac * scale
+    decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+    half_unit = 0.5 * scale / (10 ** decimals)
+    return v - half_unit, v + half_unit
 
 
 def _rolling_sums(quarters, n):
@@ -300,7 +406,7 @@ def _in_filings_near(a, label, filing_texts, window=600):
     return None
 
 
-def _in_filings(a, filing_texts):
+def _in_filings(a, filing_texts, literal=""):
     """(see below) — also matches the WORDS form, because filings write "$8.6 billion"
     rather than "8,600" and ARI's "loan book sale price ~$8.6B" failed on exactly that."""
     """Is this number printed in one of the issuer's own filings?
@@ -349,20 +455,67 @@ def _in_filings(a, filing_texts):
             for name, txt in filing_texts.items():
                 if pat in txt or pat.replace(",", "") in txt:
                     return f"filing:{name}~{pat}"
+
+    # ROUNDING-TOLERANT: a memo that correctly rounds a filing figure to its own stated
+    # precision cannot be found by exact digit-string comparison above — the whole point
+    # of rounding is that it drops digits the filing still prints. Scan the filing for any
+    # printed number whose value, at any of the three common filing scales (raw dollars/
+    # thousands/millions), falls inside the interval the memo's own precision implies.
+    if literal:
+        interval = _rounding_interval(literal)
+        if interval:
+            lo, hi = interval
+            if hi > lo + 1:   # a meaningful rounding window, not a whole-dollar figure
+                for scale in (1, 1e3, 1e6):
+                    clo, chi = lo / scale, hi / scale
+                    if clo <= 0:
+                        continue
+                    for name, txt in filing_texts.items():
+                        for m in re.finditer(r"\(?-?[\d,]{3,}(?:\.\d+)?\)?", txt):
+                            tok = m.group(0).strip("()")
+                            try:
+                                v = float(tok.lstrip("-").replace(",", ""))
+                            except ValueError:
+                                continue
+                            if clo <= v <= chi:
+                                return f"filing:{name}~'{tok}' rounds to {literal}"
     return None
 
 
-def trace_number(a, label, card, filing_texts):
+def trace_number(a, label, card, filing_texts, context="", literal=""):
     """Label-constrained tracing. Returns (status, detail):
     ok / forward (unverifiable by design) / mislabel (value exists under a
-    DIFFERENT concept — the LYFT-error shape) / unsourced."""
+    DIFFERENT concept — the LYFT-error shape) / unsourced.
+
+    `context` is a window of the SOURCE memo text around the number's own occurrence —
+    a supplement to `label`, because the 2-4 word label the extraction model produces can
+    drop a qualifier that sits a clause away in the source: "anchor $26.50 -> EV $9,608M"
+    puts "anchor" 12 characters before the number, never adjacent to it as a unit the
+    model reliably preserves when compressing to a short label (numwatch-009, 2026-08-19).
+
+    `literal` is the amount exactly as the source wrote it ("$127.2M") — used only for
+    the rounding-tolerant filing match and the delta leading-sign check; never fed into
+    the family/mislabel logic below."""
+    # context is used ONLY for these three gate checks, on distinctive multi-letter
+    # phrases unlikely to occur by coincidence. It must NOT reach the fam_keys/extras
+    # logic below: that runs on ordinary words ("cash", "debt", "revenue"...) that a
+    # numeric memo's surrounding prose will contain constantly, and would fam-match or
+    # mislabel-suppress almost every number in the document if given an 80-char window.
+    # whitespace-normalized: filing text wraps at arbitrary columns, so "flat at $606.9M
+    # vs\n$610.2M" must still match " vs " — a literal-newline miss is what let LYFT's own
+    # FCF-vs-prior-period delta cry MISLABEL instead of being recognized as one
+    # (numwatch.py-028, 2026-08-20).
+    low_ctx = re.sub(r"\s+", " ", (label + " " + context).lower())
     low = label.lower()
-    if any(w in low for w in FORWARD_WORDS):
+    if any(w in low_ctx for w in FORWARD_WORDS):
         return "forward", "forward-looking/guide — not verifiable against filings"
-    if any(w in low for w in ERROR_WORDS):
+    if any(w in low_ctx for w in ERROR_WORDS):
         return "documented-error", "the label says this figure is WRONG — the PM recording a defect, not asserting a number"
-    if any(w in low for w in MODEL_WORDS):
+    if any(w in low_ctx for w in MODEL_WORDS):
         return "modelled", "the PM's own derivation — absent from filings BY DESIGN; the memo audit re-derives it, not this watchdog"
+    if (any(w in low_ctx for w in DELTA_WORDS) or literal.strip().startswith(("+", "-"))
+            or _is_punctuation_delta(context, literal)):
+        return "modelled", "a computed delta between two filing figures — the PM's own derivation, re-derived by the memo audit, not this watchdog"
     fam_keys = None
     if not any(w in low for w in ("adj", "adjusted", "non-gaap", "gross bookings", "gbv")):
         # adjusted/KPI metrics are press-release numbers — GAAP card can't confirm
@@ -377,6 +530,21 @@ def trace_number(a, label, card, filing_texts):
             if any(re.search(rf"\b{re.escape(w)}\b", low) for w in words):
                 fam_keys = keys
                 break
+        if fam_keys is None:
+            # the label itself named no family ("balance sheet", not "cash") but the
+            # surrounding prose did: ARI's "NOT the $1.24B on the 6/30 balance sheet"
+            # sits one clause from "ARI is ~$747.0M of CASH (pro-forma...)" — a real,
+            # correctly-filed figure (card cash 1,239,480,000, 0.04% off) that a
+            # label-only match can never route anywhere. This still has to pass the
+            # SAME tolerance check below, so a wrong guess here just falls through to
+            # unsourced rather than fabricating a match — and because `low` (not
+            # low_ctx) still drives the extras/mislabel check further down, a
+            # context-derived match can only resolve "ok" or fall through, never
+            # mislabel (numwatch-009 follow-up, 2026-08-20).
+            for words, keys in FAMILIES:
+                if any(re.search(rf"\b{re.escape(w)}\b", low_ctx) for w in words):
+                    fam_keys = keys
+                    break
     if fam_keys:
         # market-priced values drift with the tape after a memo is written —
         # widen tolerance instead of crying wolf on every price move
@@ -394,6 +562,23 @@ def trace_number(a, label, card, filing_texts):
             all_keys = sorted({k for _, ks in FAMILIES for k in ks})
             for src, v in _card_values(card, all_keys):
                 if abs(abs(v) - a) <= TOL * max(abs(v), a):
+                    # a coincidental card-concept match is not proof of mislabeling if the
+                    # number is ALSO independently printed in the filing near words from
+                    # its own surrounding prose — a segment/table figure legitimately
+                    # collides with an unrelated consolidated concept by chance often
+                    # enough that this fired on two real, correctly-labeled, verbatim-
+                    # quoted filing figures the same night: LYFT's own FCF reconciliation
+                    # ("$606.9 $610.2" — matched series:buybacks:3q-sum) and MBGL's B2B
+                    # segment revenue ("revenue $295M -> $313M" — matched
+                    # derived:ebitda_approx). Bare _in_filings (just "is this digit
+                    # string anywhere in the filing") is too loose to trust here — a wrong
+                    # number can trivially be SOME real figure elsewhere in a 10-Q — so
+                    # this uses the same proximity requirement _in_filings_near already
+                    # applies everywhere else, fed by the source prose around the number,
+                    # not just the short label (numwatch-009 follow-up, 2026-08-20).
+                    hit = _in_filings_near(a, label + " " + context, filing_texts)
+                    if hit:
+                        return "in-filing", hit
                     return "mislabel", (f"labeled '{label}' but the value matches {src} — "
                                         "the LYFT-error shape (wrong concept under a familiar name)")
         # BEFORE crying unsourced: is the number simply IN THE FILING, under a line the
@@ -403,7 +588,7 @@ def trace_number(a, label, card, filing_texts):
         # whose label happened to resemble a card concept was declared unsourced without
         # the filings ever being read. That was 162 of 289 open rows on 2026-08-18, 83 of
         # them on names we hold, and it trained the PM to skim a list built to be read.
-        hit = _in_filings(a, filing_texts) or _in_filings_near(a, label, filing_texts)
+        hit = _in_filings(a, filing_texts, literal) or _in_filings_near(a, label, filing_texts)
         if hit:
             return "in-filing", hit
         return "unsourced", f"no {fam_keys} value within {TOL * 100:.0f}%, and not printed in any filing"
@@ -414,10 +599,35 @@ def trace_number(a, label, card, filing_texts):
     # are the category MOST likely to live only in a per-segment $-millions table
     # ("Adjusted EBITDA $ 272 $ 93 ...") where a bare-digit match can't clear the
     # 3-sig-fig bar but proximity to "Adjusted"/"EBITDA" still proves it (2026-08-19).
-    hit = _in_filings(a, filing_texts) or _in_filings_near(a, label, filing_texts)
+    hit = _in_filings(a, filing_texts, literal) or _in_filings_near(a, label, filing_texts)
     if hit:
         return "ok", hit
     return "unsourced", "unknown concept and no precise filing match"
+
+
+def _find_amount(text, literal, a):
+    """Locate a number's OWN occurrence in the source text, for context extraction
+    (trace_number's qualifier-proximity check). A literal find(literal) often misses:
+    extraction is told to copy the amount "EXACTLY as written" but still reformats it
+    ("$758,685K" in the source became "$758.685M" in n["text"] — same value, different
+    text, ARI numwatch-009 follow-up 2026-08-20). Try the literal first, then fall back
+    to scale/decimal variants of the numeric value itself, the same style of form
+    generation _in_filings already uses to match a value against filing text."""
+    i = text.find(literal)
+    if i >= 0:
+        return i
+    for scale in (1e6, 1e3, 1):
+        v = a / scale
+        if not (0.01 <= v < 1e6):
+            continue
+        for dec in (0, 1, 2, 3):
+            for s in (f"{v:,.{dec}f}", f"{v:.{dec}f}"):
+                s = s.rstrip("0").rstrip(".") if dec else s
+                if len(re.sub(r"[^0-9]", "", s)) >= 3:
+                    i = text.find(s)
+                    if i >= 0:
+                        return i
+    return -1
 
 
 def sweep_prose(tk, texts):
@@ -428,7 +638,10 @@ def sweep_prose(tk, texts):
     finds, seen_in_filing = [], []
     for label, text in texts.items():
         for n in extract_prose_numbers(text, label):
-            status, detail = trace_number(n["abs"], n["label"], card, filing_texts)
+            i = _find_amount(text, n["text"], n["abs"])
+            context = text[max(0, i - 80): i + 80] if i >= 0 else ""
+            status, detail = trace_number(n["abs"], n["label"], card, filing_texts, context,
+                                           literal=n["text"])
             if status in ("in-filing", "documented-error", "modelled"):
                 seen_in_filing.append(f"[{status}] {n['text']} ({n['label']}) — {detail}")
                 continue

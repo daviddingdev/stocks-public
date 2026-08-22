@@ -32,6 +32,7 @@ ownership map exists to end. The gate now derives from the same dict as the
 prompts, so a role cannot exist half-way.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -234,6 +235,18 @@ the truth and every known problem has an owner and a plan. Be adversarial toward
 4) DRIFT — compare {HERE}/data/thesis.json anchors vs latest memos: any anchor changed without a
    memo? Any position without a re-underwrite date going stale past the 21d contract line with no
    plan? Any research_spawns.json overrun?
+4c) THE CALENDAR — {HERE}/data/dates.json feeds the "Coming up" card on David's Book tab.
+   Prune rows whose date has passed (note in your report whether each expectation was MET —
+   a missed one is a finding), and add any dated expectation the week produced that nobody
+   filed.
+4a) UNIVERSE HYGIENE — read {HERE}/universe.txt. Every NON-HELD name is a watch that costs a
+   feeds slot every 30 minutes and a line of the PM's attention; each must state a mechanism
+   that is still alive. A watch whose stated mechanism has had no state change in ~30 days
+   (no filing, no event, no re-justification in a session log) is a finding: ask the PM to
+   re-justify or drop it. Held names' hygiene is C3's job, not yours. This is a QUESTION you
+   ask weekly, not a rule that auto-prunes — a slow-burn special situation can be quiet for a
+   month and still be right; the failure mode is the watch nobody can say why we keep
+   (the 2026-08-13 zero-base found 12 of 22 were exactly that).
 4b) EVERY FINDING YOU ASSIGN TO ANOTHER ROLE IS AN ASK, NOT A LINE IN YOUR REPORT.
    `python3 {HERE}/asks.py open --about <subsystem-or-file> --by coo --ask "..." --why "..."
    --repro "..."` — the owner resolves from owners.py automatically; `--to
@@ -339,6 +352,77 @@ PROMPTS = {"numbers": lambda: NUMBERS_PROMPT, "signals": lambda: SIGNALS_PROMPT,
            "coo": lambda: COO_PROMPT, "hunt": lambda: HUNT_PROMPT}
 ROLE_ALIASES = {"fixer": "numbers"}
 
+# Appended to EVERY role prompt (ask ops.py-025). On 2026-08-20 the Numbers Engineer rebuilt
+# 150 cards, then ended its turn to "genuinely wait" for background Monitor notifications —
+# and died, skipping the blast-radius gate, its report, and its commit. The finish is the
+# part that must be mechanically unskippable.
+SINGLE_TURN_NOTE = """
+
+SESSION MECHANICS — READ LAST, FORGET NEVER: you run under `claude -p`, which is SINGLE-TURN.
+Ending your turn to WAIT for a background task or Monitor notification IS session death —
+there is no next turn for the notification to arrive in. Never end a turn while work you
+depend on is unfinished: poll it to completion inside the turn (sleep-and-check in a loop is
+fine; waiting for a wake-up is not). Your report file and your one-line stdout summary are
+the LAST things you write, and no state you leave uncommitted survives you. `ops.py verify`
+checks that your dated report exists after every scheduled run and files a COO ask + phone
+alert when it does not — a session that dies quietly is found by the machine now, but found
+is not finished."""
+
+# role -> (report glob, cron hour, cron minute, weekdays as Mon=0) — the finish contract
+# `ops.py verify` enforces. Same dict philosophy as PROMPTS: a role cannot be launchable
+# without being verifiable.
+FINISH = {"numbers": ("*_fixer.md", 7, 5, {1, 2, 3, 4, 5}),
+          "signals": ("*_signals.md", 7, 35, {1, 2, 3, 4, 5}),
+          "hunt": ("*_hunt.md", 8, 30, {3, 5}),
+          "coo": ("*_coo.md", 15, 0, {5})}
+
+
+def _last_scheduled(hour, minute, weekdays, slack_h=3):
+    import datetime as dt
+    t = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=slack_h)
+    for back in range(14):
+        d = t - dt.timedelta(days=back)
+        cand = d.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if d.weekday() in weekdays and cand <= t:
+            return cand
+    return None
+
+
+def verify():
+    """Did every scheduled role FINISH — i.e. leave its dated report? A missing one gets a
+    phone alert and an ask to the COO (the asks channel, not a bespoke ledger, so C15 ages
+    it and the board shows it). Run from cron daily, after the morning windows."""
+    misses = []
+    for role, (pat, h, m, days) in FINISH.items():
+        due = _last_scheduled(h, m, days)
+        if due is None:
+            continue
+        newest = max((p.stat().st_mtime for p in OPS.glob(pat)), default=0)
+        if newest < due.timestamp():
+            misses.append(f"{role}: scheduled {due:%Y-%m-%d %H:%M}Z, newest report "
+                          f"{'NONE' if not newest else 'older than that run'}")
+    if misses:
+        try:
+            sys.path.insert(0, str(HERE))
+            import asks
+            already = any(a["status"] == "open" and a["by"] == "ops-verify"
+                          for a in asks.load()["asks"])
+            if not already:
+                asks.add("coo", "ops.py verify: scheduled role(s) left NO report — the "
+                                "finish failed even if the launch succeeded: " + "; ".join(misses),
+                         by="ops-verify", about="_engine/agent/ops.py",
+                         why="A role that dies mid-flight skips its gates silently "
+                             "(2026-08-20: numbers rebuilt 150 cards, no snapshot, no "
+                             "report). Read its ops_<role>.log tail, salvage or revert "
+                             "its working tree, and reopen what it left undone.")
+        except Exception:
+            pass
+        subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
+                        "Ops role missed its run",
+                        ("; ".join(misses))[:190]], check=False)
+    print(json.dumps({"ok": not misses, "misses": misses}))
+    return 0 if not misses else 1
+
 
 def launch(role):
     role = ROLE_ALIASES.get(role, role)
@@ -350,7 +434,7 @@ def launch(role):
     if not NO_MCP.exists():
         NO_MCP.write_text(json.dumps({"_doc": "ops sessions get NO MCP servers — no broker, "
                                               "no external tools beyond the box", "mcpServers": {}}, indent=1))
-    prompt = PROMPTS[role]()
+    prompt = PROMPTS[role]() + SINGLE_TURN_NOTE
     cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions",
            "--strict-mcp-config", "--mcp-config", str(NO_MCP),
            # Each role's model comes from the org chart (roster.py), not from here.
@@ -366,8 +450,10 @@ def launch(role):
 
 if __name__ == "__main__":
     r = ROLE_ALIASES.get(sys.argv[1], sys.argv[1]) if sys.argv[1:] else ""
+    if r == "verify":
+        sys.exit(verify())
     if r in PROMPTS:
         out = launch(r)
         print(json.dumps(out))
         sys.exit(0 if out["ok"] else 1)
-    sys.exit("usage: ops.py numbers|signals|coo|hunt   (fixer = alias for numbers)")
+    sys.exit("usage: ops.py numbers|signals|coo|hunt|verify   (fixer = alias for numbers)")

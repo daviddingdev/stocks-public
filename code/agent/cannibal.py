@@ -22,7 +22,8 @@ How it stays cheap at market scale:
      (weeks_on_screen); one-week wonders are usually data artifacts.
 
 Output: data/cannibal.json (top 15 + full survivor list); scout.py ingests the
-top rows as 'cannibal-screen' events. Cron: Sundays 22:30 UTC.
+top rows as 'cannibal-screen' events. Cron: DAILY 22:30 UTC (was Sunday-only; David
+2026-08-18 "why can't cannibal run daily?").
 CLI: cannibal.py run [--max-quotes 300]
 """
 import datetime as dt
@@ -63,6 +64,24 @@ def _get(url):
 def frame(path):
     d = _get(f"https://data.sec.gov/api/xbrl/frames/{path}.json")
     return {row["cik"]: row["val"] for row in d.get("data", [])}
+
+
+def fincard_net_cash():
+    """ticker -> net_cash from our own researched fincard.json cards. Where a card
+    exists it is the higher-fidelity source (tag precedence + zero-proof, not a bulk
+    frames max()) — reconciled against in stage 1 so this screen can never publish a
+    row that contradicts our own book (cannibal.py-036)."""
+    out = {}
+    for p in sorted((HERE / "names").glob("*/fincard.json")):
+        tk = p.parent.name.rsplit("-", 1)[-1].upper()
+        try:
+            d = json.loads(p.read_text())
+            v = ((d.get("derived") or {}).get("net_cash") or {}).get("value")
+        except Exception:
+            continue
+        if isinstance(v, (int, float)):
+            out[tk] = v
+    return out
 
 
 def latest_fy_frame(tag):
@@ -147,13 +166,26 @@ def run(max_quotes=300):
     capex = latest_fy_frame("PaymentsToAcquirePropertyPlantAndEquipment")
     cash = {**frame("us-gaap/CashAndCashEquivalentsAtCarryingValue/USD/CY2025Q4I"),
             **frame("us-gaap/CashAndCashEquivalentsAtCarryingValue/USD/CY2026Q1I")}
-    # merge BOTH major debt tags, worst value wins — the LTD-noncurrent frame alone
-    # missed DXC's multi-billion load and passed it as "net cash" (first-run lesson)
+    # merge debt tags, worst value wins for the noncurrent group — the LTD-noncurrent
+    # frame alone missed DXC's multi-billion load and passed it as "net cash" (first-run
+    # lesson). Tag list mirrors fincard.py's debt_lt/debt_current canon (cannibal.py-036,
+    # 2026-08-22): CLVT and SIG's debt tags only in LongTermDebtAndCapitalLeaseObligations
+    # were absent from the old 3-tag list, so `debt.get(cik, 0)` silently defaulted to 0 —
+    # a real debt load laundered into "net cash" by a missing tag, not a data artifact.
+    DEBT_NONCURRENT_TAGS = ("LongTermDebtNoncurrent", "LongTermDebt",
+                            "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
+                            "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
+                            "FinanceLeaseLiability")
+    DEBT_CURRENT_TAGS = ("LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
+                         "LongTermDebtAndCapitalLeaseObligationsCurrent",
+                         "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent")
     debt = {}
-    for tag in ("LongTermDebtNoncurrent", "LongTermDebt", "DebtCurrent"):
+    debt_seen = set()   # ciks with at least one debt-tag hit — absence is UNRESOLVED, not zero
+    for tag in DEBT_NONCURRENT_TAGS + DEBT_CURRENT_TAGS:
         for period in ("CY2025Q4I", "CY2026Q1I"):
             for cik, v in frame(f"us-gaap/{tag}/USD/{period}").items():
-                debt[cik] = max(debt.get(cik, 0), v or 0) if tag != "DebtCurrent" \
+                debt_seen.add(cik)
+                debt[cik] = max(debt.get(cik, 0), v or 0) if tag in DEBT_NONCURRENT_TAGS \
                     else debt.get(cik, 0) + (v or 0)
     sh_now = {**frame("dei/EntityCommonStockSharesOutstanding/shares/CY2026Q1I"),
               **frame("dei/EntityCommonStockSharesOutstanding/shares/CY2026Q2I")}
@@ -164,8 +196,11 @@ def run(max_quotes=300):
     for v in tick.values():   # first (primary) ticker per CIK wins
         tk_by_cik.setdefault(v["cik_str"], v["ticker"].upper())
 
+    card_nc = fincard_net_cash()
+
     # ---- stage 1: fundamental filters, no prices ----
     survivors = []
+    dropped_no_debt_leg = card_overrides = 0
     for cik, c in cfo.items():
         sn, sa = sh_now.get(cik), sh_ago.get(cik)
         if not c or c <= 0 or not sn or not sa or sn <= 0 or sa <= 0:
@@ -177,17 +212,36 @@ def run(max_quotes=300):
         fcf = c - (cx or 0)
         if fcf <= 0:
             continue
-        nc = (cash.get(cik) or 0) - (debt.get(cik) or 0)
-        if nc < 0 or cash.get(cik) is None:
+        if cash.get(cik) is None:
             continue
         tk = tk_by_cik.get(cik)
         if not tk or not tk.isalpha():
+            continue
+        if tk in card_nc:
+            # our own researched card is authoritative (tag-precedence + zero-proof, not
+            # a bulk frames max()) — trust it over the frames pull, both when it disagrees
+            # AND when the frames pull found no debt tag at all (cannibal.py-036: SIG's
+            # debt resolves to a real, zero-proofed 0 in the card but never appears in
+            # any SEC bulk debt frame for this period).
+            nc = card_nc[tk]
+            card_overrides += 1
+        elif cik not in debt_seen:
+            # no card, and an unresolved debt leg is not a missing decoration for this
+            # screen — it is the absence of the thing being screened for. Drop rather
+            # than admit 0 (cannibal.py-036).
+            dropped_no_debt_leg += 1
+            continue
+        else:
+            nc = cash[cik] - debt.get(cik, 0)
+        if nc < 0:
             continue
         survivors.append({"ticker": tk, "cik": cik, "fcf": fcf, "cfo": c,
                           "capex_known": cx is not None, "net_cash": nc,
                           "shares_now": sn, "share_shrink_pct": round(shrink * 100, 2)})
     print(f"fundamental pass: {len(survivors)} of {len(cfo):,} filers "
-          f"(FCF>0, net cash>=0, shares -{MIN_SHRINK * 100:.0f}%+)")
+          f"(FCF>0, net cash>=0, shares -{MIN_SHRINK * 100:.0f}%+) — "
+          f"{dropped_no_debt_leg} dropped for unresolved debt leg, "
+          f"{card_overrides} used fincard net_cash")
 
     # ---- stage 2: one quote pass, band + yield ----
     try:

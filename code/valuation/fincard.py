@@ -31,6 +31,7 @@ CLI: fincard.py TICKER [--cik N] [--out FILE]
 """
 import datetime as dt
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -44,8 +45,14 @@ from edgar_identity import UA  # SEC contact identity, config-driven
 FLOW = {
     "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
                 "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+    # CostDirectMaterial last: RRGB (Red Robin, a restaurant operator) breaks its
+    # "Restaurant operating costs" block into Cost of sales / Labor / Other operating
+    # rather than one COGS line, and tags Cost of sales with this concept —
+    # $150,686,000 for the 28wk YTD to 2026-07-12, consistent with a ~22% food-cost
+    # ratio and continuous with FY2021-FY2025 annual filings (2026-08-20).
     "cogs": ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfServices",
-             "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
+             "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+             "CostDirectMaterial"],
     "gross_profit": ["GrossProfit"],
     "rnd": ["ResearchAndDevelopmentExpense"],
     "sga": ["SellingGeneralAndAdministrativeExpense",
@@ -87,9 +94,25 @@ FLOW = {
     # PaymentsForProceedsFromProductiveAssets: RYAM's successor to PaymentsToAcquire-
     # PropertyPlantAndEquipment (died 2021-12-31) — same cash-capex line, continuous
     # magnitude (~$95-116M/yr both sides of the switch, 2026-08-18).
+    # PaymentsToAcquireOtherPropertyPlantAndEquipment: EE (Excelerate Energy, an LNG
+    # company) tags its Cash Flow Statement "Purchases of property and equipment" line
+    # with this concept instead of the plain PaymentsToAcquirePropertyPlantAndEquipment
+    # tag — $283.833M at 2026-06-30 (6mo YTD, 10-Q filed 2026-08-06), consistent with
+    # PP&E net growing ~$225M over the same half (2026-08-20).
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquirePropertyAndEquipment",
               "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements",
-              "PaymentsToDevelopRealEstateAssets", "PaymentsForProceedsFromProductiveAssets"],
+              "PaymentsToDevelopRealEstateAssets", "PaymentsForProceedsFromProductiveAssets",
+              "PaymentsToAcquireOtherPropertyPlantAndEquipment"],
+    # SEPARATE cash-flow line from "capex" above, not an alternate tag for it — capitalized
+    # software development is its own investing-activities caption, landing on the balance
+    # sheet as an intangible, never PP&E. Software-heavy issuers routinely tag BOTH lines
+    # (fincard.py-033, PM 2026-08-21): TLS tags PP&E additions AND PaymentsToDevelopSoftware
+    # separately in the same 10-Q, and the issuer's OWN "Free Cash Flow" press-release figure
+    # only reconciles once both are subtracted from CFO — a card that kept PP&E-only capex
+    # read 17.99% FCF margin against TLS's reported 13.9%. Combined additively with "capex"
+    # in the fcf build below (see the capex_sw handling there), never treated as an alternate
+    # tag NAME for the same line the way FLOW_MERGE gap-fills capex's own PP&E alternates.
+    "capex_software": ["PaymentsToDevelopSoftware", "CapitalizedComputerSoftwareAdditions"],
     # CostDepreciationAmortizationAndDepletion (MTX) and CostOfGoodsAndServicesSold-
     # DepreciationAndAmortization (PEG, a regulated utility's "Cost, Depreciation and
     # Amortization" line) are the same D&A figure filed under a cost-statement caption
@@ -130,7 +153,7 @@ FLOW_AVG = {"shares_diluted_wavg"}
 # ProductiveAssets, so no TTM ever assembled and a FY2023 figure was served as
 # current for 1001 days (2026-08-14). NEVER merge concepts whose alternates differ
 # in DEFINITION (sga: SG&A vs G&A; dividends_paid: common-only vs total).
-FLOW_MERGE = {"capex"}
+FLOW_MERGE = {"capex", "capex_software"}
 # balance-sheet points in time
 INSTANT = {
     # the RESTRICTED-inclusive tag stays LAST, and the two narrower balance-sheet tags
@@ -205,12 +228,19 @@ INSTANT = {
     # 5,720,569" at 2026-06-30 tagged exactly so, while LongTermDebtCurrent stopped in
     # 2022 and left the card shouting NET CASH UNRELIABLE over a $460M ghost (2026-08-18).
     # Totals stay first so an issuer filing both keeps the total, never the component.
+    # FinanceLeaseLiability{Noncurrent,Current} last: a standard us-gaap tag for finance-
+    # lease debt, previously absent from this map entirely — TLS (HELD) tags ONLY its
+    # finance leases (2,113,000 current + 4,536,000 noncurrent at 2026-06-30) with no other
+    # debt concept, so the gap was invisible on the card and then laundered into
+    # "PROVEN ZERO" by _zero_proof, since the finance leases sit inside total_liabilities
+    # and the balance sheet foots without them (fincard.py-022, 2026-08-20).
     "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt",
                 "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
-                "OtherLongTermDebtNoncurrent"],
+                "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
+                "FinanceLeaseLiability"],
     "debt_current": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
                      "LongTermDebtAndCapitalLeaseObligationsCurrent",
-                     "OtherLongTermDebtCurrent"],
+                     "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent"],
     "operating_lease_liab": ["OperatingLeaseLiability"],
     "total_liabilities": ["Liabilities"],
     # PartnersCapital{,IncludingPortionAttributableToNoncontrollingInterest} last: an LP
@@ -219,9 +249,15 @@ INSTANT = {
     # is ALSO stale (2015) while the NCI-inclusive one is current ($127.68M at
     # 2026-06-30) — same parent-vs-NCI precedence as the StockholdersEquity pair above,
     # just for the partnership form (2026-08-18).
+    # MembersEquity last: a cooperative/LLC has no "stockholders'" or "partners'" equity
+    # at all — GGROU (Golden Growers Cooperative) tags its balance sheet's "Total
+    # members' equity" line this way, $15,865,000 at 2026-06-30, ties to the penny
+    # against Assets - Liabilities (2026-08-20). Same precedence idea as PartnersCapital
+    # above: a different legal form's equivalent concept, not a subset of equity.
     "equity": ["StockholdersEquity",
                "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-               "PartnersCapital", "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest"],
+               "PartnersCapital", "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
+               "MembersEquity"],
 }
 # totals some issuers tag only ANNUALLY while tagging the current/noncurrent split
 # every quarter — the total then looks like a retired tag (SONO OperatingLease-
@@ -475,7 +511,16 @@ EPISODIC_FLOWS = {
 # pure noise for the ~85% of tickers that never touch it: costs_and_expenses matters
 # only to CXW's op_income_calc fallback, and adding it to FLOW put a "STALE" flag on
 # BKH/CIFR/FCELB/FIS/KLAC/LBRDP that had never used the concept before (2026-08-18).
-AUX_ONLY_FLOWS = {"costs_and_expenses"}
+# capex_software (fincard.py-033, 2026-08-21) is the same shape: it feeds the capex/fcf
+# build only for issuers currently tagging it, but companyfacts keeps a dead data point
+# for issuers that tagged it once and stopped (CDNS last 2021-01-02, GRPN 2012-06-30,
+# FIS 2014-06-30, HGV 2017-12-31) — without this, adding the concept put a fresh "STALE"
+# flag on all four the day it shipped, none of which had ever used it before either.
+# The individual figure still carries its own STALE marker (build()'s quarantine loop
+# sets F["capex_software"]["STALE"] before this set is even consulted) — only the
+# card-level flags list, the one a human actually scans, stays quiet for issuers where
+# it was never material.
+AUX_ONLY_FLOWS = {"costs_and_expenses", "capex_software"}
 
 # Concepts any US-GAAP filer must report. Their absence is a TAXONOMY problem (usually an
 # IFRS filer) rather than a tag-mapping problem — see the check at the end of build().
@@ -715,6 +760,65 @@ def _rescue_instant(card, F, cik, wanted, asof):
 # direction; understating debt is the direction that has already cost us twice.
 ZERO_PROVABLE = ("debt_lt", "debt_current")
 
+# EXHAUSTIVENESS — the second half of the zero-proof standard (pm-023/fincard.py-024,
+# 2026-08-20). Completeness (the footing identity above) is NECESSARY but not sufficient:
+# TLS's finance leases sat INSIDE total_liabilities, so the balance sheet foots cleanly
+# without them and the identity alone still blesses a wrong zero. This regex asks a second,
+# independent question of the SAME companyfacts blob already in memory (no extra HTTP call):
+# does the issuer report ANY debt-like concept, non-dimensional, at the balance-sheet date,
+# that our own tag maps never looked for? A hit means "you may not print PROVEN," never
+# "here is the debt figure" — DebtInstrumentCarryingAmount/SeniorNotes/UnsecuredDebt/
+# SecuredDebt are Note-level disclosure concepts that prove debt exists without giving the
+# balance-sheet current/noncurrent split (WELL: debt_lt already correct, only debt_current
+# open). Measured against the PM's 56-card probe (2026-08-20_pm_zeroproof_scan.py): 30 clean,
+# 25 MISS, 1 mapped-only.
+DEBT_LIKE_PATTERN = re.compile(
+    r"(LongTermDebt|DebtCurrent|DebtNoncurrent|NotesPayable|LoansPayable|"
+    r"FinanceLeaseLiability|CapitalLeaseObligation|ConvertibleNotesPayable|"
+    r"ConvertibleDebt|LineOfCredit|SecuredDebt|UnsecuredDebt|SeniorNotes|"
+    r"DebtInstrumentCarryingAmount|OtherBorrowings|ShortTermBorrowings|"
+    r"BorrowingsUnder|BankOverdrafts|SubordinatedDebt|MortgageLoans)")
+# concepts that match the pattern above by substring but are not a balance-sheet carrying
+# liability. "IssuanceCosts" added here 2026-08-20: DebtIssuanceCostsLineOfCreditArrange-
+# mentsNet is a CONTRA-ASSET (RRGB, confirmed false positive in the PM's own probe), not a
+# liability — TARS carries the same concept alongside a real one, so this must be excluded
+# rather than the whole pattern narrowed. Deliberately does NOT skip "Term" — that would
+# also skip every LongTermDebt* tag, which is the concept this check exists to see.
+DEBT_LIKE_SKIP = re.compile(
+    r"(FairValue|InterestRate|Maturity|Percentage|Weighted|Number|"
+    r"RightOfUseAsset|Payments|Proceeds|Repayments|Expense|Amortization|"
+    r"Gain|Loss|Extinguish|Covenant|Remaining|Undiscounted|Description|"
+    r"IssuanceCosts)")
+
+
+_DEBT_TAG_MAP_CONCEPTS = set(INSTANT["debt_lt"]) | set(INSTANT["debt_current"])
+
+
+def _debt_like_hits(gaap, asof, exclude=_DEBT_TAG_MAP_CONCEPTS):
+    """Any non-dimensional, instant (not duration), nonzero USD fact at the
+    balance-sheet date under a concept name that looks like a liability our own debt
+    tag maps do not resolve. Returns a list of (concept, value) pairs, largest first.
+
+    `exclude` defaults to every tag already IN our own debt_lt/debt_current alternates
+    (e.g. LongTermDebt) — a concept already used to resolve the OTHER debt field on this
+    same card is not an unmapped hit. Without this, MBGL's debt_lt (LongTermDebt,
+    correctly resolved) was reported as an 'unmapped debt-like concept' when checking
+    whether debt_current could be zero-proved, blocking a correct zero on a HELD name
+    (caught in the fincard.py-024 blast-radius review, 2026-08-20)."""
+    hits = []
+    for concept, blob in gaap.items():
+        if concept in exclude:
+            continue
+        if not DEBT_LIKE_PATTERN.search(concept) or DEBT_LIKE_SKIP.search(concept):
+            continue
+        for r in blob.get("units", {}).get("USD", []):
+            if r.get("end") == asof and r.get("val") and not r.get("start"):
+                hits.append((concept, r["val"]))
+                break
+    hits.sort(key=lambda h: -abs(h[1]))
+    return hits
+
+
 # noncontrolling-interest / mezzanine equity carried OUTSIDE parent-only StockholdersEquity
 # but INSIDE the balance-sheet identity (assets = liabilities + NCI + temporary equity +
 # parent equity). Fetched ONLY for the footing check below — never allowed to touch F["equity"],
@@ -730,7 +834,14 @@ ZERO_PROVABLE = ("debt_lt", "debt_current")
 # line, was flagging a false "does not foot" because the identity was tested against
 # shareholders' equity alone instead of total equity.
 MEZZANINE_TAGS = ("MinorityInterest", "TemporaryEquityCarryingAmountAttributableToParent",
-                  "RedeemableNoncontrollingInterestEquityCarryingAmount")
+                  "RedeemableNoncontrollingInterestEquityCarryingAmount",
+                  "TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests")
+# added 2026-08-20 (quality queue CMTL/ATNI footing breaks): the "Including..." variant is
+# used when a filer reports temporary equity WITHOUT splitting out the NCI portion the way
+# TemporaryEquityCarryingAmountAttributableToParent implies a split exists. Matched to the
+# dollar at each issuer's own balance-sheet date: CMTL 210,783,000 (closes a 32.9% gap
+# exactly), ATNI 97,393,000 on top of its already-summed MinorityInterest 120,524,000
+# (120,524,000 + 97,393,000 = 217,917,000, the exact reported 17.0% gap).
 
 
 def _mezzanine_equity(gaap, asof, parent_eq):
@@ -775,7 +886,11 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
     ZERO flags on it. sweepcheck caught it from outside the card; the card itself was silent,
     and a silent card is what the PM underwrites from.
 
-    Returns (foots, implied, gap, err, equity_used) — equity_used may include mezzanine.
+    Returns (foots, implied, gap, err, equity_used, mezz_used) — equity_used may include
+    mezzanine; mezz_used is the dollar amount of NCI/temporary equity added on top of
+    parent-only StockholdersEquity to make it foot (0.0 if none was needed). Callers that
+    want to show their work — e.g. the zero-proof note, so "equity -8,126,000" doesn't read
+    as an unexplained plug — recover parent-only equity as `equity_used - mezz_used`.
     `flag=False` lets a caller reuse the arithmetic without double-flagging."""
     ta = (F.get("total_assets") or {}).get("value")
     eq = (F.get("equity") or {}).get("value")
@@ -783,14 +898,14 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
     tl = tl_fig.get("value")
     asof = (F.get("total_assets") or {}).get("asof")
     if not (ta and eq and tl) or ta - eq <= 0:
-        return None, None, None, None, eq
+        return None, None, None, None, eq, 0.0
     if tl_fig.get("STALE"):
         # total_liabilities is itself a retired/stale tag (FLS: last filed 2014-12-31,
         # 4199d behind) — testing the identity against a number the card already
         # quarantined produces a bogus gap, not a real footing defect. That STALE flag
         # already tells the reader "excluded from derived values"; a second, contradictory
         # "does not foot" flag built on the same excluded number is noise, not signal.
-        return None, None, None, None, eq
+        return None, None, None, None, eq, 0.0
     implied = ta - eq
     gap = implied - tl
     err = abs(gap) / implied
@@ -807,6 +922,7 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
                     f"see MEZZANINE_TAGS in fincard.py")
                 implied, gap, err = implied2, gap2, err2
                 eq = eq + mezz  # for the zero-proof note below: total equity, not parent-only
+                return True, implied, gap, err, eq, mezz
             else:
                 flag and card["flags"].append(
                     f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but "
@@ -815,7 +931,7 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
                     f"(still {gap2:,.0f} / {err2 * 100:.1f}% short). That gap is liabilities "
                     f"we cannot see — net cash and EV are understated by roughly that much. "
                     f"Do not treat this card's leverage as known.")
-                return False, implied, gap, err, eq
+                return False, implied, gap, err, eq, mezz
         else:
             # The statement does not foot. Do not assert anything — quantify what is missing,
             # which is far more useful than "stale" and is the ARI/HUT signature.
@@ -824,31 +940,68 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
                 f"liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%). That gap is "
                 f"liabilities we cannot see — net cash and EV are understated by roughly that "
                 f"much. Do not treat this card's leverage as known.")
-            return False, implied, gap, err, eq
-    return True, implied, gap, err, eq
+            return False, implied, gap, err, eq, 0.0
+    return True, implied, gap, err, eq, 0.0
 
 
 def _zero_proof(card, F, names, gaap, tol=0.01):
-    """Turn 'stale, unknown' into 'zero, proven' where the balance sheet foots without it.
-    The footing arithmetic is _foot_check's; this only acts on its verdict."""
-    foots, implied, gap, err, eq = _foot_check(card, F, gaap, tol, flag=False)
+    """Turn 'stale, unknown' into 'zero, proven' where BOTH halves of the standard hold
+    (pm-023/fincard.py-024, 2026-08-20): (1) COMPLETENESS — the balance sheet foots
+    without the missing concept (_foot_check's arithmetic); (2) EXHAUSTIVENESS — no
+    debt-like concept anywhere in the issuer's own companyfacts carries a nonzero value
+    at the balance-sheet date that our tag maps did not already look for
+    (_debt_like_hits). Condition (1) alone is not enough: TLS's finance leases sat
+    INSIDE total_liabilities, so the identity closed cleanly while still blessing a
+    zero that was wrong by 6,649,000. Failing either condition leaves the concept
+    UNKNOWN and flagged — never a silent zero, never the word PROVEN.
+
+    The note SHOWS the equity figure's components rather than printing one number labeled
+    "equity" — a card whose mezzanine-adjusted equity coincidentally reads like assets minus
+    liabilities is not a plug, but printing only the combined figure makes it look like one.
+    fincard.py-013 (2026-08-19) diagnosed KPLT's "-8,126,000" as circular/back-solved because
+    the note didn't disclose it was parent equity -36,035,000 + 27,909,000 of independently-
+    reported temporary equity — both figures are real XBRL facts, neither derived from
+    assets or liabilities. Spelling out the components here is the fix: the arithmetic was
+    always sound, the note just didn't show its work."""
+    foots, implied, gap, err, eq, mezz = _foot_check(card, F, gaap, tol, flag=False)
     if not foots:
         return []
     ta = (F.get("total_assets") or {}).get("value")
     tl = (F.get("total_liabilities") or {}).get("value")
     asof = (F.get("total_assets") or {}).get("asof")
+    wanted = [n for n in names if n in ZERO_PROVABLE]
+    if not wanted:
+        return []
+    hits = _debt_like_hits(gaap, asof)
+    if hits:
+        hit_str = "; ".join(f"{c}={v:,.0f}" for c, v in hits[:4])
+        issuer = card.get("ticker") or "the issuer"
+        for n in wanted:
+            card["flags"].append(
+                f"{n}: UNKNOWN, not zero — the balance sheet foots without it, but {issuer} "
+                f"reports {hit_str} at {asof}, a debt-like concept our tag map does not "
+                f"resolve into debt_lt/debt_current. A hit proves debt exists; it does not "
+                f"say which line it belongs on, so the concept is left UNKNOWN rather than "
+                f"guessed. Leverage not known — do not treat net_cash/EV as reliable "
+                f"(fincard.py-024).")
+        return []
+    if mezz:
+        parent_eq = eq - mezz
+        eq_note = (f"parent equity {parent_eq:,.0f} + {mezz:,.0f} of noncontrolling/"
+                   f"temporary equity (both independently reported, not derived from "
+                   f"assets or liabilities) = {eq:,.0f} total equity")
+    else:
+        eq_note = f"equity {eq:,.0f}"
     proven = []
-    for n in names:
-        if n not in ZERO_PROVABLE:
-            continue
+    for n in wanted:
         F[n] = {"value": 0.0, "unit": "USD", "asof": asof, "tag": None,
                 "source": "zero-proved",
-                "note": (f"PROVEN ZERO, not missing. The balance sheet foots without it: "
-                         f"total assets {ta:,.0f} - equity {eq:,.0f} = {implied:,.0f}, which "
-                         f"equals stated total liabilities {tl:,.0f} to within "
-                         f"{err * 100:.2f}%. Every liability is therefore accounted for by "
-                         f"the lines that ARE reported, so this one is zero — the issuer "
-                         f"stopped reporting the tag because the balance went away.")}
+                "note": (f"ZERO, CHECKED (both conditions of the fincard.py-024 standard): "
+                         f"(1) COMPLETENESS — total assets {ta:,.0f} - ({eq_note}) = "
+                         f"{implied:,.0f}, matching stated total liabilities {tl:,.0f} to "
+                         f"within {err * 100:.2f}%. (2) EXHAUSTIVENESS — no debt-like "
+                         f"XBRL concept outside our own tag map reports a nonzero value at "
+                         f"{asof}. Both checked, not inferred; treated as zero.")}
         card["flags"] = [f for f in card["flags"] if not f.startswith(f"{n}: ")]
         card.setdefault("zero_proved", []).append(
             {"concept": n, "identity_error_pct": round(err * 100, 3), "asof": asof})
@@ -1018,6 +1171,32 @@ def build(tk, cik_override=None):
             seen[r["end"]] = r["val"]
         S[name] = {"points": [{"asof": k, "value": seen[k]} for k in sorted(seen)[-12:]]}
 
+    # A debt_lt/debt_current resolved ONLY via a finance-lease tag (fincard.py-022) is a
+    # real reported figure, but not necessarily the issuer's WHOLE long-term debt: AES
+    # resolves 714,000,000 this way while reporting no other debt-like concept anywhere in
+    # companyfacts, for a $54B-asset utility holding company whose conventional bonds are
+    # plausibly sitting in an extension namespace this scan cannot see (same shape as
+    # ARI's `ari:` debt tag). Apply the SAME two-condition standard used for zero-proof
+    # (fincard.py-024): flag unless the balance sheet foots AND no other debt-like concept
+    # exists — TLS clears both (its total_liabilities reconciles with the two finance-
+    # lease figures already on the card) and stays silent; AES clears neither (no
+    # total_liabilities tag to foot against at all) and is flagged for review.
+    for _dn in ("debt_lt", "debt_current"):
+        _fig = F.get(_dn)
+        if not _fig or not (_fig.get("tag") or "").startswith("FinanceLeaseLiability"):
+            continue
+        if _debt_like_hits(gaap, _fig["asof"]):
+            continue
+        _foots = _foot_check(card, F, gaap, flag=False)[0]
+        if _foots is True:
+            continue
+        card["flags"].append(
+            f"{_dn}: sourced ONLY from a finance-lease tag ({_fig['tag']} = "
+            f"{_fig['value']:,.0f} at {_fig['asof']}) — no other debt-like XBRL concept "
+            f"found, and the balance sheet cannot be footed to confirm nothing else is "
+            f"missing. If this issuer carries conventional debt under an extension "
+            f"namespace (see ARI), it is not reflected here.")
+
     # same quarantine as FLOW above, applied to balance-sheet points in time: a debt/asset
     # tag that stops updating while cash/equity/total_assets keep filing quarterly is a
     # retired tag serving a stale carrying value, not "unchanged" (ARI debt_lt served a
@@ -1165,22 +1344,61 @@ def build(tk, cik_override=None):
             "issuer's income statement has no OperatingIncomeLoss subtotal — this is "
             "revenue minus the statement's own 'Total costs and expenses' line, the "
             "subtotal that precedes Other Income/Expense on the face of the statement")
-    cfo, capex = ttm_vals.get("cfo"), ttm_vals.get("capex")
+    cfo, capex, capex_sw = ttm_vals.get("cfo"), ttm_vals.get("capex"), ttm_vals.get("capex_software")
     capex_note = ""
-    if cfo is not None and capex is None:
+    # capex_sw must cover a comparable SPAN to capex before being summed — "single period
+    # on file" is fincard's own label for LESS than a verified TTM/FY (as little as one
+    # half-year), and summing that partial window against the other concept's full TTM/FY
+    # silently mixes a 6-month figure into a 12-month total. LTCH (blast-radius review,
+    # 2026-08-22): capex YTD 2026-01-01..2026-06-30 (6mo, no TTM built yet) + capex_
+    # software TTM 2025-07-01..2026-06-30 (12mo) — same period_end, HALF the actual span,
+    # and the mismatch alone produced a 67,233% "addition" that had nothing to do with the
+    # double-count risk fincard.py-033 was written to catch. TTM-vs-FY-fallback pairs (both
+    # genuine ~12mo windows, just anchored on different fiscal-year-ends) are left alone —
+    # that offset is the same order as tolerances already accepted elsewhere in this file.
+    capex_sw_comparable = (
+        "single period on file" not in (F.get("capex", {}).get("period") or "")
+        and "single period on file" not in (F.get("capex_software", {}).get("period") or ""))
+    if capex is not None and capex_sw and capex_sw_comparable:
+        # ADDITIVE, not first-match (fincard.py-033, PM 2026-08-21): capex_software is a
+        # separately-reported line, not an alternate tag for "capex" — see the FLOW comment
+        # above. Anti-double-count: the two concepts are, by GAAP definition, mutually
+        # exclusive cash-flow captions (PP&E purchases vs. capitalized software development,
+        # which lands on the balance sheet as an intangible, never PP&E), so summing them
+        # sums two different reported dollars rather than counting one dollar twice. TLS
+        # proof (2026-08-21 repro): CFO 8,833 - PP&E capex 246 - software capex 1,970 (H1) =
+        # 6,617, matching the issuer's OWN "Free Cash Flow" press-release figure to the
+        # dollar; the PP&E-only card read 17.99% FCF margin against TLS's reported 13.9%.
+        # Still flagged past a materiality threshold rather than trusted blindly — if some
+        # future issuer's PP&E tag turns out to already subsume software spend, a >20% jump
+        # is the signal that surfaces it for review instead of silently doubling the figure.
+        combined = capex + capex_sw
+        pct_added = (capex_sw / capex) if capex else float("inf")
+        capex_note = (f" capex is PP&E {capex:,.0f} + capitalized software {capex_sw:,.0f} "
+                      f"(fincard.py-033) = {combined:,.0f}.")
+        if pct_added > 0.20:
+            card["flags"].append(
+                f"capex_software adds {pct_added * 100:,.0f}% on top of PP&E-only capex "
+                f"({capex_sw:,.0f} added to {capex:,.0f}) — material; verify neither line "
+                f"double-counts the other on this issuer's cash-flow statement (fincard.py-033).")
+        capex = combined
+    elif capex is not None and capex_sw and not capex_sw_comparable:
+        card["flags"].append(
+            f"capex_software resolved ({capex_sw:,.0f}, {F.get('capex_software', {}).get('period')}) "
+            f"but is not yet a full TTM/FY — NOT combined into capex/FCF to avoid summing a "
+            f"partial period against a full one; revisit once a full period is on file "
+            f"(fincard.py-033).")
+    elif cfo is not None and capex is None:
         # PROXY CHAIN (2026-08-13, LYFT forensic): some issuers tag NO cash-capex
         # line at all (LYFT's "purchases of property, equipment and scooter fleet"
         # is untagged in XBRL). Fall back to capitalized-software additions as an
         # explicit, labeled proxy before surrendering to the upper-bound flag.
-        tag, rows = rows_for({"_": ["CapitalizedComputerSoftwareAdditions"]}, "_")
-        if rows:
-            q_, a_, y_ = _pick_flow(rows)
-            pv, pp, _pe = _ttm(q_, a_, y_)
-            if pv:   # a 0-proxy is no proxy — keep the honest upper-bound flag instead
-                capex = pv
-                capex_note = (f" capex is a PROXY: CapitalizedComputerSoftwareAdditions "
-                              f"({pp}) — issuer tags no cash-capex line; true capex may "
-                              f"differ, verify the cash-flow statement.")
+        if capex_sw:   # a 0-proxy is no proxy — keep the honest upper-bound flag instead
+            capex = capex_sw
+            capex_note = (f" capex is a PROXY: capitalized software additions "
+                          f"({F.get('capex_software', {}).get('period')}) — issuer tags no "
+                          f"cash-capex line; true capex may differ, verify the cash-flow "
+                          f"statement.")
     if cfo is not None:
         if capex is None:
             capex_note = (" CAPEX INVISIBLE TO XBRL API — this FCF is an UPPER BOUND (=CFO). "
@@ -1244,13 +1462,26 @@ def build(tk, cik_override=None):
         fh_mc = _finnhub_mktcap(tk)
         if fh_mc:
             ratio = mc / fh_mc
+            fh_implied_price = fh_mc / sh
             card["cross_checks"]["market_cap_vs_finnhub"] = {
                 "computed": round(mc), "finnhub": round(fh_mc), "ratio": round(ratio, 3),
-                "ok": 0.9 <= ratio <= 1.1}
+                "fh_implied_price": round(fh_implied_price, 2), "ok": 0.9 <= ratio <= 1.1}
             if not (0.9 <= ratio <= 1.1):
+                # fh_implied_price (Finnhub's cached market cap / OUR OWN shares_out) lets
+                # the reader tell the two candidate causes apart at a glance: close to the
+                # live quote price -> our share count is the suspect (multi-class/stale
+                # dei); far from it but a PLAUSIBLE past price -> Finnhub's /stock/profile2
+                # market cap is just cached from an older quote (profile2 updates on a
+                # slower cadence than /quote, the endpoint `px` itself comes from) and our
+                # own price x shares figure is likely the correct one. Diagnosed 2026-08-20
+                # against MRNA (fh_implied_price $63.0 vs live $174.38 after a large rally
+                # — a stale-cache mismatch, not a share-count one).
                 card["flags"].append(
-                    f"MARKET CAP MISMATCH: computed {mc / 1e9:.2f}B vs Finnhub {fh_mc / 1e9:.2f}B — "
-                    "likely multi-class shares (dei counts one class) or stale share count; "
+                    f"MARKET CAP MISMATCH: computed {mc / 1e9:.2f}B vs Finnhub {fh_mc / 1e9:.2f}B "
+                    f"(Finnhub-implied price ${fh_implied_price:,.2f} vs live quote ${px:,.2f}) — "
+                    "likely multi-class shares (dei counts one class) or stale share count if the "
+                    "implied price is close to the live quote; likely Finnhub's cached "
+                    "/stock/profile2 market cap lagging a price move if it is not. "
                     "EV/multiples below inherit this error — resolve before using")
         nc = (D.get("net_cash") or {}).get("value")
         if nc is not None:

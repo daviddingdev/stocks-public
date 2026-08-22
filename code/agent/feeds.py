@@ -146,7 +146,13 @@ def cik_map():
     return m
 
 
-INTERESTING = {"8-K", "10-K", "10-Q", "4", "SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A", "S-1", "424B5"}
+# EDGAR's Dec-2024 modernization renamed the submissions.json form label for Schedule 13D/G
+# from "SC 13D"/"SC 13G" to "SCHEDULE 13D"/"SCHEDULE 13G" (same rename noted below for the
+# daily-index radar). Confirmed against CIK0000320121 (TLS): its 2026-07-24 SCHEDULE 13D used
+# the new label and was silently dropped by this filter — the per-name pull (45-day window,
+# would have caught it) never saw a single 13D/13G across the whole universe (feeds.py-011).
+INTERESTING = {"8-K", "10-K", "10-Q", "4", "SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A",
+               "SCHEDULE 13D", "SCHEDULE 13G", "SCHEDULE 13D/A", "SCHEDULE 13G/A", "S-1", "424B5"}
 
 
 def edgar_filings(tickers, days=45):
@@ -241,6 +247,101 @@ def _resolve_13d_subjects(rows, cap=20):
     return rows
 
 
+def _sec_company_map():
+    """title/ticker rows from the SEC's own company_tickers.json, cached a week. Same
+    cache file scout.py already writes/reads (sec_company_tickers.json) — sharing it
+    means the two collectors cooperate on one fetch instead of duplicating it."""
+    cache = DATA / "sec_company_tickers.json"
+    if cache.exists() and time.time() - cache.stat().st_mtime < 7 * 86400:
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass
+    try:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=UA, timeout=30)
+        data = r.json()
+        cache.write_text(json.dumps(data))
+        return data
+    except Exception:
+        return json.loads(cache.read_text()) if cache.exists() else {}
+
+
+def _name_to_ticker(name):
+    data = _sec_company_map()
+    want = re.sub(r"[^a-z0-9]", "", (name or "").lower())[:14]
+    if not want:
+        return None
+    for v in data.values():
+        have = re.sub(r"[^a-z0-9]", "", v["title"].lower())[:14]
+        if want == have:
+            return v["ticker"].upper()
+    return None
+
+
+_SPIN_PARENT_PATTERNS = (
+    # Exhibit list: "Form of [Separation and] Distribution Agreement between PARENT and SPINCO"
+    r"(?:Separation and )?Distribution Agreement,?\s+(?:dated[^,]*,\s*)?between\s+([A-Z][\w&,\.\s]{2,78}?)\s+and\s+[A-Z]",
+    # Item 10 (Recent Sales of Unregistered Securities): "PARENT acquired N shares of ... SPINCO"
+    r"([A-Z][\w&,\.\s]{2,78}?)\s+acquired\s+[\d,]+\s+(?:uncertificated\s+)?shares? of (?:common|capital) stock of",
+    r"wholly[- ]owned subsidiary of\s+([A-Z][\w&,\.\s]{2,78}?)[\.,]",
+)
+
+
+def _spin_parent_ticker(doc_text):
+    """A pre-distribution spinco has no ticker of its own by definition. Every spinoff
+    Form 10 discloses the PARENT in near-identical boilerplate — the Distribution
+    Agreement exhibit and Item 10's initial-share issuance are both standard disclosure
+    items, present whether or not the filer ever says "spin-off" in prose (scout.py-037,
+    2026-08-22)."""
+    for pat in _SPIN_PARENT_PATTERNS:
+        m = re.search(pat, doc_text)
+        if m:
+            tk = _name_to_ticker(m.group(1).strip())
+            if tk:
+                return tk
+    return None
+
+
+def _resolve_spin_parents(rows, cap=10):
+    """Resolve the PARENT's ticker for each spin-registration row so it can triage
+    before the spinco itself ever trades, and keep the spinco's own CIK on the row
+    (spinco_cik) so it can graduate to its own ticker once the distribution completes
+    instead of being re-discovered as a new lead (scout.py-037)."""
+    cache_f = DATA / "spin_parents.json"
+    try:
+        cache = json.loads(cache_f.read_text())
+    except Exception:
+        cache = {}
+    fetched = 0
+    for r in rows:
+        r["spinco_cik"] = r.get("cik")
+        if r.get("ticker"):   # already trading under its own symbol — nothing to resolve
+            continue
+        acc = r["url"].rsplit("/", 1)[-1]
+        if acc in cache:
+            if cache[acc]:
+                r["ticker"] = cache[acc]
+            continue
+        if fetched >= cap:  # politeness: resolve the backlog across successive runs
+            continue
+        fetched += 1
+        tk = None
+        try:
+            raw = requests.get(r["url"], headers=UA, timeout=30).content[:150000]
+            time.sleep(0.15)
+            text = re.sub(r"<[^>]+>", " ", raw.decode("utf-8", "ignore"))
+            text = re.sub(r"&nbsp;|&#\d+;", " ", text)
+            text = re.sub(r"\s+", " ", text)
+            tk = _spin_parent_ticker(text)
+        except Exception:
+            pass
+        cache[acc] = tk
+        if tk:
+            r["ticker"] = tk
+    cache_f.write_text(json.dumps(cache, indent=1))
+    return rows
+
+
 def special_situations(days=10):
     ticker_by_cik = {int(c): t for t, c in cik_map().items()}
     out = {"sc13d": [], "spins": [], "delistings": []}
@@ -275,7 +376,31 @@ def special_situations(days=10):
     for k in out:
         out[k] = sorted(out[k], key=lambda x: x["date"], reverse=True)[:60]
     out["sc13d"] = _resolve_13d_subjects(out["sc13d"])
+    out["spins"] = _resolve_spin_parents(out["spins"])
     return out
+
+
+def _tag_held(situations, held):
+    """A 13D/spin/delisting on a name we hold or watch is not one of dozens of
+    market-wide rows, it is a tripwire on our own book — mark it so a reader (or a
+    future scorer) does not have to cross-reference by hand (feeds.py-011: a TLS
+    Schedule 13D sat unflagged in this exact radar). sc13d uses subject_ticker (the
+    daily index's own 'ticker' field is the FILER's, resolved separately); spins and
+    delistings key off the issuer's own CIK, so 'ticker' is already the subject."""
+    held_hits = []
+    for r in situations.get("sc13d") or []:
+        tk = r.get("subject_ticker")
+        r["held"] = bool(tk and tk in held)
+        if r["held"]:
+            held_hits.append({"kind": "sc13d", "ticker": tk, "date": r.get("date"), "url": r.get("url")})
+    for key in ("spins", "delistings"):
+        for r in situations.get(key) or []:
+            tk = r.get("ticker")
+            r["held"] = bool(tk and tk in held)
+            if r["held"]:
+                held_hits.append({"kind": key, "ticker": tk, "date": r.get("date"), "url": r.get("url")})
+    situations["held_hits"] = sorted(held_hits, key=lambda x: x.get("date") or "", reverse=True)
+    return situations
 
 
 # ---------- manager tracker (13F holdings diff) ----------
@@ -431,7 +556,7 @@ def refresh():
         "market_news": market_news(),
         "earnings": _cross_check_earnings(earnings_calendar(tks), filings, today_s),
         "filings": filings,
-        "situations": special_situations(),
+        "situations": _tag_held(special_situations(), set(tks)),
         "managers": manager_moves(),
         "as_of": {"news": now_iso, "market_news": now_iso, "earnings": now_iso,
                   "filings": now_iso, "situations": now_iso},
@@ -474,9 +599,11 @@ def refresh():
     n_news = sum(len(v) for v in feed["news"].values())
     n_fil = sum(len(v) for v in feed["filings"].values())
     sit = feed["situations"]
+    n_held_hits = len(sit.get("held_hits") or [])
     print(f"feed.json: {len(tks)} tickers · {n_news} news · {n_fil} filings · "
           f"{len(feed['earnings'])} earnings · {len(feed['market_news'])} market headlines · "
           f"radar: {len(sit['sc13d'])} 13Ds, {len(sit['spins'])} spins, {len(sit['delistings'])} delistings"
+          + (f" ({n_held_hits} on held/universe names)" if n_held_hits else "")
           + (f"  ⚠ DEGRADED (carried over): {', '.join(degraded)}" if degraded else "")
           + (f"  [vendor: {'; '.join(FH_FAILS[-3:])}]" if FH_FAILS else ""))
 
