@@ -47,6 +47,56 @@ import runner  # noqa: E402
 
 NO_MCP = ENGINE / "config" / "ops_mcp.json"
 HUNT_LEDGER = HERE / "journal" / "ops" / "hunt_coverage.json"
+
+# The bug hunt's rotation, and the ONLY place the area list is written down. The prompt's
+# table is rendered from this dict and the coverage ledger is upserted from it on every
+# launch (_hunt_ledger_sync), so an area cannot exist in the charter and be unreachable in
+# the ledger — which is exactly what happened to `seams`: the ledger was hand-seeded with
+# five areas on 2026-08-18 while the prompt described six, and selection reads the LEDGER
+# (ask ops.py-010, opened by the PM after fixing that instance by hand).
+HUNT_AREAS = {
+    "number-pipeline": "valuation/fincard.py · query.py · xbrlfacts.py · refresh_cards.py",
+    "evidence-reading": "dossier.py · numwatch.py · bench.py · research/predigest.py · navindex.py",
+    "decision-path": "loop.py · triggers.py · contract.py · thesis.json/trades.json state",
+    "orchestration": "vp.py · ops.py · roster.py · unknowns.py · asof.py · sweepcheck.py · scout.py",
+    "surfaces": "dashboard/agent_page.py · app.py · the /agent page and every link on it",
+    "seams": "what falls BETWEEN owners (owners.py is the map): the handoffs\n"
+             "                    (feeds->relevance->scout, fincard->dossier->numwatch, engineer reports->PM\n"
+             "                    desk), anything `owners.py check` says is unowned, launch paths (does every\n"
+             "                    role in the crontab actually start? this CLI rejected `hunt` for days), and\n"
+             "                    this week's CORRECTLY-handled asks (`asks.py list` + traces) where the\n"
+             "                    boundary was the real problem. No owner will ever report these, because\n"
+             "                    none of them is theirs.",
+}
+
+
+def _hunt_area_table():
+    """The prompt's area table, rendered from HUNT_AREAS so prompt and ledger cannot drift."""
+    return "\n".join(f"  {name:<17} {desc}" for name, desc in HUNT_AREAS.items())
+
+
+def _hunt_ledger_sync():
+    """Upsert every HUNT_AREAS key into the coverage ledger BEFORE the hunt selects a target.
+    A new area lands as never-hunted (last_hunt None), so the 'oldest last_hunt or any never
+    hunted' rule picks it up on the very next run instead of never. Never removes an area:
+    a retired one keeps its history and simply stops being rendered in the prompt."""
+    try:
+        led = json.loads(HUNT_LEDGER.read_text()) if HUNT_LEDGER.exists() else {}
+    except Exception:
+        led = {}
+    led.setdefault("_doc", "bug-hunt coverage — each area's last hunt and what was found. "
+                           "Areas are UPSERTED from ops.HUNT_AREAS on every launch (ops.py-010).")
+    areas = led.setdefault("areas", {})
+    added = [a for a in HUNT_AREAS if a not in areas]
+    for a in added:
+        areas[a] = {"last_hunt": None, "found": 0,
+                    "note": "registered automatically from ops.HUNT_AREAS; never hunted"}
+    if added:
+        HUNT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HUNT_LEDGER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(led, indent=1))
+        os.replace(tmp, HUNT_LEDGER)
+    return added
 DATA = HERE / "data"
 
 NUMBERS_PROMPT = f"""You are the NUMBERS ENGINEER (the role formerly named "fixer") for the
@@ -119,7 +169,7 @@ you have time.
    opened and every one still open from prior nights.
 4) Commit code fixes to git with clear messages (repo {ROOT}; git add specific files only —
    NEVER `git add -A`; check `git status` first, other sessions co-edit) and push.
-5) Write {OPS}/<YYYY-MM-DD>_fixer.md: asks closed/acked/escalated, items worked with evidence,
+5) Write {OPS}/<YYYY-MM-DD>_numbers.md: asks closed/acked/escalated, items worked with evidence,
    every patch request you opened or that is still open, and anything you could not handle and
    why. Update quality_queue.json statuses as you go.
 Finish with one line to stdout: "numbers: N asks cleared, N fixed, N planned, N accepted"."""
@@ -295,18 +345,7 @@ YOUR TARGET THIS SESSION is the least-recently-hunted area in {HUNT_LEDGER} (cre
 {{"_doc": "bug-hunt coverage — each area's last hunt and what was found", "areas": {{}}}} if
 missing). Read it FIRST, pick the area with the oldest last_hunt (or any never hunted), and say
 at the top of your report which you chose and why. Areas:
-  number-pipeline   valuation/fincard.py · query.py · xbrlfacts.py · refresh_cards.py
-  evidence-reading  dossier.py · numwatch.py · bench.py · research/predigest.py · navindex.py
-  decision-path     loop.py · triggers.py · contract.py · thesis.json/trades.json state
-  orchestration     vp.py · ops.py · roster.py · unknowns.py · asof.py · sweepcheck.py · scout.py
-  surfaces          dashboard/agent_page.py · app.py · the /agent page and every link on it
-  seams             what falls BETWEEN owners (owners.py is the map): the handoffs
-                    (feeds->relevance->scout, fincard->dossier->numwatch, engineer reports->PM
-                    desk), anything `owners.py check` says is unowned, launch paths (does every
-                    role in the crontab actually start? this CLI rejected `hunt` for days), and
-                    this week's CORRECTLY-handled asks (`asks.py list` + traces) where the
-                    boundary was the real problem. No owner will ever report these, because
-                    none of them is theirs.
+{_hunt_area_table()}
 
 HOW TO HUNT — adversarially, with your hands:
 1) Read the code in your area looking for the shape of the bugs above: a guard applied to the
@@ -368,13 +407,16 @@ checks that your dated report exists after every scheduled run and files a COO a
 alert when it does not — a session that dies quietly is found by the machine now, but found
 is not finished."""
 
-# role -> (report glob, cron hour, cron minute, weekdays as Mon=0) — the finish contract
+# role -> (report globs, cron hour, cron minute, weekdays as Mon=0) — the finish contract
 # `ops.py verify` enforces. Same dict philosophy as PROMPTS: a role cannot be launchable
-# without being verifiable.
-FINISH = {"numbers": ("*_fixer.md", 7, 5, {1, 2, 3, 4, 5}),
-          "signals": ("*_signals.md", 7, 35, {1, 2, 3, 4, 5}),
-          "hunt": ("*_hunt.md", 8, 30, {3, 5}),
-          "coo": ("*_coo.md", 15, 0, {5})}
+# without being verifiable. A role may carry MORE THAN ONE glob: the fixer was renamed to
+# "numbers" on 2026-08-18 and wrote its first *_numbers.md on 2026-08-22, which verify()
+# then reported as a missed finish because it only knew the old name (ask ops.py-042). A
+# rename must not read as a dead role, so legacy names stay listed.
+FINISH = {"numbers": (("*_numbers.md", "*_fixer.md"), 7, 5, {1, 2, 3, 4, 5}),
+          "signals": (("*_signals.md",), 7, 35, {1, 2, 3, 4, 5}),
+          "hunt": (("*_hunt.md",), 8, 30, {3, 5}),
+          "coo": (("*_coo.md",), 15, 0, {5})}
 
 
 def _last_scheduled(hour, minute, weekdays, slack_h=3):
@@ -393,11 +435,11 @@ def verify():
     phone alert and an ask to the COO (the asks channel, not a bespoke ledger, so C15 ages
     it and the board shows it). Run from cron daily, after the morning windows."""
     misses = []
-    for role, (pat, h, m, days) in FINISH.items():
+    for role, (pats, h, m, days) in FINISH.items():
         due = _last_scheduled(h, m, days)
         if due is None:
             continue
-        newest = max((p.stat().st_mtime for p in OPS.glob(pat)), default=0)
+        newest = max((p.stat().st_mtime for pat in pats for p in OPS.glob(pat)), default=0)
         if newest < due.timestamp():
             misses.append(f"{role}: scheduled {due:%Y-%m-%d %H:%M}Z, newest report "
                           f"{'NONE' if not newest else 'older than that run'}")
@@ -434,6 +476,8 @@ def launch(role):
     if not NO_MCP.exists():
         NO_MCP.write_text(json.dumps({"_doc": "ops sessions get NO MCP servers — no broker, "
                                               "no external tools beyond the box", "mcpServers": {}}, indent=1))
+    if role == "hunt":
+        _hunt_ledger_sync()   # an area in the charter must be reachable in the ledger
     prompt = PROMPTS[role]() + SINGLE_TURN_NOTE
     cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions",
            "--strict-mcp-config", "--mcp-config", str(NO_MCP),

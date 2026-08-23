@@ -147,7 +147,7 @@ ROLES = [
                    "zero, fixes at the root, and PROVES each fix survives a re-scan. Never "
                    "adjudicates a thesis question.",
         "reads": ["_engine/agent/data/quality_queue.json", "_engine/agent/names"],
-        "writes": ["_engine/agent/journal/ops/<date>_fixer.md",
+        "writes": ["_engine/agent/journal/ops/<date>_numbers.md",
                    "_engine/agent/data/patch_requests.json"],
         # charter comes from owners.py (single source of truth) — see charter() below.
         "charter": [],
