@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 BrokerB agentic-account loop — headless Claude sessions against the
-brokerb-trading MCP (user-scope on this Spark, OAuth already established).
+brokerb-trading MCP (project-scope for ~/Stocks since 2026-08-19; the loop itself
+uses --strict-mcp-config with _engine/config/agent_mcp.json, OAuth already established).
 
 Modes
   sync   read-only: pull portfolio/positions/orders/recent activity from the MCP
@@ -427,11 +428,18 @@ def reconcile():
     trades-executed-hallucination class; does NOT judge real-but-wrong trades."""
     import datetime as dtm
     import time as _t
+    def _cleared(r):
+        # a 'reconciled' stamp clears only the state it was stamped AT (loop.py-039,
+        # authorised 2026-08-23): a row stamped at 'proposed' carried nothing the
+        # evidence checks apply to, and must face the gate again once it moves on
+        hist = r.get("state_history") or []
+        last = {h.get("state"): i for i, h in enumerate(hist)}
+        return last.get("reconciled", -1) > last.get(r.get("state"), len(hist))
     before = {r.get("order_id"): r for r in _load_trades() if r.get("order_id")}
     claimed = [r for r in _load_trades()
                if (r.get("state") in ("placed", "filled", "partial"))
                and any(h.get("source") == "agent" for h in (r.get("state_history") or []))
-               and not any(h.get("state") == "reconciled" for h in (r.get("state_history") or []))]
+               and not _cleared(r)]
     # blocking sync: broker truth into trades.json/portfolio.json — code first
     # (mcp_sync), claude session only as fallback (2026-08-13: this inner claude
     # sync was a shadow session after EVERY trade session — David saw the pile-up)
@@ -449,7 +457,7 @@ def reconcile():
     for r in rows:
         hist = r.get("state_history") or []
         agent_claimed = any(h.get("source") == "agent" for h in hist)
-        if not agent_claimed or any(h.get("state") in ("reconciled", "unresolved") for h in hist):
+        if not agent_claimed or any(h.get("state") == "unresolved" for h in hist) or _cleared(r):
             continue
         issues = []
         if r.get("state") in ("placed", "filled", "partial") and not r.get("order_id"):
@@ -486,7 +494,17 @@ def reconcile():
         else:
             hist.append({"state": "reconciled", "ts": now, "source": "mcp"})
         r["state_history"] = hist
-    (DATA / "trades.json").write_text(json.dumps(rows, indent=1))
+    # atomic temp+os.replace — same writer as every other trades.json producer (loop.py-039);
+    # keep the same shape even when mcp_sync is unavailable (the claude-fallback world)
+    import os as _os
+    try:
+        from mcp_sync import _write_json as _atomic
+    except (ImportError, AttributeError):
+        def _atomic(p, obj, indent=1):
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(obj, indent=indent))
+            _os.replace(tmp, p)
+    _atomic(DATA / "trades.json", rows)
     if problems:
         try:
             import requests
