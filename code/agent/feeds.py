@@ -151,8 +151,13 @@ def cik_map():
 # daily-index radar). Confirmed against CIK0000320121 (TLS): its 2026-07-24 SCHEDULE 13D used
 # the new label and was silently dropped by this filter — the per-name pull (45-day window,
 # would have caught it) never saw a single 13D/13G across the whole universe (feeds.py-011).
+# Merger/liquidation proxy statements were missing entirely (triggers.py-040, 2026-08-25):
+# ARI's DEFM14A — carrying the actual Special Meeting date, record date, and Initial Cash
+# Distribution timing for a live agent-book liquidation thesis — filed 2026-08-24 and never
+# reached feed.json or the filing-day trigger because no *14A form was in this set.
 INTERESTING = {"8-K", "10-K", "10-Q", "4", "SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A",
-               "SCHEDULE 13D", "SCHEDULE 13G", "SCHEDULE 13D/A", "SCHEDULE 13G/A", "S-1", "424B5"}
+               "SCHEDULE 13D", "SCHEDULE 13G", "SCHEDULE 13D/A", "SCHEDULE 13G/A", "S-1", "424B5",
+               "DEFM14A", "DEF 14A", "PREM14A", "PRE 14A"}
 
 
 def edgar_filings(tickers, days=45):
@@ -210,10 +215,13 @@ def _parse_idx_line(line):
 
 
 def _resolve_13d_subjects(rows, cap=20):
-    """The daily form index lists the FILER (Coliseum Capital), not the SUBJECT
-    (Sonos) — which made most 13Ds invisible without hand-resolution (the PM had
-    to do it manually for SONO, 2026-08-13). The full-submission header carries a
-    SUBJECT COMPANY block with its CIK: fetch it once per accession, cache forever."""
+    """The daily form index lists an accession under BOTH the filer's CIK and the
+    subject's CIK (EDGAR indexes a 13D against every party named in it); this code used
+    to keep whichever row the dedup pass happened to see first, so ~44% of rows ended up
+    with the SUBJECT's name doing double duty as the filer — 'issuer files 13D on itself',
+    which Rule 13d-1 makes impossible (feeds.py-049). The full-submission header carries
+    separate FILED BY and SUBJECT COMPANY blocks with their own CIKs: fetch it once per
+    accession, cache forever, and trust neither field to the daily index."""
     cache_f = DATA / "sc13d_subjects.json"
     try:
         cache = json.loads(cache_f.read_text())
@@ -223,12 +231,15 @@ def _resolve_13d_subjects(rows, cap=20):
     fetched = 0
     for r in rows:
         acc = r["url"].rsplit("/", 1)[-1]
-        if acc in cache:
-            r.update(cache[acc])
+        cached = cache.get(acc)
+        if cached and "filer" in cached:  # stale entries pre-feeds.py-049 lack "filer" — re-resolve them
+            r.update(cached)
             continue
         if fetched >= cap:  # politeness: resolve the backlog across successive runs
+            if cached:
+                r.update(cached)
             continue
-        entry = {}
+        entry = dict(cached or {})
         try:
             head = requests.get(r["url"], headers=UA, timeout=30).text[:6000]
             fetched += 1
@@ -237,8 +248,11 @@ def _resolve_13d_subjects(rows, cap=20):
                           head, re.S)
             if m:
                 subj_cik = int(m.group(2))
-                entry = {"subject": m.group(1).strip()[:60],
-                         "subject_ticker": t_by_cik.get(subj_cik)}
+                entry["subject"] = m.group(1).strip()[:60]
+                entry["subject_ticker"] = t_by_cik.get(subj_cik)
+            fm = re.search(r"FILED BY:.*?COMPANY CONFORMED NAME:\s*(.+?)\n", head, re.S)
+            if fm:
+                entry["filer"] = fm.group(1).strip()[:80]
         except Exception:
             pass
         cache[acc] = entry

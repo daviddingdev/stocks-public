@@ -88,6 +88,33 @@ def cfg():
     return c
 
 
+def corp_actions(c, tk):
+    """Corporate actions (cash distributions) recorded for tk in config "corporate_actions",
+    keyed by ticker to a list of {ex_date, amount_per_share, kind, doc}. Accepts a bare dict
+    for a single action too. An entry with no ex_date yet (amount known, date not) is inert —
+    it contributes nothing until the ex_date is filled in from a primary document."""
+    raw = (c.get("corporate_actions") or {}).get(tk)
+    if not raw:
+        return []
+    return raw if isinstance(raw, list) else [raw]
+
+
+def cum_distributions(c, tk, as_of=None):
+    """Total $/share tk has distributed with ex_date <= as_of (default today). Used to keep
+    a position's cost basis and a thesis's implied value comparable to a post-distribution
+    price — see triggers.py-040: a liquidating REIT's cash distribution reads as a crash to
+    any rule that doesn't know cash left the share price on purpose."""
+    as_of = as_of or dt.date.today().isoformat()
+    return sum(a.get("amount_per_share") or 0 for a in corp_actions(c, tk)
+               if a.get("ex_date") and a["ex_date"] <= as_of)
+
+
+def today_distribution(c, tk):
+    """$/share tk distributes today (ex_date == today), if any."""
+    today_s = dt.date.today().isoformat()
+    return sum(a.get("amount_per_share") or 0 for a in corp_actions(c, tk) if a.get("ex_date") == today_s)
+
+
 def held_symbols():
     brokera = [t for t, m in _j(CONF / "positions.json", {}).items() if (m.get("shares") or 0) > 0]
     agent = [p.get("symbol") for p in _j(DATA / "portfolio.json", {}).get("positions", []) if p.get("symbol")]
@@ -168,7 +195,9 @@ def run():
         price, prev = q.get("c"), q.get("pc")
         if not price or not prev:
             continue
-        pct = (price - prev) / prev * 100
+        # Finnhub's pc (prior close) predates today's distribution; price doesn't. Add today's
+        # distribution back before measuring the move, else a scheduled cash-out reads as a drop.
+        pct = (price + today_distribution(c, tk) - prev) / prev * 100
         is_agent = tk in ag_pos
         thr = c["agent_action_move_pct"] if is_agent else c["price_move_pct_holdings"]
         if abs(pct) >= thr:
@@ -268,7 +297,14 @@ def run():
         price = q.get("c")
         if not price:
             continue
-        gap = (th["implied_value"] - price) / th["implied_value"] * 100
+        # Cash already distributed has left both the price and the residual thesis value —
+        # net it out of implied_value before comparing, else a paid-out distribution reads
+        # as the market disagreeing with the thesis (triggers.py-040).
+        paid = cum_distributions(c, tk)
+        implied = th["implied_value"] - paid
+        if implied <= 0:
+            continue
+        gap = (implied - price) / implied * 100
         rec = tstate.setdefault(tk, {"days": 0, "last": ""})
         if gap >= c["thesis_gap_alert_pct"]:
             if rec["last"] != today_s:      # count each market day once
@@ -277,9 +313,10 @@ def run():
             n = c["thesis_gap_persist_days"]
             if rec["days"] >= n and (rec["days"] - n) % 5 == 0:
                 dl = th.get("deadline", "no deadline set")
+                dist_note = f" (implied ${th['implied_value']:,.2f} less ${paid:,.2f}/sh already distributed)" if paid else ""
                 fired += alert(state, c, f"thesisgap:{tk}:{rec['days']}", "thesis-vs-price", tk,
                                f"{tk} ${price:,.2f} has sat >={c['thesis_gap_alert_pct']:.0f}% below your "
-                               f"implied ${th['implied_value']:,.2f} for {rec['days']} market days "
+                               f"implied ${implied:,.2f}{dist_note} for {rec['days']} market days "
                                f"(deadline {dl}). The market is persistently disagreeing with your thesis — "
                                f"that is evidence, not noise. Re-verify the premise in the PRIMARY DOCUMENTS "
                                f"(dossier terms.json + filings), not in your own memos.", book="Agent")
@@ -292,10 +329,20 @@ def run():
     # must re-derive the thesis from documents FIRST, then read its own memos.
     for tk, p in ag_pos.items():
         pnl_pct = p.get("pnl_pct")
-        if pnl_pct is None or pnl_pct > -c["reunderwrite_drawdown_pct"]:
+        if pnl_pct is None:
             continue
+        # pnl_pct (from portfolio.json, via mcp_sync) is price-vs-cost only — it doesn't know
+        # about cash already paid out. Add distributions received back as a % of cost so a
+        # liquidating position's own cash-out doesn't read as a loss (triggers.py-040).
+        avg_cost = p.get("avg_cost") or 0
+        paid = cum_distributions(c, tk)
+        dist_pct = (paid / avg_cost * 100) if avg_cost else 0
+        adj_pct = pnl_pct + dist_pct
+        if adj_pct > -c["reunderwrite_drawdown_pct"]:
+            continue
+        dist_note = f" (${paid:,.2f}/sh distributions added back; raw price-vs-cost {pnl_pct:+.1f}%)" if paid else ""
         fired += alert(state, c, f"reunder:{tk}:{week_s}", "re-underwrite", tk,
-                       f"{tk} {pnl_pct:+.1f}% vs cost ${p.get('avg_cost', 0):,.2f} — forced fresh-look: "
+                       f"{tk} {adj_pct:+.1f}% vs cost ${avg_cost:,.2f}{dist_note} — forced fresh-look: "
                        f"re-derive the thesis from the dossier/filings FIRST (do not start from your own "
                        f"memos), then decide add/hold/exit against your pre-committed triggers.",
                        action=True, book="Agent")

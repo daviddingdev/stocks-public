@@ -104,7 +104,12 @@ def _events():
     ev = []
     sit = feed.get("situations") or {}
     for r in (sit.get("sc13d") or []):
-        if _self_filed_13d(r.get("company"), r.get("subject")):
+        # r["company"] is the daily-index label, which is unreliable for filer identity —
+        # EDGAR indexes a 13D under both parties' CIKs, and the surviving row after dedup
+        # is arbitrary (feeds.py-049). r["filer"], resolved from the submission header's own
+        # FILED BY block, is authoritative; fall back to the index label only until resolved.
+        filer = r.get("filer") or r.get("company")
+        if _self_filed_13d(filer, r.get("subject")):
             continue
         tk = r.get("subject_ticker")
         d = r.get("date", "")
@@ -116,7 +121,7 @@ def _events():
         # accessions were sitting in the queue twice. The accession is the stable identity.
         ev.append({"id": f"13d:{r['url'].rsplit('/', 1)[-1]}",
                    "kind": "13D", "ticker": tk, "date": d,
-                   "detail": f"SCHEDULE 13D by {r.get('company', '?')} on "
+                   "detail": f"SCHEDULE 13D by {filer or '?'} on "
                              f"{r.get('subject', tk or '?')}", "url": r.get("url")})
     for r in (sit.get("spins") or []):
         # ticker (if resolved) is the PARENT's — a pre-distribution spinco has none of

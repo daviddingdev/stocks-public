@@ -234,13 +234,44 @@ INSTANT = {
     # debt concept, so the gap was invisible on the card and then laundered into
     # "PROVEN ZERO" by _zero_proof, since the finance leases sit inside total_liabilities
     # and the balance sheet foots without them (fincard.py-022, 2026-08-20).
+    # LongTermNotesPayable / ConvertibleDebtNoncurrent / NotesPayableCurrent /
+    # NotesPayableToBankCurrent added 2026-08-25 (quality.py-043, Class B NET CASH
+    # UNRELIABLE sweep) — all four verified against the issuer's own footing balance sheet
+    # at its 2026-06-30 date before adopting (assets - equity = stated liabilities, exact,
+    # in every case): SMID tags its only debt as LongTermNotesPayable 3,475,000 (noncurrent)
+    # + NotesPayableCurrent 661,000 (current), reported every quarter with a consistent
+    # paydown trend — the prior debt_lt/debt_current tags (FinanceLeaseLiability*) went
+    # stale in 2021 when SMID retired its lease and switched to this note. LAB's only debt is
+    # ConvertibleDebtNoncurrent 299,000, the same dollar figure the retired LongTermDebt tag
+    # last carried at 2024-12-31 — a straight retag, not a new liability. CRTO tags
+    # NotesPayableCurrent 5,688,000 (current only; no noncurrent debt reported since 2020,
+    # left as debt_lt UNKNOWN rather than guessed zero). BDSX tags NotesPayableToBankCurrent
+    # 0 at 2026-06-30, corroborated by its own maturity schedule showing the entire $50M term
+    # loan due in year two — a verified zero, not an absent tag.
+    # UnsecuredLongTermDebt / LinesOfCreditCurrent added 2026-08-25 (quality.py-043): CDNS
+    # (Cadence Design Systems) ties UnsecuredLongTermDebt 2,481,170,000 exactly to
+    # DebtInstrumentFaceAmount 2,500,000,000 - unamortized discount/issuance-costs 18,830,000
+    # at 2026-03-31 (debt_lt was reading nothing at all — no prior alternate matched); its
+    # newly-drawn revolver is tagged LinesOfCreditCurrent 425,000,000 at the same date
+    # (zero the three prior quarters, then drawn — genuinely current, not a stale figure).
+    # ICLR ties the same LinesOfCreditCurrent tag (1,279,762,000 at 2026-06-30) to the
+    # issuer's own combined DebtInstrumentCarryingAmount to the dollar once summed with its
+    # already-correct debt_lt and unamortized discount. NotesPayable last, LOWEST priority
+    # (only wins when nothing else reports fresher): PRI's entire disclosed debt is
+    # NotesPayable 595,716,000 at 2026-06-30 — the prior debt_lt pick was a stale/trivial
+    # FinanceLeaseLiability figure understating real debt by ~$595M. NotesPayable is
+    # normally a Note-level combined figure (see RESCUE_VETO caution elsewhere in this
+    # file) so it is intentionally ordered last — it only replaces a tag that is itself
+    # stale or absent, never a fresher, cleaner current/noncurrent split.
     "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt",
                 "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
                 "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
-                "FinanceLeaseLiability"],
+                "FinanceLeaseLiability", "LongTermNotesPayable", "ConvertibleDebtNoncurrent",
+                "UnsecuredLongTermDebt", "NotesPayable"],
     "debt_current": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
                      "LongTermDebtAndCapitalLeaseObligationsCurrent",
-                     "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent"],
+                     "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent",
+                     "NotesPayableCurrent", "NotesPayableToBankCurrent", "LinesOfCreditCurrent"],
     "operating_lease_liab": ["OperatingLeaseLiability"],
     "total_liabilities": ["Liabilities"],
     # PartnersCapital{,IncludingPortionAttributableToNoncontrollingInterest} last: an LP
@@ -267,6 +298,12 @@ INSTANT = {
 INSTANT_SUM = {
     "operating_lease_liab": ["OperatingLeaseLiabilityCurrent",
                              "OperatingLeaseLiabilityNoncurrent"],
+    # LW (Lamb Weston): the consolidated `Liabilities` tag stopped 2016-11-27 (STALE, 3472d,
+    # quality.py-043 2026-08-25) while LiabilitiesCurrent and LiabilitiesNoncurrent both
+    # report every quarter (1,415.5M + 4,139.7M = 5,555.2M at 2026-05-31, 10-K) — the two
+    # components an issuer keeps tagging quarterly even after retiring the combined total,
+    # same shape as operating_lease_liab above.
+    "total_liabilities": ["LiabilitiesCurrent", "LiabilitiesNoncurrent"],
 }
 # PM-verified figures for lines an issuer reports ONLY in the printed statement.
 # Applied in build() and never allowed to beat a real XBRL tag. Every entry needs a
@@ -289,6 +326,24 @@ MANUAL = {
             "quote": "Purchases of property and equipment and scooter fleet ( 50,718 ) ( 20,786 )",
             "doc": "10-Q filed 2026-08-07 (H1 legs) + 10-K filed 2026-02-11 ('( 52,822 )') — cash-flow statements",
             "entered": "2026-08-14",
+        },
+    },
+    "INSG": {
+        # INSG (Inseego) carries two distinct, non-overlapping long-term debt lines at
+        # 2026-06-30: a drawn revolver (LongTermLineOfCredit) and secured notes
+        # (SecuredLongTermDebt). Our tag map can only pick ONE freshest tag per concept —
+        # summing them here (rather than adding a second alternate that would silently
+        # replace, not add to, the first) avoids understating debt_lt by whichever leg loses
+        # the pick (quality.py-043, 2026-08-25).
+        "debt_lt": {
+            "value": 60_291_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Working Capital Facility 10,000,000 + 2029 Senior Secured Notes, net 50,291,000",
+            "quote": "Working Capital Facility 10,000 0 ... 2029 Senior Secured Notes, net 50,291 41,611 "
+                     "(balance sheet, $ in Thousands)",
+            "doc": "10-Q filed 2026-08-06 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-08-25",
         },
     },
     "MDGL": {
@@ -417,24 +472,27 @@ def _ttm(quarters, annuals, ytd=None, mode="sum"):
         if not annuals or run[0]["end"] > annuals[0]["end"]:
             return (sum(x["value"] for x in run) / len(run),
                     f"avg of {len(run)} direct quarter(s) {run[-1]['start']}..{run[0]['end']}",
-                    run[0]["end"])
+                    run[0]["end"], run[-1]["start"])
     q_result = None
     if len(quarters) >= 4:
         qs = quarters[:4]
         if _contig(qs) and 350 <= _days(qs[3]["start"], qs[0]["end"]) <= 380:
             how = "incl. ytd-diff derived" if any(q.get("derived") for q in qs) else "4 direct 10-Q quarters"
-            q_result = (sum(x["value"] for x in qs), f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})", qs[0]["end"])
+            q_result = (sum(x["value"] for x in qs), f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})",
+                        qs[0]["end"], qs[3]["start"])
     a_result = None
     if annuals:
         a = annuals[0]
-        a_result = (a["value"], f"FY {a['start']}..{a['end']} (no verified TTM — annual used)", a["end"])
+        a_result = (a["value"], f"FY {a['start']}..{a['end']} (no verified TTM — annual used)",
+                    a["end"], a["start"])
     y_result = None
     if ytd:
         # newly-registered issuer: only one YTD period on file, no prior quarters/FY to
         # build a TTM or even a clean quarter from — carry the YTD figure honestly labeled
         # rather than drop it (MBGL: single 10-Q on file, caught by fincheck 2026-08-13)
         y = ytd[0]
-        y_result = (y["value"], f"YTD {y['start']}..{y['end']} (single period on file — no TTM/FY yet)", y["end"])
+        y_result = (y["value"], f"YTD {y['start']}..{y['end']} (single period on file — no TTM/FY yet)",
+                    y["end"], y["start"])
     # None of these three shapes is automatically the FRESHEST answer — an issuer that
     # switches disclosure cadence leaves an old-but-structurally-valid candidate sitting
     # next to fresher data in a shape the code used to rank below it. LEU's sbc: 4
@@ -446,7 +504,7 @@ def _ttm(quarters, annuals, ytd=None, mode="sum"):
     # (a verified 4-quarter TTM over a single annual over a partial-year YTD).
     candidates = [c for c in (q_result, a_result, y_result) if c is not None]
     if not candidates:
-        return None, None, None
+        return None, None, None, None
     return max(candidates, key=lambda c: c[2])
 
 
@@ -469,6 +527,22 @@ def _price(tk):
             return json.loads(r.read()).get("c") or None
     except Exception:
         return None
+
+
+def _cik_tickers(cik):
+    """Every ticker SEC has ever registered under this CIK (submissions API), primary
+    (common) first. [] on any failure — never blocks the card. Used to catch the FTAIM
+    class of error (quality.py-043, 2026-08-25): FTAI Aviation Ltd. registers FIVE tickers
+    at one CIK — FTAI (common) plus FTAIM/FTAIN/FTAIO/FTAIP (four preferred series) — and
+    dei:EntityCommonStockSharesOutstanding is COMMON-only. Multiplying the parent's common
+    share count by a preferred ticker's quote (FTAIM $27.42 x 102.7M common shares) is a
+    type error, not a data-quality gap: it computed $2.82B against Finnhub's real $21.54B
+    common-stock market cap, a 7.6x miss the "multi-class shares" flag text could not
+    explain because there is no multi-class dei split to rescue here at all."""
+    try:
+        return _get(f"https://data.sec.gov/submissions/CIK{cik}.json").get("tickers") or []
+    except Exception:
+        return []
 
 
 def _finnhub_mktcap(tk):
@@ -852,14 +926,27 @@ def _mezzanine_equity(gaap, asof, parent_eq):
     an SEC API inconsistency, not a data gap (2026-08-18). Returns None (not 0) when
     nothing is found, so the caller can tell 'no mezzanine equity' from 'not present'."""
     total, found, got_minority = 0.0, False, False
+    seen_vals = set()
     for tag in MEZZANINE_TAGS:
         rows = [r for r in gaap.get(tag, {}).get("units", {}).get("USD", [])
                 if r.get("end") == asof and r.get("val") is not None]
         if rows:
-            total += max(rows, key=lambda r: r.get("filed") or "")["val"]
+            val = max(rows, key=lambda r: r.get("filed") or "")["val"]
             found = True
             if tag == "MinorityInterest":
                 got_minority = True
+            # Some issuers tag the SAME reported line under two MEZZANINE_TAGS concepts —
+            # U (Unity Software): RedeemableNoncontrollingInterestEquityCarryingAmount and
+            # TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests
+            # both read 266,727,000 at 2026-06-30, the SAME redeemable-NCI line disclosed
+            # twice for taxonomy reasons, not two components. Summing both overshot the
+            # footing identity by exactly that 266.7M (quality.py-043, 2026-08-25). Dedupe
+            # by exact value match at this date rather than by tag identity — CMTL/ATNI's
+            # genuinely additive pair (120,524,000 + 97,393,000, distinct values) is untouched.
+            if val in seen_vals:
+                continue
+            seen_vals.add(val)
+            total += val
     if not got_minority:
         # ARES: 732 facts live under its own `ares:` extension namespace (companyfacts
         # drops it) and NCI never gets its own us-gaap MinorityInterest tag — only the
@@ -868,6 +955,16 @@ def _mezzanine_equity(gaap, asof, parent_eq):
         rows = [r for r in gaap.get("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", {})
                 .get("units", {}).get("USD", [])
                 if r.get("end") == asof and r.get("val") is not None]
+        if not rows:
+            # Partnership form has no "stockholders'" equity at all — KRP (Kimbell Royalty
+            # Partners LP) reports zero rows under the StockholdersEquity tag above, so the
+            # NCI backout silently did nothing; PartnersCapitalIncludingPortionAttributable-
+            # ToNoncontrollingInterest is the LP-form equivalent combined tag (quality.py-043,
+            # 2026-08-25: KRP 669,545,000 combined - 575,851,000 parent-only PartnersCapital
+            # = 93,694,000 NCI, closing the remaining footing gap to the dollar).
+            rows = [r for r in gaap.get("PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest", {})
+                    .get("units", {}).get("USD", [])
+                    if r.get("end") == asof and r.get("val") is not None]
         if rows:
             incl = max(rows, key=lambda r: r.get("filed") or "")["val"]
             total += incl - parent_eq
@@ -1065,11 +1162,11 @@ def build(tk, cik_override=None):
             continue
         avg = name in FLOW_AVG
         quarters, annuals, ytd = _pick_flow(rows, derive=not avg)
-        val, period, endd = _ttm(quarters, annuals, ytd, mode="avg" if avg else "sum")
+        val, period, endd, startd = _ttm(quarters, annuals, ytd, mode="avg" if avg else "sum")
         if val is None:
             continue
         F[name] = {"value": val, "unit": FLOW_UNITS.get(name, "USD"), "period": period,
-                   "period_end": endd, "tag": tag,
+                   "period_end": endd, "period_start": startd, "tag": tag,
                    "latest_quarter_end": quarters[0]["end"] if quarters else None}
         ttm_vals[name] = val
         pv, pp = _prior_ttm(quarters, annuals, mode="avg" if avg else "sum")
@@ -1171,6 +1268,41 @@ def build(tk, cik_override=None):
             seen[r["end"]] = r["val"]
         S[name] = {"points": [{"asof": k, "value": seen[k]} for k in sorted(seen)[-12:]]}
 
+    # SOURCED OVERRIDES, INSTANT twin of the FLOW block above (added 2026-08-25,
+    # quality.py-043): some issuers carry TWO simultaneous, genuinely additive debt
+    # instruments where our tag map can only pick ONE (rows_for keeps the freshest single
+    # tag; it does not sum). INSG (Inseego) reports LongTermLineOfCredit 10,000,000 AND
+    # SecuredLongTermDebt 50,291,000 at the same 2026-06-30 date — two distinct, non-
+    # overlapping instruments (confirmed against the balance sheet: noncurrent liabilities
+    # 66,618,000 = 50,291,000 + 10,000,000 + OperatingLeaseLiabilityNoncurrent 2,381,000 +
+    # OtherLiabilitiesNoncurrent 3,754,000 = 66,426,000, within 192,000/0.3%). Adding
+    # SecuredLongTermDebt as a plain alternate would make rows_for pick ONE of the two
+    # (whichever is freshest/first-listed) and silently drop the other — same
+    # understatement risk as the bug this file exists to avoid. MANUAL is the existing,
+    # narrower escape hatch (PM-verified, quoted, flagged) for exactly this shape; applied
+    # to INSTANT concepts here for the first time, same rules as the FLOW version.
+    for name, ov in (MANUAL.get(tk.upper()) or {}).items():
+        if name not in INSTANT:
+            continue
+        existing = F.get(name)
+        # Strict `>`, not `>=` (unlike the FLOW version above): the FLOW case exists for
+        # STALENESS (an equally-fresh XBRL tag is trusted over a frozen manual figure
+        # because both would compute the SAME thing). This INSTANT case exists for
+        # ADDITIVITY — INSG's single-tag pick (LongTermLineOfCredit alone) is EQUALLY
+        # fresh as the MANUAL sum and still wrong, because freshness never told rows_for
+        # to add a second simultaneous instrument in the first place. A tie must go to
+        # MANUAL here; only a STRICTLY newer filing (a real reason to re-key) defers to it.
+        if existing and (existing.get("asof") or "") > (ov.get("period_end") or ""):
+            continue
+        F[name] = {"value": ov["value"], "unit": "USD", "asof": ov["period_end"],
+                   "tag": "MANUAL (not read by the XBRL pass)", "source": "MANUAL — PM-verified",
+                   "quote": ov["quote"], "doc": ov["doc"], "entered": ov["entered"],
+                   "formula": ov.get("formula")}
+        card["flags"].append(
+            f"{name}: MANUAL figure — not read by the XBRL pass, keyed from the printed "
+            f"statement ({ov['doc']}, entered {ov['entered']}). Quote on the figure. Derived "
+            f"values built on it inherit this: verify the quote before quoting the derivation.")
+
     # A debt_lt/debt_current resolved ONLY via a finance-lease tag (fincard.py-022) is a
     # real reported figure, but not necessarily the issuer's WHOLE long-term debt: AES
     # resolves 714,000,000 this way while reporting no other debt-like concept anywhere in
@@ -1181,21 +1313,41 @@ def build(tk, cik_override=None):
     # exists — TLS clears both (its total_liabilities reconciles with the two finance-
     # lease figures already on the card) and stays silent; AES clears neither (no
     # total_liabilities tag to foot against at all) and is flagged for review.
+    #
+    # FIXED 2026-08-25 (quality.py-043 blast-radius review): the condition below was
+    # INVERTED — `if _debt_like_hits(...): continue` SKIPPED the flag exactly when a hit
+    # existed, i.e. exactly when there WAS other debt out there our tag map cannot resolve.
+    # That is the one case this check exists to catch. Live and silent on HUT: debt_lt read
+    # FinanceLeaseLiability=0 at 2026-06-30 while the issuer's own DebtInstrumentCarryingAmount
+    # showed 7,735,104,000 at the same date — a 7.7B debt understatement with ZERO flags on
+    # the card, the exact "PROVEN ZERO on a real debt" shape fincard.py-022 was written to
+    # stop, reintroduced by this one inverted condition. Also silent on PRI (NotesPayable
+    # 595,716,000 unresolved against a FinanceLeaseLiability debt_lt of ~1,001,000). "Clears
+    # both -> silent" from the doctrine above means BOTH conditions must hold to stay quiet;
+    # either failing must flag, so a hit alone is now sufficient to flag, not to suppress.
     for _dn in ("debt_lt", "debt_current"):
         _fig = F.get(_dn)
         if not _fig or not (_fig.get("tag") or "").startswith("FinanceLeaseLiability"):
             continue
-        if _debt_like_hits(gaap, _fig["asof"]):
-            continue
+        _hits = _debt_like_hits(gaap, _fig["asof"])
         _foots = _foot_check(card, F, gaap, flag=False)[0]
-        if _foots is True:
+        if not _hits and _foots is True:
             continue
-        card["flags"].append(
-            f"{_dn}: sourced ONLY from a finance-lease tag ({_fig['tag']} = "
-            f"{_fig['value']:,.0f} at {_fig['asof']}) — no other debt-like XBRL concept "
-            f"found, and the balance sheet cannot be footed to confirm nothing else is "
-            f"missing. If this issuer carries conventional debt under an extension "
-            f"namespace (see ARI), it is not reflected here.")
+        if _hits:
+            hit_str = "; ".join(f"{c}={v:,.0f}" for c, v in _hits[:4])
+            card["flags"].append(
+                f"{_dn}: sourced ONLY from a finance-lease tag ({_fig['tag']} = "
+                f"{_fig['value']:,.0f} at {_fig['asof']}) — but the issuer ALSO reports "
+                f"{hit_str} at the same date, a debt-like concept our tag map does not "
+                f"resolve into debt_lt/debt_current. Treat {_fig['value']:,.0f} as a LOWER "
+                f"BOUND, not the whole debt line (fincard.py-022/quality.py-043).")
+        else:
+            card["flags"].append(
+                f"{_dn}: sourced ONLY from a finance-lease tag ({_fig['tag']} = "
+                f"{_fig['value']:,.0f} at {_fig['asof']}) — no other debt-like XBRL concept "
+                f"found, and the balance sheet cannot be footed to confirm nothing else is "
+                f"missing. If this issuer carries conventional debt under an extension "
+                f"namespace (see ARI), it is not reflected here.")
 
     # same quarantine as FLOW above, applied to balance-sheet points in time: a debt/asset
     # tag that stops updating while cash/equity/total_assets keep filing quarterly is a
@@ -1454,9 +1606,20 @@ def build(tk, cik_override=None):
                 f"{base['value']:,.0f} ({base['asof']}) over {span} days",
                 "positive = dilution, negative = net buybacks; span varies with dei history")
 
+    _cik_tks = _cik_tickers(cik)
+    _non_primary = bool(_cik_tks) and len(_cik_tks) > 1 and tk.upper() != _cik_tks[0].upper()
     px, sh = _price(tk), gv("shares_out")
-    if px and sh:
+    if px:
         card["price"] = {"value": px, "asof": now, "source": "finnhub quote"}
+    if _non_primary:
+        card["flags"].append(
+            f"NON-PRIMARY SECURITY: CIK {cik} registers {len(_cik_tks)} tickers "
+            f"({', '.join(_cik_tks)}) — {tk} is not {_cik_tks[0]}, the common stock "
+            f"dei:EntityCommonStockSharesOutstanding covers. market_cap/EV/multiples are "
+            f"NOT computed for {tk}: a non-common quote (preferred/alternate class) priced "
+            f"against the common share count is not a real number (quality.py-043, "
+            f"FTAIM forensic, 2026-08-25). Price is still recorded above for reference.")
+    if px and sh and not _non_primary:
         mc = px * sh
         put("market_cap", mc, f"price {px} x shares_out {sh:,.0f} (asof {F['shares_out'].get('asof')})")
         fh_mc = _finnhub_mktcap(tk)
@@ -1476,21 +1639,66 @@ def build(tk, cik_override=None):
                 # own price x shares figure is likely the correct one. Diagnosed 2026-08-20
                 # against MRNA (fh_implied_price $63.0 vs live $174.38 after a large rally
                 # — a stale-cache mismatch, not a share-count one).
+                #
+                # SPLIT DETECTION added 2026-08-25 (quality.py-043, SMXT forensic): SMXT
+                # executed a 1-for-12 reverse split (Nevada cert. of change 2026-08-04,
+                # effective ~2026-08-11) with no post-split 10-Q on file yet (NT 10-Q filed
+                # 2026-08-17) — shares_out is a real, correctly-read dei fact that simply
+                # PREDATES the split. Ratio read exactly 12.0, and the "multi-class shares"
+                # message was actively wrong for this shape (no per-class dei fact exists
+                # to rescue). Name the pattern when the ratio matches a common split factor.
+                _split = ""
+                for _n in (2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 40, 50):
+                    if abs(ratio - _n) / _n < 0.05 or abs(ratio * _n - 1) < 0.05:
+                        _split = (f" Ratio is within 5% of {_n}x — consistent with an "
+                                  f"UN-REFLECTED STOCK SPLIT (shares_out asof "
+                                  f"{F['shares_out'].get('asof')} likely predates a since-"
+                                  f"filed split/reverse-split; check EDGAR for a recent 8-K "
+                                  f"item 5.03/3.03) rather than multi-class shares.")
+                        break
                 card["flags"].append(
                     f"MARKET CAP MISMATCH: computed {mc / 1e9:.2f}B vs Finnhub {fh_mc / 1e9:.2f}B "
                     f"(Finnhub-implied price ${fh_implied_price:,.2f} vs live quote ${px:,.2f}) — "
                     "likely multi-class shares (dei counts one class) or stale share count if the "
                     "implied price is close to the live quote; likely Finnhub's cached "
-                    "/stock/profile2 market cap lagging a price move if it is not. "
-                    "EV/multiples below inherit this error — resolve before using")
+                    "/stock/profile2 market cap lagging a price move if it is not." + _split +
+                    " EV/multiples below inherit this error — resolve before using")
         nc = (D.get("net_cash") or {}).get("value")
         if nc is not None:
             ev = mc - nc
             put("enterprise_value", ev, f"market_cap {mc:,.0f} - net_cash {nc:,.0f}")
             fcf = (D.get("fcf") or {}).get("value")
             if fcf and fcf > 0:
-                put("ev_over_fcf", ev / fcf, f"EV {ev:,.0f} / FCF {fcf:,.0f}")
-                put("fcf_yield_pct", fcf / mc * 100, f"FCF {fcf:,.0f} / market_cap {mc:,.0f}")
+                # fincard.py-045 (quality.py-043, 2026-08-25): EV is a POINT-IN-TIME stock;
+                # FCF from a single YTD period on file (no TTM/FY built yet — a newly-
+                # registered issuer, e.g. MBGL HELD) is a PARTIAL-YEAR flow. Dividing the
+                # two unannotated overstated MBGL's multiple ~2x (43.2x printed vs ~21.6x
+                # true, on its 177,000,000 six-month FCF) with no flag anywhere on the card.
+                # Annualize by the period's own day-count — named in the formula, never a
+                # bare number — rather than either silently printing the wrong multiple or
+                # refusing it outright.
+                _cfo_f = F.get("cfo") or {}
+                _cfo_days = (_days(_cfo_f["period_start"], _cfo_f["period_end"])
+                             if _cfo_f.get("period_start") and _cfo_f.get("period_end") else None)
+                if "single period on file" in (_cfo_f.get("period") or "") and _cfo_days:
+                    _ann_fcf = fcf * 365.0 / _cfo_days
+                    put("ev_over_fcf", ev / _ann_fcf,
+                        f"EV {ev:,.0f} / FCF(annualized) {_ann_fcf:,.0f} (FCF {fcf:,.0f} over "
+                        f"{_cfo_days}d x 365/{_cfo_days} — {_cfo_f.get('period')})",
+                        "FCF is a partial-period (YTD, no TTM/FY on file yet) figure, "
+                        "annualized by day-count so a point-in-time EV is not divided by a "
+                        "partial-year flow (fincard.py-045). Re-derive once a full TTM/FY "
+                        "is on file — this annualization assumes a flat run-rate.")
+                    put("fcf_yield_pct", _ann_fcf / mc * 100,
+                        f"FCF(annualized) {_ann_fcf:,.0f} / market_cap {mc:,.0f}",
+                        "annualized from a partial-period FCF — see ev_over_fcf note")
+                    card["flags"].append(
+                        f"ev_over_fcf/fcf_yield_pct ANNUALIZED from a {_cfo_days}d partial-"
+                        f"period FCF ({fcf:,.0f} -> {_ann_fcf:,.0f}/yr) — no TTM/FY on file "
+                        f"yet; treat as approximate, assumes a flat run-rate (fincard.py-045).")
+                else:
+                    put("ev_over_fcf", ev / fcf, f"EV {ev:,.0f} / FCF {fcf:,.0f}")
+                    put("fcf_yield_pct", fcf / mc * 100, f"FCF {fcf:,.0f} / market_cap {mc:,.0f}")
             if eb and eb > 0:
                 put("ev_over_ebitda", ev / eb, f"EV {ev:,.0f} / approx EBITDA {eb:,.0f}")
             if rev:
@@ -1539,8 +1747,10 @@ def build(tk, cik_override=None):
                 except Exception:
                     grid[f"{g * 100:+.0f}%"] = None
             V["dcf_value_per_share_at_growth"] = grid
-    else:
+    elif not _non_primary:
         card["flags"].append("no live price and/or shares_out — market-derived values skipped")
+    # else: _non_primary already carries its own NON-PRIMARY SECURITY flag above — a second,
+    # generic "no live price" flag here would misdescribe a card that has both.
 
     # One flag, not six. A filer with no us-gaap facts for the universal concepts is not
     # mis-mapped — it reports under a different taxonomy. Six identical "no XBRL tag found"

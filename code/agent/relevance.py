@@ -22,6 +22,7 @@ BATCH = 15
 def main():
     feed = json.load(open(FEED))
     cutoff = time.time() - FRESH_H * 3600
+    raw_total = sum(len(arts or []) for arts in (feed.get("news") or {}).values())
     items = []
     for ticker, arts in (feed.get("news") or {}).items():
         for a in arts or []:
@@ -30,12 +31,14 @@ def main():
                               "ticker": ticker, "headline": a["headline"][:160],
                               "summary": (a.get("summary") or "")[:220],
                               "datetime": a.get("datetime"), "url": a.get("url", "")})
+    filtered = raw_total - len(items)  # stale (past FRESH_H) or missing a headline
     prev = {}
     try:
         prev = json.load(open(OUT)).get("scores", {})
     except Exception:
         pass
     todo = [i for i in items if i["id"] not in prev]
+    already_scored = len(items) - len(todo)
     scores = dict(prev)
     for b in range(0, len(todo), BATCH):
         batch = todo[b:b + BATCH]
@@ -99,7 +102,8 @@ def main():
 
     hot = sorted((v for v in scores.values() if v["score"] >= 7),
                  key=lambda x: -x["score"])[:5]
-    print(f"{time.strftime('%F %T')} scored {len(todo)} new / {len(scores)} total; "
+    print(f"{time.strftime('%F %T')} scored {len(todo)} new / {len(scores)} total "
+          f"(offered {len(items)}, {already_scored} already scored, {filtered} filtered); "
           f"alerted {len(hot_new)} hot; brief has {len(ranked)} items; "
           f"top: {['%s %s' % (h['ticker'], h['score']) for h in hot]}")
 
