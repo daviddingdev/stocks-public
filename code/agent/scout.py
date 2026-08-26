@@ -147,8 +147,16 @@ def _events():
                                  f"their book (Q ended {g.get('period')}; 45d stale)"})
     can = _j(DATA / "cannibal.json", {})
     for h in can.get("top", []):
-        ev.append({"id": f"can:{h['ticker']}:{str(can.get('ran_at', ''))[:10]}",
+        # Keyed by TICKER, not ticker+date (scout.py-056): the screen re-hits the same
+        # names every run it survives on, and a dated id minted a fresh row per sighting —
+        # 120 rows for 25 tickers, with a PM verdict (dropped/pm_reviewed) on one day's row
+        # invisible to tomorrow's. The merge loop below carries date/detail/runs_on_screen
+        # forward on the SAME row and never touches status/pm_note, so a verdict sticks
+        # until a human reopens it — "never re-derive a candidate you already passed on
+        # without new facts" (SOURCING.md) is now something the funnel can actually do.
+        ev.append({"id": f"can:{h['ticker']}",
                    "kind": "cannibal-screen", "ticker": h["ticker"], "date": str(can.get("ran_at", ""))[:10],
+                   "runs_on_screen": h.get("runs_on_screen") or h.get("weeks_on_screen") or 1,
                    "detail": (f"Cannibal screen: FCF yield {h['fcf_yield_pct']}%, shares "
                               f"-{h['share_shrink_pct']}% y/y, net cash ${h['net_cash'] / 1e6:,.0f}M, "
                               f"cap ${h['market_cap'] / 1e6:,.0f}M, {h.get('runs_on_screen') or h.get('weeks_on_screen') or 1} run(s) on screen"
@@ -296,10 +304,18 @@ def run(max_pre=25, max_triage=8):
                 # unblocks it same as a fresh event would, not just events arriving after
                 # the fix (scout.py-037).
                 cur["status"] = "enriching"
+        if cur and e.get("kind") == "cannibal-screen":
+            # scout.py-056: a re-hit refreshes the screen's numbers and sighting count on
+            # the SAME row — never status or pm_note. A dropped/pm_reviewed verdict must
+            # survive every later run; only a human reopen (or a new event kind entirely)
+            # should move it off that status.
+            cur["date"], cur["detail"] = e["date"], e["detail"]
+            cur["runs_on_screen"] = e.get("runs_on_screen")
+            cur["last_seen"] = now
     new = [e for e in evs if e["id"] not in items]
     n_pre = n_tri = 0
     for e in new:
-        items[e["id"]] = {**e, "status": "new", "first_seen": now}
+        items[e["id"]] = {**e, "status": "new", "first_seen": now, "last_seen": now}
     # Stage 1: pre-triage newest-first, capped per run
     todo = [i for i in items.values() if i["status"] == "new"]
     todo.sort(key=lambda x: str(x.get("date", "")), reverse=True)
@@ -375,7 +391,15 @@ def run(max_pre=25, max_triage=8):
     q["items"] = items
     q["scanned_at"] = now
     CAND.write_text(json.dumps(q, indent=1))
-    top = sorted((i for i in items.values() if i["status"] == "triaged"),
+    # A row can reach status=triaged without a "triage" dict if a PM session hand-edits
+    # status back onto a row that never ran the code triage stage (e.g. reopening a
+    # pre_triaged/pm_reviewed candidate) — this crashed every run for a full market day
+    # on 2026-08-24 (KeyError: 'triage'), 15 times, after the write above had already
+    # succeeded — only this display line was ever at risk, but a crash here still kills
+    # the cron job with a non-zero exit every run until the offending row's status
+    # changes. Require a real "triage" dict to enter the display, same gate the sort key
+    # implicitly assumed but never enforced (scout.py-crash-2026-08-26).
+    top = sorted((i for i in items.values() if i["status"] == "triaged" and "triage" in i),
                  key=lambda x: -x["triage"]["score"])[:5]
     print(f"{now} scout: {len(new)} new events · {n_pre} pre-triaged · {n_tri} triaged · "
           f"queue top: {[(t.get('ticker'), t['triage']['score']) for t in top]}")

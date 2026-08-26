@@ -305,6 +305,21 @@ INSTANT_SUM = {
     # same shape as operating_lease_liab above.
     "total_liabilities": ["LiabilitiesCurrent", "LiabilitiesNoncurrent"],
 }
+# total_liabilities's component-sum is NOT safe as a blanket rule the way operating_lease_
+# liab's is (that one is a single concept split current/noncurrent by definition, so the
+# two halves always foot to the whole). `Liabilities` decomposing into exactly
+# `LiabilitiesCurrent + LiabilitiesNoncurrent` is a coincidence of how LW's balance sheet
+# is laid out, not a guarantee of the taxonomy. Shipped unscoped in the first cut of
+# quality.py-043 (2026-08-25) and caught by the blast-radius sweep (2026-08-26): a
+# rate-regulated utility balance sheet keeps major captions (long-term debt, regulatory
+# liabilities, deferred taxes) OUTSIDE both tags, so the sum silently understates the
+# total — PEG (the ticker THIS FILE's own RESCUE comment already names as the 264x
+# total_liabilities disaster) read 18.7B against a true ~41.5B; NI and TE broke the same
+# way. Scope to tickers verified by hand against the issuer's own footing balance sheet,
+# same bar as a MANUAL entry — do not widen without checking a new ticker foots.
+INSTANT_SUM_TICKERS = {
+    "total_liabilities": {"LW"},
+}
 # PM-verified figures for lines an issuer reports ONLY in the printed statement.
 # Applied in build() and never allowed to beat a real XBRL tag. Every entry needs a
 # verbatim quote and the document it came from, because this dict is the one place
@@ -1232,6 +1247,9 @@ def build(tk, cik_override=None):
     def component_sum(name):
         """INSTANT_SUM fallback: rebuild an annual-only total from the current/
         noncurrent split the issuer does tag quarterly. All components or nothing."""
+        allowed = INSTANT_SUM_TICKERS.get(name)
+        if allowed is not None and tk.upper() not in allowed:
+            return None, []
         comps = INSTANT_SUM.get(name) or []
         per = {}
         for ctag in comps:
@@ -1607,21 +1625,25 @@ def build(tk, cik_override=None):
                 "positive = dilution, negative = net buybacks; span varies with dei history")
 
     _cik_tks = _cik_tickers(cik)
-    _non_primary = bool(_cik_tks) and len(_cik_tks) > 1 and tk.upper() != _cik_tks[0].upper()
+    _multi_ticker_cik = bool(_cik_tks) and len(_cik_tks) > 1
     px, sh = _price(tk), gv("shares_out")
     if px:
         card["price"] = {"value": px, "asof": now, "source": "finnhub quote"}
-    if _non_primary:
-        card["flags"].append(
-            f"NON-PRIMARY SECURITY: CIK {cik} registers {len(_cik_tks)} tickers "
-            f"({', '.join(_cik_tks)}) — {tk} is not {_cik_tks[0]}, the common stock "
-            f"dei:EntityCommonStockSharesOutstanding covers. market_cap/EV/multiples are "
-            f"NOT computed for {tk}: a non-common quote (preferred/alternate class) priced "
-            f"against the common share count is not a real number (quality.py-043, "
-            f"FTAIM forensic, 2026-08-25). Price is still recorded above for reference.")
-    if px and sh and not _non_primary:
+    # NON-PRIMARY SECURITY is now EVIDENCE-GATED, not assumed from ticker-list position
+    # (fixed 2026-08-26, same-night regression): the original cut treated `_cik_tks[0]` as
+    # "the" common ticker and suppressed market_cap/EV for every OTHER ticker at that CIK.
+    # SEC's submissions API does not order tickers common-first — OmniAB (a currently-
+    # researched name) registers ['OABIW', 'OABI'], warrant FIRST, so the naive rule flagged
+    # OABI itself (the actual common stock) as non-primary and killed a market_cap that
+    # matched Finnhub to the dollar ($677.5M both ways). Multi-class common (BATRA/BATRK/
+    # BATRB) has the same problem the other direction — every class is legitimately common,
+    # not one primary and N impostors. Now: always compute mc and cross-check against
+    # Finnhub first; only attribute a REAL mismatch to non-primary-security status (and
+    # suppress) when there's evidence (the ratio is actually off) rather than guessing from
+    # array order alone.
+    _non_primary = False
+    if px and sh:
         mc = px * sh
-        put("market_cap", mc, f"price {px} x shares_out {sh:,.0f} (asof {F['shares_out'].get('asof')})")
         fh_mc = _finnhub_mktcap(tk)
         if fh_mc:
             ratio = mc / fh_mc
@@ -1629,6 +1651,20 @@ def build(tk, cik_override=None):
             card["cross_checks"]["market_cap_vs_finnhub"] = {
                 "computed": round(mc), "finnhub": round(fh_mc), "ratio": round(ratio, 3),
                 "fh_implied_price": round(fh_implied_price, 2), "ok": 0.9 <= ratio <= 1.1}
+            if not (0.9 <= ratio <= 1.1) and _multi_ticker_cik:
+                _non_primary = True
+                card["flags"].append(
+                    f"NON-PRIMARY SECURITY: CIK {cik} registers {len(_cik_tks)} tickers "
+                    f"({', '.join(_cik_tks)}) and computed market cap ({mc / 1e9:.2f}B) "
+                    f"disagrees with Finnhub ({fh_mc / 1e9:.2f}B) by more than a rounding — "
+                    f"{tk}'s price against the CIK's dei:EntityCommonStockSharesOutstanding "
+                    f"count is not a real number (quality.py-043, FTAIM forensic, "
+                    f"2026-08-25; evidence-gated 2026-08-26 after the OABI false positive — "
+                    f"see fincard.py comment). market_cap/EV/multiples NOT computed for "
+                    f"{tk}. Price is still recorded above for reference.")
+    if px and sh and not _non_primary:
+        put("market_cap", mc, f"price {px} x shares_out {sh:,.0f} (asof {F['shares_out'].get('asof')})")
+        if fh_mc:
             if not (0.9 <= ratio <= 1.1):
                 # fh_implied_price (Finnhub's cached market cap / OUR OWN shares_out) lets
                 # the reader tell the two candidate causes apart at a glance: close to the

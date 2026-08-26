@@ -155,9 +155,14 @@ def cik_map():
 # ARI's DEFM14A — carrying the actual Special Meeting date, record date, and Initial Cash
 # Distribution timing for a live agent-book liquidation thesis — filed 2026-08-24 and never
 # reached feed.json or the filing-day trigger because no *14A form was in this set.
-INTERESTING = {"8-K", "10-K", "10-Q", "4", "SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A",
+# 8-K/A and DEFA14A added (triggers.py-054, 2026-08-26): ARI faces contested litigation
+# (attachment hearing 2026-09-25, 4 days before the 2026-09-29 vote) that can amend or
+# supplement the DEFM14A's disclosures — those updates are the two standard EDGAR forms for
+# "the 8-K/DEFM14A I already filed needs a correction or supplemental disclosure", most often
+# used industry-wide for exactly this kind of merger-litigation development.
+INTERESTING = {"8-K", "8-K/A", "10-K", "10-Q", "4", "SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A",
                "SCHEDULE 13D", "SCHEDULE 13G", "SCHEDULE 13D/A", "SCHEDULE 13G/A", "S-1", "424B5",
-               "DEFM14A", "DEF 14A", "PREM14A", "PRE 14A"}
+               "DEFM14A", "DEF 14A", "PREM14A", "PRE 14A", "DEFA14A"}
 
 
 def edgar_filings(tickers, days=45):

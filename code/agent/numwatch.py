@@ -198,8 +198,16 @@ FAMILIES = [
 # unsourced inverts the meaning. ARI's thesis notes carry "erroneous cash figure $758.685M"
 # and "dividend calculation error $480.795M": both are the PM recording an error, and both
 # were reported back at it as errors.
-ERROR_WORDS = ("erroneous", "error", "incorrect", "misstated", "mistaken", "wrong",
-               "typo", "overstated", "understated", "corrected", "correction")
+# Stems, not exact words, for the overstat/understat/misstat family (numwatch.py-055,
+# 2026-08-25): "overstated" as an exact word does not match "overstatement" — TLS's
+# 2026-08-18 defect writeup ("a 30% overstatement of free cash flow") kept reporting as
+# UNSOURCED across two sessions even after a full correction block was appended, because
+# the PM's own phrasing ("...ment" not "...ed") never matched. Substring-matched against
+# low_ctx like every other entry here, so the stem alone is enough to catch every
+# inflection (overstate/overstated/overstatement/overstating, etc).
+ERROR_WORDS = ("erroneous", "error", "incorrect", "mistaken", "wrong",
+               "typo", "overstat", "understat", "misstat", "corrected", "correction",
+               "defect")
 
 # The PM's own arithmetic. "implied REO asset value", "my base case" — derived numbers that
 # are SUPPOSED to be absent from the filings; that is what makes them the PM's variant view
