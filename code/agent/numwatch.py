@@ -238,7 +238,18 @@ FORWARD_WORDS = ("guide", "guidance", "target", "estimate", "expected", "forecas
 # H1 capex delta (50,718 - 20,786 = 29,932K) fell through to the coincidental-card-concept
 # check and cried MISLABEL against a 2024 balance-sheet figure with no relationship to it
 # (numwatch.py-028, 2026-08-20). Re-derivation is the memo audit's job, not this watchdog's.
-DELTA_WORDS = ("delta", "swing", " vs ", "vs.", "up from", "down from", "increase", "decrease")
+DELTA_WORDS = ("delta", "swing", " vs ", "vs.", "up from", "down from", "increase", "decrease",
+               "reserve build", "reserve release")
+# "reserve build"/"release": standard accounting shorthand for an increase/decrease in a
+# reserve balance — itself a delta by definition, but neither the word nor the figure
+# carries a sign or DELTA_WORDS match above (fincard.py-060 follow-up, numbers 2026-08-27,
+# LYFT: "Insurance-reserve build inside CFO is $359,793K" cried UNSOURCED against no card
+# concept, even though it is an exact, verified TTM rollforward of two verbatim filing
+# quotes two lines above it in the SAME memo — FY25 10-K "Insurance reserves 479,033
+# 363,524 (79,482)" minus 10-Q H1'25 "127,232 246,472"'s 246,472 plus that same quote's
+# 127,232 = 479,033 - 246,472 + 127,232 = 359,793 exactly, the identical FY+H1curr-H1prior
+# formula the memo uses one line up for TTM CFO. Scoped to the two-word phrase, not bare
+# "build" (which appears in unrelated contexts — "build a position," "build conviction").
 
 # a delta signalled by PUNCTUATION rather than a WORD (numwatch.py-034, PM 2026-08-21):
 # (1) a leading sign directly on the figure — "H1: CFO +26.6M, capex +29.9M" — the same

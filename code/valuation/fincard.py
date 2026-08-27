@@ -320,6 +320,31 @@ INSTANT_SUM = {
 INSTANT_SUM_TICKERS = {
     "total_liabilities": {"LW"},
 }
+# fincard.py-033 flags any issuer where capex_software adds >20% on top of PP&E-only
+# capex, asking a human to verify the two lines don't double-count. Per-ticker allowlist
+# for issuers where that has been checked against the PRINTED cash-flow statement and
+# the flag would otherwise re-ask the same answered question every session (fincard.py-060,
+# PM ask 2026-08-26, closed by numbers 2026-08-27). The combine into fcf still happens —
+# this only suppresses the review flag. Every entry needs the two verbatim quotes that
+# proved it: the cash-flow statement footing to total investing (disjoint lines, not one
+# subsuming the other) and, where available, the issuer's own FCF definition matching the
+# card's formula. Do NOT widen to a blanket rule — capex_software is flagged in the first
+# place because some issuers DO report capitalized software inside PP&E.
+CAPEX_SOFTWARE_DISJOINT_VERIFIED = {
+    "TLS": {
+        "quote_cfs": "Cash flows from investing activities: Capitalized software development "
+                      "costs ( 4,102 ) Purchases of property and equipment ( 391 ) Net cash "
+                      "used in investing activities ( 4,493 )",
+        "doc_cfs": "10-Q filed 2026-08-10, six months ended 2026-06-30 — 4,102 + 391 = 4,493 "
+                   "exactly, footing to total investing: two disjoint lines, neither subsumes "
+                   "the other",
+        "quote_fcf_def": "Free Cash Flow is defined as net cash (used in) provided by operating "
+                          "activities, less net purchases of property and equipment, and "
+                          "capitalized software development costs.",
+        "doc_fcf_def": "EX-99.2 filed 2026-08-10 — matches the card's capex = capex + "
+                        "capex_software exactly",
+    },
+}
 # PM-verified figures for lines an issuer reports ONLY in the printed statement.
 # Applied in build() and never allowed to beat a real XBRL tag. Every entry needs a
 # verbatim quote and the document it came from, because this dict is the one place
@@ -1546,7 +1571,7 @@ def build(tk, cik_override=None):
         pct_added = (capex_sw / capex) if capex else float("inf")
         capex_note = (f" capex is PP&E {capex:,.0f} + capitalized software {capex_sw:,.0f} "
                       f"(fincard.py-033) = {combined:,.0f}.")
-        if pct_added > 0.20:
+        if pct_added > 0.20 and tk not in CAPEX_SOFTWARE_DISJOINT_VERIFIED:
             card["flags"].append(
                 f"capex_software adds {pct_added * 100:,.0f}% on top of PP&E-only capex "
                 f"({capex_sw:,.0f} added to {capex:,.0f}) — material; verify neither line "

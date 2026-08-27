@@ -116,7 +116,23 @@ def instance_url(cik, acc):
 
 
 def facts(cik, acc=None):
-    """Every fact in the filing, as dicts. Extensions included — that is the whole point."""
+    """Every fact in the filing, as dicts. Extensions included — that is the whole point.
+
+    Deduped on (ns, tag, context, value): a single reported fact routinely appears as TWO
+    separate `<ix:...>` elements in the raw instance — same concept, same contextRef, same
+    value, different `id` — because filers' tagging tools re-tag cover-page facts once in
+    the "Document and Entity Information" block and again in a "cover page" viewer block
+    that references the same underlying fact (MSGS 10-K filed 2026-08-13: `dei:
+    EntityCommonStockSharesOutstanding` for context c-3/c-4 (Class A/B) each appears 3x
+    verbatim). A context legitimately reports one value per concept, so identical (ns, tag,
+    context, value) tuples are the same fact re-tagged, not independent data points.
+    Un-deduped, `_shares_out_rescue` (fincard.py) summed each class 2-4x over, corrupting
+    its own largest-vs-sum disambiguation and silently dropping MSGS's Class B shares
+    entirely (fincard.py-060 follow-up, numbers 2026-08-27: computed market cap read 7.79B
+    against Finnhub's 9.59B, a false MARKET CAP MISMATCH — true total is Class A
+    19,550,424 + Class B 4,529,517 = 24,079,941, confirmed identical-economic-rights common
+    stock via the 10-K's own 'entitled to identical dividend and liquidation rights'
+    language, same shape as VICR/GEL/LEU/ATROB already in this module's docstring)."""
     if acc is None:
         acc, *_ = latest_filing(cik)
     if not acc:
@@ -127,6 +143,7 @@ def facts(cik, acc=None):
     raw = _get(url).decode("utf-8", "ignore")
     ctxs = contexts(raw)
     out = []
+    seen = set()
     for ns, tag, attrs, val in _FACT.findall(raw):
         v = val.strip()
         if not v:
@@ -140,6 +157,10 @@ def facts(cik, acc=None):
             except ValueError:
                 num = None
         cid = ctx.group(1) if ctx else ""
+        dedup_key = (ns, tag, cid, v)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
         c = ctxs.get(cid, {})
         out.append({"ns": ns, "tag": tag, "value": v, "number": num,
                     "context": cid, "unit": unit.group(1) if unit else "",

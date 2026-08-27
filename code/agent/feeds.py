@@ -219,6 +219,15 @@ def _parse_idx_line(line):
     return None
 
 
+# scout.py-061: a 13D's own Item 5 percentage basis reads "based upon 143,044,372.357
+# shares of common stock outstanding as of ..." — FRACTIONAL SHARES TO THREE DECIMALS —
+# on an interval/tender-offer fund (repurchases at NAV, no listed price, nothing for an
+# activist to force). A listed issuer's share count is always a whole number. Cheap and
+# structural: catch it once here, at the same fetch that already resolves filer/subject,
+# rather than let every downstream stage re-discover the same disqualifying fact.
+_FRAC_SHARES_RE = re.compile(r"\b\d[\d,]{2,}\.\d+\s+shares\s+of\b", re.I)
+
+
 def _resolve_13d_subjects(rows, cap=20):
     """The daily form index lists an accession under BOTH the filer's CIK and the
     subject's CIK (EDGAR indexes a 13D against every party named in it); this code used
@@ -246,7 +255,10 @@ def _resolve_13d_subjects(rows, cap=20):
             continue
         entry = dict(cached or {})
         try:
-            head = requests.get(r["url"], headers=UA, timeout=30).text[:6000]
+            # 50KB covers the SGML header plus the cover page / Item 5 of a typical 13D —
+            # the 6KB used for filer/subject resolution alone stops before Item 5 ever starts.
+            full = requests.get(r["url"], headers=UA, timeout=30).text[:50_000]
+            head = full[:6000]
             fetched += 1
             time.sleep(0.15)
             m = re.search(r"SUBJECT COMPANY:.*?COMPANY CONFORMED NAME:\s*(.+?)\n.*?CENTRAL INDEX KEY:\s*(\d+)",
@@ -258,6 +270,7 @@ def _resolve_13d_subjects(rows, cap=20):
             fm = re.search(r"FILED BY:.*?COMPANY CONFORMED NAME:\s*(.+?)\n", head, re.S)
             if fm:
                 entry["filer"] = fm.group(1).strip()[:80]
+            entry["frac_shares_basis"] = bool(_FRAC_SHARES_RE.search(full))
         except Exception:
             pass
         cache[acc] = entry

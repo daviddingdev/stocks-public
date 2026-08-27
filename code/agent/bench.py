@@ -395,7 +395,10 @@ def work(minutes=60, model_key="fast", worker=None):
             if survived:
                 kept += 1
             q = _load(); tt = q["tasks"][t["id"]]
-            tt.update(state="done", model=model, seconds=dt_s, at=_now(),
+            # bench.py-058: stamp WHICH question produced this row — the queue is durable
+            # and outlives any single channel, so a task's own "done" record is the only
+            # place that can later say it was channel 11's read, not channel 12's.
+            tt.update(state="done", model=model, seconds=dt_s, at=_now(), channel=qn["channel"],
                       result=out, claimed=claimed, verbatim=verbatim, survived=survived)
             _write(QUEUE, q)
             done += 1
@@ -493,19 +496,53 @@ def rank():
                                 "why": r.get("why_it_matters"),
                                 "confidence": r.get("confidence"),
                                 "score": _specificity(quote),
-                                "doc": Path(t["file"]).name, "model": t.get("model")})
+                                "doc": Path(t["file"]).name, "model": t.get("model"),
+                                # bench.py-058: which question produced this row, and when —
+                                # tasks written before this field existed carry channel=None.
+                                "channel": t.get("channel"), "at": t.get("at")})
         row["best"] = max(row["best"], _specificity(quote))
     out = sorted(by.values(), key=lambda x: (-x["best"], -len(x["evidence"])))
     _write(BENCH, {"built": _now(), "question": question(), "rows": out,
                    "_doc": "Ranked by a coded specificity score (numeric figure + a change-to-"
                            "prior-arrangement verb in the quote), not model confidence and not "
                            "a multiple — see bench.py-030. A row is a LEAD; the full evidence "
-                           "gate is unchanged before any order."})
+                           "gate is unchanged before any order. Each evidence item carries the "
+                           "channel and UTC time it was extracted (bench.py-058)."})
     print(f"bench.json: {len(out)} names with verbatim-verified evidence")
     for r in out[:10]:
         print(f"  {r['best']}/10 {r['ticker']:<6} {len(r['evidence'])} quote(s) · "
               f"{(r['evidence'][0]['quote'] or '')[:80]}")
     return out
+
+
+def _channel_stats(channel):
+    """bench.py-058: claimed/survived totals for every task DONE under this exact channel,
+    across the whole durable queue — the brief's "what did THIS question actually produce"
+    line. A task written before channel-stamping shipped has channel=None and never matches."""
+    q = _load()
+    done = [t for t in q["tasks"].values() if t.get("state") == "done" and t.get("channel") == channel]
+    claimed = sum(1 for t in done if t.get("claimed"))
+    survived = sum(1 for t in done if t.get("survived"))
+    return {"read": len(done), "claimed": claimed, "survived": survived}
+
+
+def _corpus_forms():
+    """bench.py-059: what SEC forms the corpus actually contains, counted from the files on
+    disk — e.g. {'10-K': 2252, '10-Q': 2254}. A channel asking about a mechanism disclosed
+    in forms absent here (S-1/S-3/424B/8-K/25-NSE — lock-ups, shelves, delistings) cannot
+    find it no matter how good the question is; this is the provenance that says so up front."""
+    from collections import Counter
+    c = Counter()
+    if not CORPUS.exists():
+        return {}
+    for d in CORPUS.iterdir():
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.txt"):
+            m = re.search(r"_([A-Za-z0-9/-]+)\.txt$", f.name)
+            if m:
+                c[m.group(1)] += 1
+    return dict(sorted(c.items(), key=lambda kv: -kv[1]))
 
 
 
@@ -627,7 +664,23 @@ def brief(top=25):
     fresh = [r for r in rows if r["ticker"].upper() not in held
              and r["ticker"].upper() not in seen]
     qn = b.get("question") or {}
+    cur_channel = qn.get("channel")
+    stats = _channel_stats(cur_channel)
+    this_ck = {r["ticker"] for r in rows
+               if any(e.get("channel") == cur_channel for e in r.get("evidence") or [])}
+    carried = len(rows) - len(this_ck)
+    forms = _corpus_forms()
+    forms_line = ", ".join(f"{n} {f}" for f, n in forms.items()) or "corpus not built yet"
+    # bench.py-058: what THIS channel actually produced, first line, unmissable — a run that
+    # claimed 0 must say so before any evidence rows, not bury it under yesterday's leads.
     L = [f"# The Bench — overnight read, built {b.get('built', '?')}", "",
+         f"**This channel ({cur_channel or '?'}) read {stats['read']} filings this run · "
+         f"claimed {stats['claimed']} · {stats['survived']} SURVIVED the verbatim check.**"
+         + ("" if stats["claimed"] else "  **ZERO claimed — every row below, if any, is "
+            "carried over from an earlier channel, not produced by this question.**"),
+         "", f"**Corpus:** {forms_line} (bench.py-059 — a channel asking about a mechanism "
+             "disclosed in forms outside this mix will find nothing here regardless of the "
+             "question's quality).", "",
          "_Your local analyst read primary filings across the market all night, at zero Claude",
          "token cost. Ranked by a CODED score (a concrete figure + a change-to-prior-arrangement",
          "verb in the quote), not the model's own confidence — that field saturated at 9/10 across",
@@ -639,7 +692,8 @@ def brief(top=25):
          f"(set by {qn.get('set_by', '?')}{' on ' + qn['set_at'] if qn.get('set_at') else ''})", "",
          f"**{len(rows)} names carry evidence · {len(fresh)} are new to you** "
          f"({len(held & {r['ticker'].upper() for r in rows})} already held, "
-         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel).",
+         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel) — "
+         f"{len(this_ck)} of these rows are from THIS channel, {carried} carried over from earlier ones.",
          ""]
     if not rows:
         L += ["_No evidence rows — either the queue was empty or every read failed the verbatim",
@@ -704,5 +758,10 @@ if __name__ == "__main__":
         q["set_by"] = "PM"; q["set_at"] = _now()
         _write(QFILE, q)
         print(f"question set: channel={q['channel']!r} ask={q['ask'][:60]!r}... rule={q['rule'][:60]!r}...")
+        forms = _corpus_forms()
+        # bench.py-059: printed at set-time so the PM sees the constraint BEFORE spending a
+        # night on a channel the corpus structurally cannot answer (e.g. lock-ups/shelves,
+        # which live in S-1/S-3/424B/8-K — forms this 10-K/10-Q corpus does not contain).
+        print("corpus forms: " + (", ".join(f"{n} {f}" for f, n in forms.items()) or "not built yet"))
     else:
         sys.exit(__doc__)

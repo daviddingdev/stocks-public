@@ -111,6 +111,12 @@ def _events():
         filer = r.get("filer") or r.get("company")
         if _self_filed_13d(filer, r.get("subject")):
             continue
+        if r.get("frac_shares_basis"):
+            # scout.py-061: a fractional (to 2+ decimals) share-count basis in the 13D's own
+            # Item 5 percentage math is an interval/tender-offer fund's signature — it
+            # repurchases at NAV, not a listed price, so there is no discount for an
+            # activist to close. Applies to the 13D channel generally, not just a CEF screen.
+            continue
         tk = r.get("subject_ticker")
         d = r.get("date", "")
         d = f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
@@ -372,6 +378,17 @@ def run(max_pre=25, max_triage=8):
                 it["status"] = "enrich_failed"
                 it["error"] = str(ex)[:120]
                 continue
+        # scout.py-061: "no live price" (fincard.py) on a 13D subject is the other half of
+        # the interval/tender-offer fund signature — a listed activist target always has one.
+        # Coded, not left for the local model to notice as free-text red_flags: it never
+        # reaches the TRIAGE call, which would otherwise spend the LLM read on an event that
+        # cannot be a listed-discount thesis.
+        if it["kind"] == "13D" and card and any("no live price" in f for f in card.get("flags", [])):
+            it["status"] = "pre_triaged"
+            it["pre"] = {"plausible": 0,
+                         "why": "no live quote — interval/tender-offer fund, not a listed discount",
+                         "channel": "none"}
+            continue
         v = ask_json(TRIAGE_PROMPT + "\n\nEVENT: " + json.dumps(
             {k: it.get(k) for k in ("kind", "ticker", "issuer", "date", "detail")})
             + "\n\nFINANCIAL CARD SUMMARY: " + (summary or "unavailable"), num_predict=600)
