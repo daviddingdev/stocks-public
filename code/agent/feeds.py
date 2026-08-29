@@ -185,11 +185,193 @@ def edgar_filings(tickers, days=45):
                                                rec["primaryDocument"], rec.get("items", [""] * len(rec["form"]))):
             if date < cutoff or form not in INTERESTING:
                 continue
-            rows.append({"date": date, "form": form, "items": items,
-                         "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{doc}"})
+            row = {"date": date, "form": form, "items": items,
+                   "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{doc}"}
+            if form == "4":
+                # primaryDocument points at the XSLT-rendered viewer (xslF345X06/<file>.xml,
+                # HTML under an .xml name); the raw ownershipDocument XML this parses lives at
+                # the SAME filename one directory up, at the accession root (verified against
+                # TLS 0001628280-26-058627 and LYFT 0001675948-26-000006, feeds.py-070).
+                row["_xml_url"] = (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+                                   f"{acc.replace('-', '')}/{doc.rsplit('/', 1)[-1]}")
+            rows.append(row)
         out[tk] = rows[:15]
         time.sleep(0.15)
+    return _resolve_form4_transactions(out)
+
+
+def _f4_val(container_tag, block):
+    """The <value> immediately inside a Form 4 wrapper tag, e.g. <transactionShares><value>."""
+    m = re.search(rf"<{container_tag}>(.*?)</{container_tag}>", block, re.S)
+    if not m:
+        return None
+    vm = re.search(r"<value>\s*([^<]*?)\s*</value>", m.group(1), re.S)
+    val = vm.group(1).strip() if vm else ""
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return val
+
+
+def _f4_ownership_nature(txn_block):
+    """Direct ('D') vs indirect ('I') ownership plus, for I, the natureOfOwnership footnote
+    text (e.g. "By spouse's IRA") -- a Form 4 sale out of a family/trust account and a sale
+    from the insider's own direct holding are opposite signals and were previously collapsed
+    into one unlabeled number (feeds.py-073)."""
+    m = re.search(r"<directOrIndirectOwnership>(.*?)</directOrIndirectOwnership>", txn_block, re.S)
+    if not m:
+        return None, None
+    vm = re.search(r"<value>\s*([^<]*?)\s*</value>", m.group(1), re.S)
+    nature = vm.group(1).strip() if vm else None
+    note = None
+    if nature == "I":
+        nm = re.search(r"<natureOfOwnership>(.*?)</natureOfOwnership>", txn_block, re.S)
+        if nm:
+            nvm = re.search(r"<value>\s*([^<]*?)\s*</value>", nm.group(1), re.S)
+            note = nvm.group(1).strip() if nvm else None
+    return nature, note
+
+
+def _f4_owner_role(owner_block):
+    title_m = re.search(r"<officerTitle>\s*([^<]+?)\s*</officerTitle>", owner_block)
+    if title_m and title_m.group(1).strip():
+        return title_m.group(1).strip()
+
+    def flag(tag):
+        return bool(re.search(rf"<{tag}>\s*(1|true)\s*</{tag}>", owner_block, re.I))
+    if flag("isOfficer"):
+        return "Officer"
+    if flag("isDirector"):
+        return "Director"
+    if flag("isTenPercentOwner"):
+        return "10% Owner"
+    return ""
+
+
+def _parse_form4_xml(xml_text):
+    """Extract the fields BOOK.md's insider tripwires actually test (filer, transaction
+    code, shares, price, post-transaction share count, Rule 10b5-1 status) from a Form 4's
+    raw ownershipDocument XML. Before this the row carried only {date, form, items, url} --
+    every field a tripwire needs was one fetch away and none of them were in feed.json
+    (feeds.py-070). Schema verified live against TLS 0001628280-26-058627 (Dockery, code S,
+    no plan) and LYFT 0001675948-26-000006 (Brewer CFO, code S, <aff10b5One>1</aff10b5One>
+    plus an F1 footnote naming the 2026-03-13 plan date)."""
+    owner_m = re.search(r"<reportingOwner>(.*?)</reportingOwner>", xml_text, re.S)
+    owner_block = owner_m.group(1) if owner_m else ""
+    name_m = re.search(r"<rptOwnerName>\s*([^<]+?)\s*</rptOwnerName>", owner_block)
+    out = {"filer": name_m.group(1).strip() if name_m else "",
+           "owner_title": _f4_owner_role(owner_block)}
+
+    footnotes = {fm.group(1): fm.group(2).strip() for fm in
+                 re.finditer(r'<footnote id="([^"]+)">(.*?)</footnote>', xml_text, re.S)}
+    # the 2023 rule change added a document-level "filed pursuant to a Rule 10b5-1(c) plan"
+    # checkbox (aff10b5One) -- newer filings (LYFT) set it directly; older-schema filings
+    # only say so in a footnote text, so both are checked.
+    doc_10b5_1 = bool(re.search(r"<aff10b5One>\s*(1|true)\s*</aff10b5One>", xml_text, re.I))
+
+    txns = []
+    for kind, block_re in (("non-derivative", r"<nonDerivativeTransaction>(.*?)</nonDerivativeTransaction>"),
+                            ("derivative", r"<derivativeTransaction>(.*?)</derivativeTransaction>")):
+        for tm in re.finditer(block_re, xml_text, re.S):
+            b = tm.group(1)
+            code_m = re.search(r"<transactionCode>\s*([^<]+?)\s*</transactionCode>", b)
+            fn_ids = re.findall(r'footnoteId\s+id="([^"]+)"', b)
+            fn_texts = [footnotes[i] for i in fn_ids if i in footnotes]
+            plan_texts = [t for t in fn_texts if "10b5-1" in t]  # a transaction can carry
+            # several footnotes (e.g. LYFT's plan-date note AND its weighted-avg-price note
+            # on the SAME transaction) -- keep only the one that actually says 10b5-1.
+            is_10b5_1 = doc_10b5_1 or bool(plan_texts)
+            wavg_texts = [t for t in fn_texts if "weighted average" in t.lower()]
+            nature, nature_note = _f4_ownership_nature(b)
+            txns.append({"kind": kind,
+                        "transaction_code": code_m.group(1).strip() if code_m else None,
+                        "date": _f4_val("transactionDate", b),
+                        "shares": _f4_val("transactionShares", b),
+                        "price": _f4_val("transactionPricePerShare", b),
+                        "shares_after": _f4_val("sharesOwnedFollowingTransaction", b),
+                        "ownership_nature": nature,
+                        "ownership_nature_note": nature_note,
+                        "rule_10b5_1": is_10b5_1,
+                        "rule_10b5_1_note": plan_texts[0][:200] if plan_texts else None,
+                        "price_is_weighted_avg": bool(wavg_texts),
+                        "price_note": wavg_texts[0][:200] if wavg_texts else None})
+    if txns:
+        # Summary fields are what diffbrief.py renders -- they must reflect the WHOLE filing,
+        # not transactions[0] (feeds.py-073, the ARI case: two non-derivative sales, 835 sh
+        # out of a spouse's IRA to zero plus 125 sh direct, previously promoted as a single
+        # 835-sh sale to zero). Group by code so a mixed filing (e.g. an S alongside a G gift)
+        # aggregates within its own kind rather than blending unrelated transaction types.
+        by_code = {}
+        for t in txns:
+            by_code.setdefault(t["transaction_code"], []).append(t)
+        primary_code, primary_group = max(by_code.items(), key=lambda kv: sum(x["shares"] or 0 for x in kv[1]))
+        total_shares = sum(t["shares"] or 0 for t in primary_group)
+        priced = [t for t in primary_group if t["price"]]
+        wshares = sum(t["shares"] or 0 for t in priced)
+        price = (sum((t["price"] or 0) * (t["shares"] or 0) for t in priced) / wshares
+                 if wshares else (priced[0]["price"] if priced else None))
+        dates = [t["date"] for t in txns if t["date"]]
+        wavg_notes = [t["price_note"] for t in primary_group if t["price_note"]]
+        plan_notes = [t["rule_10b5_1_note"] for t in primary_group if t["rule_10b5_1_note"]]
+        out.update({
+            "transaction_code": primary_code,
+            "shares": total_shares,
+            "price": price,
+            # largest remaining balance across ALL transactions on the filing, not just the
+            # primary-code group -- the filing's own "how much does this insider still hold"
+            # answer, regardless of which account/code produced it.
+            "shares_after": max((t["shares_after"] for t in txns if t["shares_after"] is not None),
+                                 default=None),
+            "date": max(dates) if dates else None,
+            "rule_10b5_1": any(t["rule_10b5_1"] for t in primary_group),
+            "rule_10b5_1_note": plan_notes[0][:200] if plan_notes else None,
+            "price_is_weighted_avg": len(priced) > 1 or any(t["price_is_weighted_avg"] for t in primary_group),
+            "price_note": wavg_notes[0][:200] if wavg_notes else None,
+        })
+        out["transactions"] = txns
     return out
+
+
+def _resolve_form4_transactions(filings, cap=30):
+    """Form 4 rows land in feed.json shaped like every other filing -- but BOOK.md's
+    insider tripwires test transaction fields that only live inside the filing's own
+    XML, one fetch away and never taken (feeds.py-070, repro: 13 held-name Form 4 rows
+    with zero transaction fields). Cached forever by accession: a Form 4 is a
+    point-in-time report and this codebase never sees the amended form "4/A" (not in
+    INTERESTING). Cap + carry-the-backlog matches _resolve_13d_subjects/_resolve_spin_parents."""
+    cache_f = DATA / "form4_transactions.json"
+    try:
+        cache = json.loads(cache_f.read_text())
+    except Exception:
+        cache = {}
+    fetched = 0
+    for rows in filings.values():
+        for r in rows:
+            if r.get("form") != "4":
+                continue
+            xml_url = r.pop("_xml_url", None)
+            if not xml_url:
+                continue
+            acc = xml_url.rsplit("/", 2)[-2]
+            if acc in cache:
+                r.update(cache[acc])
+                continue
+            if fetched >= cap:  # politeness: resolve the backlog across successive runs
+                continue
+            fetched += 1
+            entry = {}
+            try:
+                xml_text = requests.get(xml_url, headers=UA, timeout=30).text
+                entry = _parse_form4_xml(xml_text)
+            except Exception:
+                pass
+            time.sleep(0.15)
+            cache[acc] = entry
+            r.update(entry)
+    cache_f.write_text(json.dumps(cache, indent=1))
+    return filings
 
 
 # ---------- special-situations radar (market-wide, not universe-bound) ----------
@@ -200,7 +382,13 @@ def edgar_filings(tickers, days=45):
 # "SC 13D" kept for any legacy stragglers. Amendments (/A) are excluded on purpose —
 # we want NEW stakes, not position updates.
 RADAR_FORMS = {"SCHEDULE 13D": "sc13d", "SC 13D": "sc13d",
-               "10-12B": "spins", "25": "delistings", "25-NSE": "delistings"}
+               "10-12B": "spins", "25": "delistings", "25-NSE": "delistings",
+               "EFFECT": "reg_effective",
+               # build-003: N-14 registers a fund merger/reorganization (including a
+               # mutual-fund/CEF converting into an ETF share class) -- both index labels
+               # seen live (11 trading days: 12x "N-14", 1x "N-14 8C"); "N-14 8C/A" excluded
+               # as an amendment, same convention as SC 13D/A.
+               "N-14": "n14", "N-14 8C": "n14"}
 
 
 def _parse_idx_line(line):
@@ -374,9 +562,65 @@ def _resolve_spin_parents(rows, cap=10):
     return rows
 
 
+# build-004 (PM adjudication 2026-08-27): the ask's literal channel -- a market-wide watch
+# for 8-Ks carrying items 1.01+3.02+3.03 ("Plan Effective Date" language) -- needs the ITEMS
+# field, which only exists per-CIK in submissions.json, not in the daily index; scanning
+# every market-wide 8-K to find it is not a cheap first cut. PM's own adjudication (having
+# just hand-recovered KODK -- an S-3 resale shelf for 4,426,268 sponsor shares, effective
+# 2026-07-08 -- from the Bench's stranded claims) named the cheaper substitute: EDGAR's daily
+# index carries a distinct "EFFECT" form for every registration statement's notice of
+# effectiveness, ~14/day market-wide. Each notice's own XML names the underlying form (S-3,
+# S-4, S-8, N-1A, ...) and file number -- so filtering to the S-3/S-1 family before any
+# further fetch turns a noisy 14/day radar into a handful of leads that WOULD have caught
+# KODK's channel. Classifying resale-vs-primary-shelf is left to scout.py's existing
+# pre-triage stage (same division of labor as every other radar channel: code collects the
+# minimal fact, the local model reads the event text for mechanism fit) rather than guessed
+# here from more brittle document-text heuristics.
+REG_FORM_PREFIXES = ("S-3", "S-1")
+
+
+def _resolve_reg_effectiveness(rows, cap=20):
+    """rows are raw EFFECT-notice hits from the daily index (company/cik/date/url only --
+    the index line itself doesn't say what type of registration went effective). Fetch each
+    notice's own SGML/XML body once, cached forever by its accession (a notice of
+    effectiveness is never amended), to learn the underlying form and keep only the S-3/S-1
+    family this channel cares about."""
+    cache_f = DATA / "reg_effective.json"
+    try:
+        cache = json.loads(cache_f.read_text())
+    except Exception:
+        cache = {}
+    fetched = 0
+    kept = []
+    for r in rows:
+        acc = r["url"].rsplit("/", 1)[-1]
+        cached = cache.get(acc)
+        if cached is None and fetched < cap:  # politeness: resolve the backlog across successive runs
+            fetched += 1
+            cached = {}
+            try:
+                text = requests.get(r["url"], headers=UA, timeout=30).text
+                fm = re.search(r"<form>\s*([^<]+?)\s*</form>", text)
+                em = re.search(r"<finalEffectivenessDispDate>\s*([^<]+?)\s*</finalEffectivenessDispDate>", text)
+                nm = re.search(r"<fileNumber>\s*([^<]+?)\s*</fileNumber>", text)
+                if fm:
+                    cached = {"reg_form": fm.group(1).strip(),
+                              "effective_date": em.group(1).strip() if em else None,
+                              "file_number": nm.group(1).strip() if nm else None}
+            except Exception:
+                pass
+            time.sleep(0.15)
+            cache[acc] = cached
+        if cached and cached.get("reg_form", "").startswith(REG_FORM_PREFIXES):
+            r.update(cached)
+            kept.append(r)
+    cache_f.write_text(json.dumps(cache, indent=1))
+    return kept
+
+
 def special_situations(days=10):
     ticker_by_cik = {int(c): t for t, c in cik_map().items()}
-    out = {"sc13d": [], "spins": [], "delistings": []}
+    out = {"sc13d": [], "spins": [], "delistings": [], "reg_effective": [], "n14": []}
     seen = set()
     d = dt.date.today()
     fetched = 0
@@ -409,23 +653,25 @@ def special_situations(days=10):
         out[k] = sorted(out[k], key=lambda x: x["date"], reverse=True)[:60]
     out["sc13d"] = _resolve_13d_subjects(out["sc13d"])
     out["spins"] = _resolve_spin_parents(out["spins"])
+    out["reg_effective"] = _resolve_reg_effectiveness(out["reg_effective"])
     return out
 
 
 def _tag_held(situations, held):
-    """A 13D/spin/delisting on a name we hold or watch is not one of dozens of
-    market-wide rows, it is a tripwire on our own book — mark it so a reader (or a
+    """A 13D/spin/delisting/reg-effectiveness on a name we hold or watch is not one of
+    dozens of market-wide rows, it is a tripwire on our own book — mark it so a reader (or a
     future scorer) does not have to cross-reference by hand (feeds.py-011: a TLS
     Schedule 13D sat unflagged in this exact radar). sc13d uses subject_ticker (the
-    daily index's own 'ticker' field is the FILER's, resolved separately); spins and
-    delistings key off the issuer's own CIK, so 'ticker' is already the subject."""
+    daily index's own 'ticker' field is the FILER's, resolved separately); spins,
+    delistings and reg_effective key off the issuer's own CIK, so 'ticker' is already
+    the subject."""
     held_hits = []
     for r in situations.get("sc13d") or []:
         tk = r.get("subject_ticker")
         r["held"] = bool(tk and tk in held)
         if r["held"]:
             held_hits.append({"kind": "sc13d", "ticker": tk, "date": r.get("date"), "url": r.get("url")})
-    for key in ("spins", "delistings"):
+    for key in ("spins", "delistings", "reg_effective", "n14"):
         for r in situations.get(key) or []:
             tk = r.get("ticker")
             r["held"] = bool(tk and tk in held)
@@ -634,7 +880,8 @@ def refresh():
     n_held_hits = len(sit.get("held_hits") or [])
     print(f"feed.json: {len(tks)} tickers · {n_news} news · {n_fil} filings · "
           f"{len(feed['earnings'])} earnings · {len(feed['market_news'])} market headlines · "
-          f"radar: {len(sit['sc13d'])} 13Ds, {len(sit['spins'])} spins, {len(sit['delistings'])} delistings"
+          f"radar: {len(sit['sc13d'])} 13Ds, {len(sit['spins'])} spins, {len(sit['delistings'])} delistings, "
+          f"{len(sit['reg_effective'])} reg-effective (S-3/S-1), {len(sit['n14'])} N-14 fund reorgs"
           + (f" ({n_held_hits} on held/universe names)" if n_held_hits else "")
           + (f"  ⚠ DEGRADED (carried over): {', '.join(degraded)}" if degraded else "")
           + (f"  [vendor: {'; '.join(FH_FAILS[-3:])}]" if FH_FAILS else ""))

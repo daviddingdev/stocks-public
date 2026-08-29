@@ -99,10 +99,15 @@ FLOW = {
     # with this concept instead of the plain PaymentsToAcquirePropertyPlantAndEquipment
     # tag — $283.833M at 2026-06-30 (6mo YTD, 10-Q filed 2026-08-06), consistent with
     # PP&E net growing ~$225M over the same half (2026-08-20).
+    # PaymentsToAcquireOilAndGasPropertyAndEquipment: the oil & gas sector's own capex
+    # line (GTE/Gran Tierra Energy tags "Additions to oil and gas properties" this way,
+    # quality.py-open fincard-flag:GTE:capex, 2026-08-28) — same cash-outflow role as
+    # PaymentsToAcquirePropertyPlantAndEquipment, sector-specific caption.
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquirePropertyAndEquipment",
               "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements",
               "PaymentsToDevelopRealEstateAssets", "PaymentsForProceedsFromProductiveAssets",
-              "PaymentsToAcquireOtherPropertyPlantAndEquipment"],
+              "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+              "PaymentsToAcquireOilAndGasPropertyAndEquipment"],
     # SEPARATE cash-flow line from "capex" above, not an alternate tag for it — capitalized
     # software development is its own investing-activities caption, landing on the balance
     # sheet as an intangible, never PP&E. Software-heavy issuers routinely tag BOTH lines
@@ -137,6 +142,15 @@ FLOW = {
     "buybacks": ["PaymentsForRepurchaseOfCommonStock"],
     "dividends_paid": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
     "acquisitions": ["PaymentsToAcquireBusinessesNetOfCashAcquired"],
+    # BANK/THRIFT REVENUE BASIS inputs (fincard.py-072, PM decision 2026-08-28): a
+    # depository tags NO Revenues/RevenueFromContractWithCustomer* concept — banks
+    # don't recognize interest income under ASC 606. These three feed the bank-basis
+    # revenue fallback below (net interest income + noninterest income, or gross
+    # interest income - interest expense + noninterest income); AUX_ONLY — never a
+    # standalone "revenue" concept themselves.
+    "bank_net_interest_income": ["InterestIncomeExpenseNet"],
+    "bank_interest_income_gross": ["InterestAndDividendIncomeOperating"],
+    "bank_noninterest_income": ["NoninterestIncome"],
 }
 FLOW_UNITS = {"eps_diluted": "USD/shares", "shares_diluted_wavg": "shares"}
 # STOCK measures reported per period (a weighted-average count) — never additive.
@@ -318,7 +332,16 @@ INSTANT_SUM = {
 # way. Scope to tickers verified by hand against the issuer's own footing balance sheet,
 # same bar as a MANUAL entry — do not widen without checking a new ticker foots.
 INSTANT_SUM_TICKERS = {
-    "total_liabilities": {"LW"},
+    # DAKT (Daktronics) and SKY (Skyline Champion) verified 2026-08-29 against
+    # quality_queue's open "total_liabilities: STALE" flags (both retired `Liabilities`
+    # tags 2500+ days ago): LiabilitiesCurrent + LiabilitiesNoncurrent foots EXACTLY
+    # to Assets - Equity for both (DAKT 253,665,000 = 253,665,000 at 2026-05-02; SKY
+    # 574,988,000 = 574,988,000 at 2026-06-27, both 10-Q data) — 0.00% diff, no
+    # caption sits outside the two tags for either issuer. REX was checked in the
+    # same pass and does NOT foot (component sum 83,920,000 vs true 178,439,000 at
+    # 2026-04-30, -53% off) — left OUT of this set; fincard-flag:REX:total_liabilities
+    # stays open, some other caption (not LC/LN) holds the missing ~$94.5M.
+    "total_liabilities": {"LW", "DAKT", "SKY"},
 }
 # fincard.py-033 flags any issuer where capex_software adds >20% on top of PP&E-only
 # capex, asking a human to verify the two lines don't double-count. Per-ticker allowlist
@@ -445,6 +468,17 @@ def resolve_cik(tk, override=None):
 
 def _days(a, b):
     return (dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days
+
+
+def _partial_period_days(fig):
+    """Day-count if `fig` (an F[name] entry) is a single YTD period with no TTM/FY on
+    file yet, else None. fincard.py-045 caught this for FCF alone (2026-08-25); 068
+    (PM, 2026-08-27) found ev_over_revenue, ev_over_ebitda, debt_over_ebitda and pe
+    dividing the same point-in-time balance by an un-annualized partial-year flow."""
+    if fig and "single period on file" in (fig.get("period") or "") \
+            and fig.get("period_start") and fig.get("period_end"):
+        return _days(fig["period_start"], fig["period_end"])
+    return None
 
 
 def _pick_flow(entries, derive=True):
@@ -634,7 +668,8 @@ EPISODIC_FLOWS = {
 # sets F["capex_software"]["STALE"] before this set is even consulted) — only the
 # card-level flags list, the one a human actually scans, stays quiet for issuers where
 # it was never material.
-AUX_ONLY_FLOWS = {"costs_and_expenses", "capex_software"}
+AUX_ONLY_FLOWS = {"costs_and_expenses", "capex_software", "bank_net_interest_income",
+                   "bank_interest_income_gross", "bank_noninterest_income"}
 
 # Concepts any US-GAAP filer must report. Their absence is a TAXONOMY problem (usually an
 # IFRS filer) rather than a tag-mapping problem — see the check at the end of build().
@@ -1249,6 +1284,60 @@ def build(tk, cik_override=None):
             f"statement ({ov['doc']}, entered {ov['entered']}). Quote on the figure. Derived "
             f"values built on it inherit this: verify the quote before quoting the derivation.")
 
+    # DEPOSITORY TEST (fincard.py-072, PM decision 2026-08-28): tag presence, self-
+    # contained in the XBRL pass, not an SIC lookup — CSBA (a bank holding co) tags
+    # InterestAndDividendIncomeOperating; a thrift that reports interest expense on
+    # deposits separately would tag InterestExpenseDeposits. Either is sufficient
+    # evidence this issuer is a depository.
+    _is_depository = bool((gaap.get("InterestAndDividendIncomeOperating", {})
+                           .get("units", {}) or {}).get("USD")) \
+        or bool((gaap.get("InterestExpenseDeposits", {})
+                .get("units", {}) or {}).get("USD"))
+
+    # BANK/THRIFT REVENUE BASIS (fincard.py-072, PM decision 2026-08-28): a depository
+    # tags no Revenues/RevenueFromContractWithCustomer* concept at all, so the standard
+    # revenue pass above found nothing. PM: use the NET basis, not gross — revenue =
+    # net interest income + noninterest income. A depository's interest expense is its
+    # cost of product, not a financing cost below the operating line, and net interest
+    # income + noninterest income is the basis the issuer, the regulator, and the
+    # efficiency ratio all use. Fall back to (gross interest income - interest expense)
+    # + noninterest income when the net tag itself is absent — on CSBA those foot
+    # exactly (1,524,112 - 586,554 = 937,558, both from the 10-Q for the quarter ended
+    # 2026-06-30). Every such card is flagged: NOT comparable to a non-financial top
+    # line — gross was 1.60x net on CSBA Q2 2026.
+    if _is_depository and "revenue" not in F:
+        _nii = ttm_vals.get("bank_net_interest_income")
+        _noninterest = ttm_vals.get("bank_noninterest_income") or 0
+        _basis_note = None
+        if _nii is not None:
+            _rev_val = _nii + _noninterest
+            _basis_note = (f"net interest income {_nii:,.0f} (InterestIncomeExpenseNet) + "
+                           f"noninterest income {_noninterest:,.0f}")
+            _src = F.get("bank_net_interest_income")
+        else:
+            _gross_ii = ttm_vals.get("bank_interest_income_gross")
+            _gross_ie = ttm_vals.get("interest_expense")
+            if _gross_ii is not None and _gross_ie is not None:
+                _rev_val = (_gross_ii - _gross_ie) + _noninterest
+                _basis_note = (f"gross interest income {_gross_ii:,.0f} - interest expense "
+                               f"{_gross_ie:,.0f} + noninterest income {_noninterest:,.0f} "
+                               f"(net interest income tag absent)")
+                _src = F.get("bank_interest_income_gross")
+            else:
+                _src = None
+        if _basis_note is not None:
+            F["revenue"] = {"value": _rev_val, "unit": "USD", "period": _src.get("period"),
+                            "period_end": _src.get("period_end"),
+                            "period_start": _src.get("period_start"),
+                            "tag": "BANK BASIS (fincard.py-072, not an XBRL revenue concept)",
+                            "latest_quarter_end": _src.get("latest_quarter_end")}
+            ttm_vals["revenue"] = _rev_val
+            card["flags"] = [f for f in card["flags"] if f != "revenue: no XBRL tag found"]
+            card["flags"].append(
+                f"BANK BASIS: revenue = net interest income + noninterest income "
+                f"({_basis_note}); not comparable to a non-financial issuer's top line "
+                f"(fincard.py-072).")
+
     # quarantine stale flows: a concept whose data ends >270 days before the freshest
     # concept was likely reported under a retired tag — keep the figure (flagged) but
     # NEVER feed it into derived values (stale capex inside FCF is silent poison)
@@ -1516,14 +1605,30 @@ def build(tk, cik_override=None):
         put("total_debt", dlt + dcur, f"debt_lt {dlt:,.0f} + debt_current {dcur:,.0f}",
             "excl. operating leases (see operating_lease_liab figure); missing tags count as 0"
             + stale_debt)
-        put("net_cash", cash + sti - dlt - dcur,
-            f"cash {cash:,.0f} + st_investments {sti:,.0f} - total_debt {dlt + dcur:,.0f}",
-            f"as of {F['cash'].get('asof')}"
-            + (stale_debt + " NET CASH UNRELIABLE until the current debt tag is found"
-               if stale_debt else ""))
-        if stale_debt:
-            card["flags"].append("NET CASH UNRELIABLE:" + stale_debt.rstrip("—") +
-                                 " find the issuer's current debt tag (EV/multiples inherit this)")
+        if _is_depository:
+            # BANK EV SUPPRESSION (fincard.py-072, PM decision 2026-08-28): for a
+            # depository, deposits and borrowings are OPERATING liabilities, so "net
+            # cash" and enterprise value are not imprecise here, they are undefined —
+            # skip them the way the card already skips market_cap for a non-primary
+            # security, reason printed. net_cash staying unset here cascades: EV,
+            # ev_over_revenue, ev_over_ebitda and ev_over_fcf are all built ONLY when
+            # net_cash is present, below. Keep market_cap, pe and price_over_book —
+            # those are the right rulers for a bank.
+            card["flags"].append(
+                "BANK: net_cash/enterprise_value/ev_over_revenue/ev_over_ebitda not "
+                "computed — for a depository, deposits and borrowings are operating "
+                "liabilities, not financing debt, so net cash and EV are undefined "
+                "(fincard.py-072, PM 2026-08-28). Use market_cap, pe and "
+                "price_over_book instead.")
+        else:
+            put("net_cash", cash + sti - dlt - dcur,
+                f"cash {cash:,.0f} + st_investments {sti:,.0f} - total_debt {dlt + dcur:,.0f}",
+                f"as of {F['cash'].get('asof')}"
+                + (stale_debt + " NET CASH UNRELIABLE until the current debt tag is found"
+                   if stale_debt else ""))
+            if stale_debt:
+                card["flags"].append("NET CASH UNRELIABLE:" + stale_debt.rstrip("—") +
+                                     " find the issuer's current debt tag (EV/multiples inherit this)")
     if gv("current_assets") is not None and gv("current_liabilities") is not None:
         put("working_capital", gv("current_assets") - gv("current_liabilities"),
             f"current_assets {gv('current_assets'):,.0f} - current_liabilities {gv('current_liabilities'):,.0f}")
@@ -1636,8 +1741,23 @@ def build(tk, cik_override=None):
         put("interest_coverage", opi / ie, f"op_income {opi:,.0f} / interest_expense {ie:,.0f}")
     eb = (D.get("ebitda_approx") or {}).get("value")
     td = (D.get("total_debt") or {}).get("value")
-    if eb and eb > 0 and td is not None:
-        put("debt_over_ebitda", td / eb, f"total_debt {td:,.0f} / approx EBITDA {eb:,.0f}")
+    # debt_over_ebitda suppressed for depositories too (fincard.py-072) — total_debt
+    # is deposits/borrowings, a depository's operating liability, not leverage.
+    if eb and eb > 0 and td is not None and not _is_depository:
+        _eb_days = _partial_period_days(F.get("dna"))
+        if _eb_days:
+            _ann_eb = eb * 365.0 / _eb_days
+            put("debt_over_ebitda", td / _ann_eb,
+                f"total_debt {td:,.0f} / approx EBITDA(annualized) {_ann_eb:,.0f} "
+                f"(EBITDA {eb:,.0f} over {_eb_days}d x 365/{_eb_days})",
+                "approx EBITDA annualized from a partial-period flow — no TTM/FY on file "
+                "yet, assumes a flat run-rate (fincard.py-068).")
+            card["flags"].append(
+                f"debt_over_ebitda ANNUALIZED approx EBITDA from a {_eb_days}d partial-"
+                f"period flow ({eb:,.0f} -> {_ann_eb:,.0f}/yr) — no TTM/FY on file yet; "
+                f"treat as approximate (fincard.py-068).")
+        else:
+            put("debt_over_ebitda", td / eb, f"total_debt {td:,.0f} / approx EBITDA {eb:,.0f}")
     shp = S.get("shares_out", {}).get("points", [])
     if len(shp) >= 2 and F.get("shares_out", {}).get("asof"):
         base = shp[0]  # oldest available dei point; span stated in the formula
@@ -1761,11 +1881,50 @@ def build(tk, cik_override=None):
                     put("ev_over_fcf", ev / fcf, f"EV {ev:,.0f} / FCF {fcf:,.0f}")
                     put("fcf_yield_pct", fcf / mc * 100, f"FCF {fcf:,.0f} / market_cap {mc:,.0f}")
             if eb and eb > 0:
-                put("ev_over_ebitda", ev / eb, f"EV {ev:,.0f} / approx EBITDA {eb:,.0f}")
+                _eb_days = _partial_period_days(F.get("dna"))
+                if _eb_days:
+                    _ann_eb = eb * 365.0 / _eb_days
+                    put("ev_over_ebitda", ev / _ann_eb,
+                        f"EV {ev:,.0f} / approx EBITDA(annualized) {_ann_eb:,.0f} "
+                        f"(EBITDA {eb:,.0f} over {_eb_days}d x 365/{_eb_days})",
+                        "approx EBITDA annualized from a partial-period flow — no TTM/FY "
+                        "on file yet, assumes a flat run-rate (fincard.py-068).")
+                    card["flags"].append(
+                        f"ev_over_ebitda ANNUALIZED approx EBITDA from a {_eb_days}d "
+                        f"partial-period flow ({eb:,.0f} -> {_ann_eb:,.0f}/yr) — no TTM/FY "
+                        f"on file yet; treat as approximate (fincard.py-068).")
+                else:
+                    put("ev_over_ebitda", ev / eb, f"EV {ev:,.0f} / approx EBITDA {eb:,.0f}")
             if rev:
-                put("ev_over_revenue", ev / rev, f"EV {ev:,.0f} / revenue {rev:,.0f}")
+                _rev_days = _partial_period_days(F.get("revenue"))
+                if _rev_days:
+                    _ann_rev = rev * 365.0 / _rev_days
+                    put("ev_over_revenue", ev / _ann_rev,
+                        f"EV {ev:,.0f} / revenue(annualized) {_ann_rev:,.0f} "
+                        f"(revenue {rev:,.0f} over {_rev_days}d x 365/{_rev_days})",
+                        "revenue annualized from a partial-period flow — no TTM/FY on "
+                        "file yet, assumes a flat run-rate (fincard.py-068).")
+                    card["flags"].append(
+                        f"ev_over_revenue ANNUALIZED revenue from a {_rev_days}d partial-"
+                        f"period flow ({rev:,.0f} -> {_ann_rev:,.0f}/yr) — no TTM/FY on "
+                        f"file yet; treat as approximate (fincard.py-068).")
+                else:
+                    put("ev_over_revenue", ev / rev, f"EV {ev:,.0f} / revenue {rev:,.0f}")
         if ni and ni > 0:
-            put("pe", mc / ni, f"market_cap {mc:,.0f} / net_income {ni:,.0f}")
+            _ni_days = _partial_period_days(F.get("net_income"))
+            if _ni_days:
+                _ann_ni = ni * 365.0 / _ni_days
+                put("pe", mc / _ann_ni,
+                    f"market_cap {mc:,.0f} / net_income(annualized) {_ann_ni:,.0f} "
+                    f"(net_income {ni:,.0f} over {_ni_days}d x 365/{_ni_days})",
+                    "net_income annualized from a partial-period flow — no TTM/FY on "
+                    "file yet, assumes a flat run-rate (fincard.py-068).")
+                card["flags"].append(
+                    f"pe ANNUALIZED net_income from a {_ni_days}d partial-period flow "
+                    f"({ni:,.0f} -> {_ann_ni:,.0f}/yr) — no TTM/FY on file yet; treat as "
+                    f"approximate (fincard.py-068).")
+            else:
+                put("pe", mc / ni, f"market_cap {mc:,.0f} / net_income {ni:,.0f}")
         if gv("equity") and gv("equity") > 0:
             pf = F.get("preferred_liq_pref") or {}
             pref = pf.get("value") or 0

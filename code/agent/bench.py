@@ -77,6 +77,7 @@ DEFAULT_QUESTION = {
                '"why_it_matters": "<=25 words>", "confidence": 0-10}'),
     "rule": ("If you cannot copy a VERBATIM contradicting sentence out of the text, gap_found MUST "
              "be false. Never paraphrase into the quote field. Never infer beyond the excerpt."),
+    "claim_key": "gap_found",
     "set_by": "default", "set_at": None,
 }
 
@@ -307,10 +308,30 @@ def _targets(path, max_windows=4):
     return hits
 
 
+def _qkey(qn):
+    """A stable short id for the active question, used to scope task ids (bench.py-072).
+    Channel strings follow 'N — description' by convention; fall back to the full string
+    for anything that doesn't (still stable, just longer)."""
+    m = re.match(r"^\s*(\S+)", qn.get("channel") or "")
+    return m.group(1) if m else (qn.get("channel") or "?")
+
+
 def fill(limit=40):
-    """Stage A/B: pick filings worth reading, then the WINDOWS worth reading inside them."""
+    """Stage A/B: pick filings worth reading, then the WINDOWS worth reading inside them.
+
+    bench.py-072: task ids used to be bare f"{tk}:{f.name}:@{off}" -- no question in the id
+    at all. The FIRST question to read a window "owned" that id forever: once it was marked
+    done, every later question (bench_question.json changed by the PM, e.g. 11 -> 13) hit
+    `if tid in tasks: continue` on the SAME id and could never queue that window again. 141
+    of 16291 tasks in the live queue carried the current question's channel; the other
+    16150 were pre-058 legacy reads of a DIFFERENT (untagged) question, permanently
+    blocking re-reads. fill() reported "0 queued" and work() reported "queue drained" every
+    night since the PM set channel 13 on 2026-08-26 -- a stalled queue that looked, from the
+    log line alone, exactly like a finished one. Scoping the id by the active question's key
+    makes a question change open a fresh namespace instead of colliding with the last one's."""
     q = _load()
     tasks = q["tasks"]
+    qkey = _qkey(question())
     added = skipped = 0
     cands = []
     if CORPUS.exists():                      # STAGE A corpus — the whole market
@@ -327,7 +348,7 @@ def fill(limit=40):
             skipped += 1
             continue
         for off in _targets(f):
-            tid = f"{tk}:{f.name}:@{off}"
+            tid = f"q{qkey}:{tk}:{f.name}:@{off}"
             if tid in tasks:
                 continue
             tasks[tid] = {"id": tid, "ticker": tk, "file": str(f), "offset": off,
@@ -387,7 +408,9 @@ def work(minutes=60, model_key="fast", worker=None):
             # GUARDRAIL, enforced by CODE not by the model: a claimed gap must carry a
             # verbatim sentence that actually appears in the source text.
             quote = (out.get("contradicting_disclosure") or "").strip()
-            claimed = bool(out.get("gap_found"))
+            # bench.py-066: the claim key follows the QUESTION, not a constant — a
+            # renamed schema boolean must not silently zero every read
+            claimed = bool(out.get(qn.get("claim_key", "gap_found")))
             verbatim = bool(quote) and _norm(quote) in _norm(chunk)
             if claimed:
                 hits += 1
@@ -482,11 +505,24 @@ def _specificity(quote):
 
 
 def rank():
-    """bench.json — ranked by a CODED specificity score (bench.py-030), never by a multiple."""
+    """bench.json — ranked by a CODED specificity score (bench.py-030), never by a multiple.
+
+    bench.py-072: this used to aggregate EVERY done+survived task regardless of which
+    question produced it, so a PM reading bench.json for the currently-set question (e.g.
+    channel 13, covenant/default) was actually shown channel-11 narrative-vs-contract
+    quotes with no per-row signal that they answered a different question -- confirmed live:
+    1271 rows, only 5 carrying any channel-13 evidence, yet the top-ranked rows (VRRM, OLN,
+    SMXT, RDN...) were 100% channel=None (pre-058 legacy) quotes about an unrelated question.
+    brief()'s own header already computed and disclosed a 'carried over from earlier
+    channels' count for exactly this reason, but nothing stopped the carried-over rows from
+    being ranked first and displayed as this run's leads. Filtering to the CURRENT channel
+    here, at the source, means bench.json only ever holds evidence for the question actually
+    on the PM's desk right now — matching _channel_stats()'s existing per-channel filter."""
     q = _load()
+    cur_channel = question()["channel"]
     by = {}
     for t in q["tasks"].values():
-        if t.get("state") != "done" or not t.get("survived"):
+        if t.get("state") != "done" or not t.get("survived") or t.get("channel") != cur_channel:
             continue
         r = t["result"]
         row = by.setdefault(t["ticker"], {"ticker": t["ticker"], "evidence": [], "best": 0})
@@ -666,18 +702,16 @@ def brief(top=25):
     qn = b.get("question") or {}
     cur_channel = qn.get("channel")
     stats = _channel_stats(cur_channel)
-    this_ck = {r["ticker"] for r in rows
-               if any(e.get("channel") == cur_channel for e in r.get("evidence") or [])}
-    carried = len(rows) - len(this_ck)
     forms = _corpus_forms()
     forms_line = ", ".join(f"{n} {f}" for f, n in forms.items()) or "corpus not built yet"
-    # bench.py-058: what THIS channel actually produced, first line, unmissable — a run that
-    # claimed 0 must say so before any evidence rows, not bury it under yesterday's leads.
+    # bench.py-058/-072: what THIS channel actually produced, first line, unmissable — a run
+    # that claimed 0 must say so before any evidence rows, not bury it under yesterday's
+    # leads. rank() now only ever writes bench.json rows whose evidence is from cur_channel
+    # (bench.py-072 — it used to blend in every earlier question's surviving reads with no
+    # per-row flag), so every row below IS this channel's; nothing here is carried over.
     L = [f"# The Bench — overnight read, built {b.get('built', '?')}", "",
          f"**This channel ({cur_channel or '?'}) read {stats['read']} filings this run · "
-         f"claimed {stats['claimed']} · {stats['survived']} SURVIVED the verbatim check.**"
-         + ("" if stats["claimed"] else "  **ZERO claimed — every row below, if any, is "
-            "carried over from an earlier channel, not produced by this question.**"),
+         f"claimed {stats['claimed']} · {stats['survived']} SURVIVED the verbatim check.**",
          "", f"**Corpus:** {forms_line} (bench.py-059 — a channel asking about a mechanism "
              "disclosed in forms outside this mix will find nothing here regardless of the "
              "question's quality).", "",
@@ -690,10 +724,9 @@ def brief(top=25):
          "next to it is the local model's and is NOT._", "",
          f"**Question asked:** {qn.get('channel', '?')} "
          f"(set by {qn.get('set_by', '?')}{' on ' + qn['set_at'] if qn.get('set_at') else ''})", "",
-         f"**{len(rows)} names carry evidence · {len(fresh)} are new to you** "
+         f"**{len(rows)} names carry evidence from THIS channel · {len(fresh)} are new to you** "
          f"({len(held & {r['ticker'].upper() for r in rows})} already held, "
-         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel) — "
-         f"{len(this_ck)} of these rows are from THIS channel, {carried} carried over from earlier ones.",
+         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel).",
          ""]
     if not rows:
         L += ["_No evidence rows — either the queue was empty or every read failed the verbatim",
@@ -749,12 +782,25 @@ if __name__ == "__main__":
         q = question()
         positional = sys.argv[2] if sys.argv[2:] and not sys.argv[2].startswith("--") else None
         for flag, key in (("--ask", "ask"), ("--rule", "rule"),
-                          ("--channel", "channel"), ("--schema", "schema")):
+                          ("--channel", "channel"), ("--schema", "schema"),
+                          ("--claim-key", "claim_key")):
             v = arg(flag)
             if v is not None:
                 q[key] = v
         if positional is not None:
             q["ask"] = positional
+        # bench.py-066: the gate reads q['claim_key'] — REFUSE any question whose
+        # schema does not declare that boolean, so a renamed key can never re-arm
+        # the silent-zero failure (channels 12/13 scored 78 TRUE reads as 0).
+        bools = re.findall(r'"(\w+)":\s*true\|false', q.get("schema") or "")
+        ck = arg("--claim-key") or q.get("claim_key")
+        if ck not in bools:
+            if len(bools) == 1:
+                ck = bools[0]
+            else:
+                sys.exit(f"REFUSED: schema booleans {bools} do not include claim_key "
+                         f"{ck!r} — pass --claim-key naming the boolean the gate should read")
+        q["claim_key"] = ck
         q["set_by"] = "PM"; q["set_at"] = _now()
         _write(QFILE, q)
         print(f"question set: channel={q['channel']!r} ask={q['ask'][:60]!r}... rule={q['rule'][:60]!r}...")

@@ -105,6 +105,43 @@ def held_names():
     return [p["symbol"] for p in pf.get("positions", []) if p.get("symbol")]
 
 
+def candidate_desk(n=5):
+    """The VP's candidate desk (David, 2026-08-27: the VP must put "at least 5 options
+    per day considered" on the table). Picks the n candidates most worth preparing
+    tonight — underwriting first, then pm_reviewed, then triage score — skipping held
+    names. Prep is CODE (dossier.py: filings pulled, terms quote-verified, fincard
+    built); the Sonnet review then owes each one a VERDICT, and the PM's morning read
+    starts from prepared evidence instead of a cold filing. Returns
+    [{tk, status, why, build}] — build=False when the dossier is already fresh (<5d),
+    which still counts as considered tonight."""
+    import time as _t
+    held = set(held_names())
+    c = _j(DATA / "candidates.json", {}).get("items", [])
+    items = c if isinstance(c, list) else list(c.values())
+    rank = {"underwriting": 0, "pm_reviewed": 1, "triaged": 2, "pre_triaged": 3}
+
+    def score(it):
+        tr = it.get("triage")
+        return (tr or {}).get("score", 0) if isinstance(tr, dict) else 0
+    out, seen = [], set()
+    for it in sorted(items, key=lambda i: (rank.get(i.get("status"), 9), -score(i))):
+        tk = (it.get("ticker") or "").upper()
+        if not tk or tk in held or tk in seen or rank.get(it.get("status"), 9) > 3:
+            continue
+        seen.add(tk)
+        # a pm_reviewed row whose own note records a kill is a verdict, not a lead
+        note_hd = (it.get("pm_note") or "")[:120].upper()
+        if any(w in note_hd for w in ("VOID", "DROP", "REJECT", "PASS —", "PASS:")):
+            continue
+        mf = NAMES / tk / "manifest.json"
+        fresh = mf.exists() and (_t.time() - mf.stat().st_mtime) < 5 * 86400
+        why = (it.get("pm_note") or it.get("detail") or "")[:200]
+        out.append({"tk": tk, "status": it.get("status"), "why": why, "build": not fresh})
+        if len(out) >= n:
+            break
+    return out
+
+
 def card_state(tk):
     """Freshness + flags for one name's code-computed numbers."""
     c = _j(NAMES / tk / "fincard.json", {})
@@ -236,6 +273,28 @@ def brief(stages=None):
     L.append("")
 
     # --- what the VP is explicitly handing over
+    prep = _j(DATA / "vp_candidate_prep.json", {})
+    desk = prep.get("considered") or []
+    L.append("## Candidate desk — options prepared for consideration")
+    if desk:
+        L.append(f"_Prepped {prep.get('as_of', '?')} (David 2026-08-27: at least 5 options "
+                 f"per day considered). Dossiers under `names/<TK>/` — terms quote-verified, "
+                 f"fincard built. The review below owes each a verdict._")
+        for d in desk:
+            cs = card_state(d["tk"])
+            L.append(f"- **{d['tk']}** ({d['status']}) — {d['why'][:160]}")
+            if cs.get("has"):
+                L.append(f"  - fincard {cs.get('built', '?')} · {cs.get('figures', 0)} figures"
+                         + (f" · ⚠ {len(cs['flags'])} flag(s)" if cs.get("flags") else "")
+                         + (f" · STALE: {', '.join(cs['stale'][:3])}" if cs.get("stale") else ""))
+            else:
+                L.append("  - no fincard yet — tonight's dossier build creates it")
+    else:
+        L.append("- EMPTY — no eligible candidates. That is a finding, not a quiet day: "
+                 "the funnel produced nothing worth preparing.")
+    L.append("")
+
+    # --- what the VP is explicitly handing over
     L.append("## Handover — what is ready, and what needs your judgment")
     L.append("")
     L.append("Ready (done, cite it rather than redoing it):")
@@ -335,6 +394,12 @@ with these four parts, tight, no preamble:
 
 1. **What actually needs the PM this session** — at most 5 items, each one line, ranked. This is
    the whole point of you: the sweep produces hundreds of rows and only a handful move a decision.
+1b. **Candidate desk verdicts** (David 2026-08-27: "at least 5 options per day considered") —
+   for EVERY name under '## Candidate desk' in the brief, one line each: verdict
+   **PM-READ-NOW** / **PARK until <date or event>** / **DROP**, then the single number that
+   decides it, QUOTED from that name's `names/<TK>/terms.json`, fincard or dossier — never
+   estimated. A desk you skip is a desk that silently reverts to zero options considered;
+   if a name's dossier failed to build, say so and verdict on what exists.
 2. **Watchdog triage** — group the open numwatch findings by ROOT CAUSE, give each group a count,
    and name the ones that are NOT structural noise. Be concrete: "37 = quarterly figure compared
    against a TTM card value" beats "many are false positives".
@@ -409,6 +474,14 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     if not fast:
         for tk in held_names():
             stages.append(run(f"dossier:{tk}", ["python3", "dossier.py", "build", tk], 900))
+        # candidate desk (David 2026-08-27): >=5 options prepared per sweep, coded
+        desk = candidate_desk()
+        (DATA / "vp_candidate_prep.json").write_text(json.dumps(
+            {"as_of": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+             "considered": desk}, indent=1))
+        for d in desk:
+            if d["build"]:
+                stages.append(run(f"cand:{d['tk']}", ["python3", "dossier.py", "build", d["tk"]], 900))
     stages.append(run("brief", ["python3", "diffbrief.py"], 300))
     # The reading pass. Unlike every stage above it, this one is BOUNDED BY TIME, not by a
     # work list — it reads until the window closes. That is the point: the model is free and

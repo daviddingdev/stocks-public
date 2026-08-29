@@ -387,7 +387,35 @@ Write {OPS}/<YYYY-MM-DD>_hunt.md. Finish with one line to stdout:
 # The CLI gate, the prompt lookup, and the model lookup all derive from THIS dict — a role
 # cannot exist in one and not the others. Its absence is how `ops.py hunt` sat in the crontab
 # from 2026-08-18 being rejected by a gate that read `("fixer", "coo")`, and no hunt ever ran.
+BUILD_PROMPT = f"""You are the BUILD ENGINEER for the BrokerB agent stack at {ROOT} — owner of
+the SURFACES: the dashboard at :8787 and every page on it. Created 2026-08-28 (owners.py-067)
+because subsystem `surfaces` had an owner that never ran while its queue went 4 deep — among
+them a card that showed a false MISSED for another role every day for five days. You have NO
+broker access and you never touch trading logic; your truth test is different from every other
+role's: WHAT A CARD CLAIMS MUST MATCH WHAT THE DATA SAYS, and a card that renders confidently
+from a key nobody writes anymore is your defect even though no exception fires.
+
+1) YOUR INBOX FIRST — `python3 {HERE}/asks.py inbox build`. Every row leaves in a different
+   state: CLOSE with proof (`asks.py close <id> --by build --note "<what + how proved>"`), ACK
+   with a due date if bigger than one session, ESCALATE to the PM for judgment calls, or close
+   `DECLINED: <reason>` when your judgment says no.
+2) FIX inside your charter (`python3 {HERE}/owners.py charter build`) — dashboard/*.py. Rules
+   that are law here: app.py is CO-EDITED by concurrent sessions (surgical edits, check `git
+   status` first, keep new features in their own modules); every page ships phone-first —
+   read ~/.claude/skills/mobile-web/SKILL.md and honor it; a defect in a file owned by another
+   role is an ask with your diagnosis, never a cross-boundary edit.
+3) PROVE every fix against the RUNNING dashboard: `{ROOT}/_engine/dashboard/serve.sh start`,
+   then curl the affected route and show the before/after fragment (`curl -s
+   localhost:8787/<page> | grep ...`). py_compile everything you touch. A fix that only
+   compiles is not a fix; a fix that renders is.
+4) Commit code fixes to git (add specific files only, NEVER `git add -A`) and push.
+5) Write {OPS}/<YYYY-MM-DD>_build.md: asks cleared, each fix with its rendered proof, a
+   one-line health verdict per page you touched (/, /agent, /brokera, /journal, /today), asks
+   opened. Finish with one line to stdout:
+   "build: N asks cleared, N fixes, N findings, surfaces <OK|DEGRADED>"."""
+
 PROMPTS = {"numbers": lambda: NUMBERS_PROMPT, "signals": lambda: SIGNALS_PROMPT,
+           "build": lambda: BUILD_PROMPT,
            "coo": lambda: COO_PROMPT, "hunt": lambda: HUNT_PROMPT}
 ROLE_ALIASES = {"fixer": "numbers"}
 
@@ -416,7 +444,8 @@ is not finished."""
 FINISH = {"numbers": (("*_numbers.md", "*_fixer.md"), 7, 5, {1, 2, 3, 4, 5}),
           "signals": (("*_signals.md",), 7, 35, {1, 2, 3, 4, 5}),
           "hunt": (("*_hunt.md",), 8, 30, {3, 5}),
-          "coo": (("*_coo.md",), 15, 0, {5})}
+          "coo": (("*_coo.md",), 15, 0, {5}),
+          "build": (("*_build.md",), 8, 30, {4})}
 
 
 def _last_scheduled(hour, minute, weekdays, slack_h=3):
@@ -443,6 +472,24 @@ def verify():
         if newest < due.timestamp():
             misses.append(f"{role}: scheduled {due:%Y-%m-%d %H:%M}Z, newest report "
                           f"{'NONE' if not newest else 'older than that run'}")
+    # ops.py-053 (structural): a missed role gets ONE same-day relaunch before any human
+    # is alerted — the 8/25 numbers death sat as a COO ask for four days because the COO
+    # runs Saturdays. Marker file per role per day guards against relaunch loops; if the
+    # NEXT verify still finds the miss (marker present), it escalates as before.
+    import datetime as _dt
+    healed = []
+    for msg in list(misses):
+        role = msg.split(":")[0]
+        marker = DATA / f"verify_relaunch_{role}_{_dt.date.today().isoformat()}"
+        if role in PROMPTS and not marker.exists():
+            marker.write_text(msg)
+            r = launch(role)
+            healed.append(f"{role} relaunched ({'ok' if r.get('ok') else r.get('msg', '?')[:60]})")
+            misses.remove(msg)
+    if healed:
+        subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
+                        "Ops role missed its run — self-heal relaunched",
+                        ("; ".join(healed))[:190]], check=False)
     if misses:
         try:
             sys.path.insert(0, str(HERE))

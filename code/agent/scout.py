@@ -137,6 +137,31 @@ def _events():
                    "ticker": r.get("ticker"), "spinco_cik": r.get("spinco_cik") or r.get("cik"),
                    "date": r.get("date"),
                    "detail": f"Form 10-12B: {r.get('company', '?')}", "url": r.get("url")})
+    for r in (sit.get("reg_effective") or []):
+        # build-004 (PM 2026-08-27, KODK's sponsor-share resale shelf as the worked example):
+        # a market-wide watch for S-3/S-1 registration statements going EFFECTIVE. This does
+        # NOT yet distinguish a resale shelf (creditor/sponsor shares registered for public
+        # sale -- the post-reorg mechanism the ask actually wants) from a primary capital
+        # raise -- that read belongs to the SAME pre-triage/triage stages every other channel
+        # here uses, not to a document-text heuristic guessed at collection time. id keyed on
+        # cik+file_number (both stable regardless of ticker-resolution status) -- same lesson
+        # as the 13D id bug two channels up.
+        ev.append({"id": f"regfx:{r.get('cik')}:{r.get('file_number')}", "kind": "reg-effective",
+                   "ticker": r.get("ticker"), "date": r.get("effective_date") or r.get("date"),
+                   "detail": f"{r.get('reg_form', '?')} registration effective "
+                             f"{r.get('effective_date', '?')} for {r.get('company', '?')} "
+                             f"(file {r.get('file_number', '?')}) — resale/selling-stockholder "
+                             f"shelf or primary raise?", "url": r.get("url")})
+    for r in (sit.get("n14") or []):
+        # build-003: N-14 registers a fund merger/reorganization -- including a mutual-
+        # fund/CEF converting into an ETF share class, the specific pattern the ask names.
+        # Whether THIS N-14 is a CEF-into-ETF conversion (vs. a routine two-fund merger
+        # inside the same family) is a triage read, same division of labor as reg-effective.
+        ev.append({"id": f"n14:{r.get('cik')}:{r.get('date')}", "kind": "n14-reorg",
+                   "ticker": r.get("ticker"), "date": r.get("date"),
+                   "detail": f"N-14 fund reorganization/merger registration: {r.get('company', '?')} "
+                             f"— check for CEF/mutual-fund-into-ETF conversion language",
+                   "url": r.get("url")})
     for g in (feed.get("managers") or {}).get("managers", []):
         for n in (g.get("new") or []):
             if n.get("putCall"):

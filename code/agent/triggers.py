@@ -195,6 +195,14 @@ def run():
         price, prev = q.get("c"), q.get("pc")
         if not price or not prev:
             continue
+        # Before Finnhub rolls the session (pre-open / market closed), q['c'] is still the
+        # PRIOR session's close and q['pc'] the one before that -- the move computed from a
+        # stale quote is yesterday's already-alerted move, re-priced. The per-day dedup key
+        # doesn't catch this because a new calendar day is exactly what lets it back in
+        # (triggers.py-074, the TLS +8.6% re-fire 30 min before the 2026-08-28 open).
+        qt = q.get("t")
+        if qt and dt.datetime.fromtimestamp(qt, dt.timezone.utc).date() != dt.datetime.now(dt.timezone.utc).date():
+            continue
         # Finnhub's pc (prior close) predates today's distribution; price doesn't. Add today's
         # distribution back before measuring the move, else a scheduled cash-out reads as a drop.
         pct = (price + today_distribution(c, tk) - prev) / prev * 100

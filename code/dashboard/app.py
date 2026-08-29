@@ -519,13 +519,16 @@ def render_card(cdir):
 
 # ---------- investor lenses ----------
 def sig_cls(s):
+    # build-064: THE single implementation — jpm_page delegates here. Order matters:
+    # "Speculative Buy" must read as caution (amber), not buy, so the warn set wins first;
+    # "Pass" is a bearish verdict and colors accordingly.
     s = (s or "").strip().lower()
+    if any(k in s for k in ("caution", "warn", "mixed", "risk", "speculative")):
+        return "warn"
+    if any(k in s for k in ("bear", "sell", "negative", "avoid", "pass")):
+        return "sell"
     if any(k in s for k in ("bull", "buy", "positive", "accumulate")):
         return "buy"
-    if any(k in s for k in ("bear", "sell", "negative", "avoid")):
-        return "sell"
-    if any(k in s for k in ("caution", "warn", "mixed", "risk")):
-        return "warn"
     return "neu"
 
 def lenses_overall(cdir):

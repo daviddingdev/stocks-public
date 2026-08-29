@@ -471,6 +471,21 @@ def _in_filings(a, filing_texts, literal=""):
         scaled = a / scale
         if 0.1 <= scaled < 1e7:
             pat = f"{scaled:,.1f}".rstrip("0").rstrip(".")
+            # hunt-2026-08-29a, fixed in 186abc0: the >=3-significant-digit bar above is
+            # measured on pat_base (the full-dollar rendering) but the string actually
+            # SEARCHED is this scaled one, which routinely carries only one or two. That
+            # is the "laundering" this file's own comments condemn ("matching $6.5M
+            # against the digit 6 ... is not verification, it is laundering"), applied to
+            # the wrong string: $1,221,185 -> scale 1e6 -> "1.2", found in ARI's 10-Q as
+            # "a fair value adjustment of $ 1.2 million" and reported as PROOF the figure
+            # is printed in the filing. 1,221,185 is the phantom ARI debt number caught
+            # on 2026-08-13 and it appears in NO ARI filing, as a literal or as raw
+            # digits. Measured on the four held names' active prose: 38 of 219 figures
+            # were cleared on a <3-sig-digit pattern, one of them the single character
+            # "1". Guard the pattern that is searched; a citation that legitimately
+            # rounds is still rescued by the rounding-tolerant pass below.
+            if len(re.sub(r"[^1-9]", "", pat)) < 3:
+                continue
             for name, txt in filing_texts.items():
                 if pat in txt or pat.replace(",", "") in txt:
                     return f"filing:{name}~{pat}"
@@ -524,8 +539,17 @@ def trace_number(a, label, card, filing_texts, context="", literal=""):
     # vs\n$610.2M" must still match " vs " — a literal-newline miss is what let LYFT's own
     # FCF-vs-prior-period delta cry MISLABEL instead of being recognized as one
     # (numwatch.py-028, 2026-08-20).
-    low_ctx = re.sub(r"\s+", " ", (label + " " + context).lower())
-    low = label.lower()
+    # hunt-2026-08-29b, fixed in 186abc0: underscores are WORD characters, so the
+    # word-boundary family match (r"\bnet cash\b") cannot match a label the extraction
+    # model copied straight off the memo's own token — "net_cash". The label then names
+    # no family, control falls through to the low_ctx pass, and whatever family a
+    # NEIGHBOURING figure names wins instead. Live: TLS's 2026-08-28 sell memo writes
+    # "net_cash $43,998,000 ... FCF $25,865,000"; the label "net_cash" matched nothing,
+    # "fcf" in the context window won, and a figure equal to the card's own derived
+    # net_cash TO THE DOLLAR (cash 50,647,000 - debt_lt 4,536,000 - debt_current
+    # 2,113,000 = 43,998,000) was reported UNSOURCED against the cfo/fcf family.
+    low_ctx = re.sub(r"[\s_]+", " ", (label + " " + context).lower())
+    low = re.sub(r"[\s_]+", " ", label.lower())
     if any(w in low_ctx for w in FORWARD_WORDS):
         return "forward", "forward-looking/guide — not verifiable against filings"
     if any(w in low_ctx for w in ERROR_WORDS):
@@ -568,9 +592,25 @@ def trace_number(a, label, card, filing_texts, context="", literal=""):
         # market-priced values drift with the tape after a memo is written —
         # widen tolerance instead of crying wolf on every price move
         tol = 0.15 if any(k in ("market_cap", "enterprise_value") for k in fam_keys) else TOL
-        for src, v in _card_values(card, fam_keys):
-            if abs(abs(v) - a) <= tol * max(abs(v), a):
-                return "ok", src
+        # hunt-2026-08-29c, fixed in 186abc0: the module docstring promises code compares
+        # "scale- and period-aware", and _in_filings/_in_filings_near do try 1e6/1e3/1 —
+        # but THIS comparison, the one that sources a number against the card, never did.
+        # A memo that quotes a statement in the statement's OWN units (US filers print in
+        # thousands) writes a bare "1,195,080" where the card carries 1,195,080,000, and
+        # the two can never be within 2.5% of each other. Live: LYFT's 2026-08-17 memo
+        # line "TTM CFO = FY25 1,168,438 + H1'26 657,604 - H1'25 630,962 = 1,195,080
+        # matches fincard" — it matches the card EXACTLY, at 1000x. Only applied when the
+        # memo's literal carries NO scale token of its own; an explicit "$1.2M" already
+        # means dollars and must not be re-scaled. The multiplier used is reported in the
+        # detail so a 1000x match is never silent.
+        scales = [(1, "")]
+        if not re.search(r"(?i)[bmk]\b|billion|million|thousand", literal or ""):
+            scales += [(1e3, " x1e3 (memo in thousands)"), (1e6, " x1e6 (memo in millions)")]
+        for mult, note in scales:
+            av = a * mult
+            for src, v in _card_values(card, fam_keys):
+                if abs(abs(v) - av) <= tol * max(abs(v), av):
+                    return "ok", src + note
         # MISLABEL verdicts only for BARE concept labels ("net cash", "ttm fcf") —
         # qualified ones (segment/brand/period: "CARFAX revenue", "Q2 FCF") legitimately
         # differ from consolidated card concepts and must not cry mislabel
@@ -733,10 +773,16 @@ def memo_cmd(path, tk=None):
         p = JOURNAL / path
     tk = (tk or re.search(r"_([A-Z]+)_", p.name).group(1)).upper()
     finds = sweep_prose(tk, {p.name: p.read_text(errors="replace")})
-    for f in finds:
+    # _INFO rows explain numbers that turned out fine; they are not defects (see run()'s
+    # same split at numwatch.py:713-716) — counting them here made a clean memo report
+    # "1 unsourced number(s)" and exit 1, which is indistinguishable from a real finding.
+    real = [f for f in finds if not f.startswith("_INFO")]
+    info = [f for f in finds if f.startswith("_INFO")]
+    for f in real:
         print(" ", f)
-    print(f"{p.name}: {len(finds)} unsourced number(s)")
-    return 1 if finds else 0
+    print(f"{p.name}: {len(real)} unsourced number(s)"
+          + (f" (+{len(info)} explained away)" if info else ""))
+    return 1 if real else 0
 
 
 if __name__ == "__main__":

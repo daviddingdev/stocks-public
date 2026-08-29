@@ -353,7 +353,11 @@ def parse_claims(memo_txt):
 
 
 def score_paragraphs(txt, claim, n=3, width=900):
-    """Cheap retrieval: rank paragraphs by rare-token overlap with the claim."""
+    """Cheap retrieval: rank paragraphs by rare-token overlap with the claim.
+
+    Returns (score, chunk) pairs, NOT bare chunks — audit() has to rank candidates
+    ACROSS documents before it truncates, and it cannot do that without the score
+    (hunt-2026-08-29d)."""
     toks = [w for w in re.findall(r"[a-z0-9$%.]{3,}", claim.lower()) if w not in STOP]
     if not toks:
         return []
@@ -365,9 +369,9 @@ def score_paragraphs(txt, claim, n=3, width=900):
             best.append((s, i))
     best.sort(reverse=True)
     out = []
-    for _, i in best[:n]:
+    for sc, i in best[:n]:
         chunk = "\n\n".join(paras[max(0, i - 1):i + 2])[:width * 3]
-        out.append(chunk)
+        out.append((sc, chunk))
     return out
 
 
@@ -404,12 +408,25 @@ def audit(memo_path, tk=None):
                             "why": "agent citation verified by code" if ok
                                    else "agent citation FAILED verbatim check"})
             continue
-        # 2) model path: retrieval across all docs, best-first
-        cands = []
+        # 2) model path: retrieval across all docs, best-first.
+        # hunt-2026-08-29d, fixed in 186abc0: "best-first" was a lie. The per-document top-3
+        # were appended in DOCUMENT order and then cut at [:6], and docs is built from
+        # sorted(glob) = OLDEST FILENAME FIRST — so the auditor only ever saw the two
+        # oldest documents on file and never the ones the claim was written from. Live
+        # proof: every one of the 8 claims in 2026-07-29_LBRDP_buy (3 CONTRADICTED, 5
+        # NOT_FOUND) was judged against a 2020 8-A12B and a 2024 PREM14A while the
+        # 2025-01-22 DEFM14A carrying the merger terms, the 2026-02-05 10-K and the
+        # 2026-07-29 10-Q were all discarded unread. Same on ARI (12 docs, the newest ten
+        # never reached the model) and on yesterday's 2026-08-28_TLS_sell. Rank the pooled
+        # candidates by their own retrieval score, newest document breaking ties, THEN cut.
+        scored = []
         for name, doc_txt in docs.items():
-            for chunk in score_paragraphs(doc_txt, c["claim"]):
-                cands.append((name, chunk))
-        cands = cands[:6]
+            for sc, chunk in score_paragraphs(doc_txt, c["claim"]):
+                scored.append((sc, name, chunk))
+        # score desc; ties to the NEWEST document (filenames are date-prefixed)
+        scored.sort(key=lambda r: r[1], reverse=True)
+        scored.sort(key=lambda r: r[0], reverse=True)
+        cands = [(name, chunk) for _, name, chunk in scored][:6]
         verdict = {"verdict": "NOT_FOUND", "quote": "", "doc": "", "why": "no relevant passage located"}
         if cands:
             excerpt = "\n\n".join(f"[{n}]\n{ch}" for n, ch in cands)[:16000]

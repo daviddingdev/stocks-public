@@ -175,6 +175,24 @@ ROLES = [
         "escalates_to": "pm",
     },
     {
+        "id": "build", "name": "Build Engineer — surfaces",
+        "who": "Sonnet · NO broker access",
+        # NEW 2026-08-28 (owners.py-067, authorized by David "fix everything, no decisions
+        # needed me" 2026-08-27): subsystem `surfaces` (the dashboard) had an owner that
+        # never ran — 4 asks deep, oldest stalled 5 days, while the /agent page showed a
+        # false MISSED daily. Weekly on Friday: surface defects are real but rarely urgent,
+        # and the hunt's Thursday run feeds it fresh repros.
+        "model": "sonnet",
+        "cadence": "08:30 UTC Fri",
+        "purpose": "Owns the SURFACES (owners.py: subsystem `surfaces`) — the dashboard and "
+                   "every page on it. Works its ask queue: what a card claims must match "
+                   "what the data says, on the phone first (mobile-web rules).",
+        "reads": ["_engine/agent/data/asks.json"],
+        "writes": ["_engine/agent/journal/ops/<date>_build.md"],
+        "charter": [],
+        "escalates_to": "pm",
+    },
+    {
         "id": "coo", "name": "COO — weekend process review",
         "who": "Opus · NO broker access",
         # Stays Opus: the COO's job is adversarial re-derivation from primary sources — the
