@@ -73,6 +73,15 @@ def auth_check():
     return True, ""
 
 
+# Every spawn goes through Mission Control's race-proof wrapper: it exports the
+# long-lived headless token so concurrent sessions never race the ONE rotating
+# refresh token in ~/.claude/.credentials.json (box-wide auth died 08-27/28/29 that
+# way — memo 2026-08-29). Wrapper missing token → execs plain claude, no change.
+CLAUDE_BIN = os.path.expanduser("~/maintenance/bin/claude-headless")
+if not os.path.exists(CLAUDE_BIN):
+    CLAUDE_BIN = "claude"
+
+
 def clean_env():
     """Environment for the child CLI: the Spark's own, minus session/harness vars."""
     drop = ("ANTHROPIC_", "CLAUDE", "AI_AGENT")
@@ -134,7 +143,7 @@ def launch(prompt, log_path):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "w")
     try:
-        p = subprocess.Popen(["claude", "-p", prompt, "--dangerously-skip-permissions",
+        p = subprocess.Popen([CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                               "--model", job_model()],
                              cwd=str(ROOT), stdout=log, stderr=log,
                              start_new_session=True, env=clean_env())
@@ -342,12 +351,12 @@ def launch_update(tk):
     rep = cd / "analysis" / "FINAL-REPORT.md"
     rdate = dt.date.fromtimestamp(rep.stat().st_mtime).isoformat() if rep.exists() else "unknown"
     prompt = update_prompt(tk, cd.name, rdate)
-    topic = _ntfy_topic()
-    if tk in _held() and topic:
+    if tk in _held():
+        # Route the session's own push through Mission Control's choke point, not a raw
+        # curl — that is what lets box-wide tiering see it (PROJECT_STANDARDS §1).
         prompt += (f"\nFINALLY — {tk} is a HELD position, so notify David that the refresh landed: "
-                   f"curl -s -H 'Title: Research updated: {tk}' "
-                   f"-d '<one line: your section-4 action, e.g. HOLD — thesis intact, next catalyst <date>>' "
-                   f"https://ntfy.sh/{topic}")
+                   f"~/maintenance/bin/notify.sh stocks 'Research updated: {tk}' "
+                   f"'<one line: your section-4 action, e.g. HOLD — thesis intact, next catalyst <date>>'")
     return launch(prompt, update_log(tk))
 
 
@@ -603,7 +612,7 @@ def save_token_interactive():
     kf.write_text(json.dumps(keys, indent=2))
     os.chmod(kf, 0o600)
     print("Saved to _engine/config/keys.json. Verifying with a live headless call…")
-    r = subprocess.run(["claude", "-p", "Reply with exactly: AUTH-OK"],
+    r = subprocess.run([CLAUDE_BIN, "-p", "Reply with exactly: AUTH-OK"],
                        env=clean_env(), capture_output=True, text=True, timeout=120)
     out = (r.stdout + r.stderr).strip()
     if "AUTH-OK" in out:

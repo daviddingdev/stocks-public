@@ -526,7 +526,7 @@ def launch(role):
     if role == "hunt":
         _hunt_ledger_sync()   # an area in the charter must be reachable in the ledger
     prompt = PROMPTS[role]() + SINGLE_TURN_NOTE
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions",
+    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
            "--strict-mcp-config", "--mcp-config", str(NO_MCP),
            # Each role's model comes from the org chart (roster.py), not from here.
            # numbers/signals=sonnet, coo/hunt=opus (David 2026-08-18: "Fixer should go down

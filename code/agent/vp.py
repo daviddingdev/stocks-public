@@ -434,7 +434,7 @@ def review(timeout=1800):
     prompt = REVIEW_PROMPT.format(root=ROOT, data=DATA, agent=HERE)
     t0 = time.time()
     try:
-        p = subprocess.run(["claude", "-p", prompt, "--dangerously-skip-permissions",
+        p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                             "--strict-mcp-config", "--mcp-config", str(nomcp),
                             "--model", runner.job_model("vp")],
                            cwd=str(ROOT), capture_output=True, text=True,

@@ -397,7 +397,7 @@ def launch(mode):
             pass
     log = open(LOGS / f"agent_{mode}.log", "w")
     # trade sessions think on Opus (David, 2026-08-04); syncs are mechanical — default model
-    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"] + MCP_RESTRICT
+    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + MCP_RESTRICT
     if mode == "trade":
         cmd += ["--model", runner.job_model()]
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
@@ -448,7 +448,7 @@ def reconcile():
         mcp_sync.sync()
     except Exception as e:
         print(f"code-sync failed in reconcile ({str(e)[:100]}) — claude fallback")
-        subprocess.run(["claude", "-p", SYNC_PROMPT, "--dangerously-skip-permissions"] + MCP_RESTRICT,
+        subprocess.run([runner.CLAUDE_BIN, "-p", SYNC_PROMPT, "--dangerously-skip-permissions"] + MCP_RESTRICT,
                        cwd=str(ROOT), env=runner.clean_env(), timeout=600,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rows = _load_trades()
@@ -507,12 +507,9 @@ def reconcile():
     _atomic(DATA / "trades.json", rows)
     if problems:
         try:
-            import requests
-            topic = runner._ntfy_topic()
-            if topic:
-                requests.post(f"https://ntfy.sh/{topic}",
-                              data=("Agent order reconciliation FAILED:\n" + "\n".join(problems)).encode(),
-                              headers={"Title": "Stocks · agent UNRESOLVED orders"}, timeout=10)
+            import notify as _n
+            _n.push("Stocks · agent UNRESOLVED orders",
+                    "Agent order reconciliation FAILED:\n" + "\n".join(problems))
         except Exception:
             pass
     # memo-ledger self-verification (amendment 2026-08-10): first instrumented run
@@ -532,12 +529,9 @@ def reconcile():
         cv = contract.check()
         if cv:
             try:
-                import requests
-                topic = runner._ntfy_topic()
-                if topic:
-                    requests.post(f"https://ntfy.sh/{topic}",
-                                  data=("Agent desk contract violations:\n" + "\n".join(cv[:10])).encode(),
-                                  headers={"Title": "Stocks · agent CONTRACT"}, timeout=10)
+                import notify as _n
+                _n.push("Stocks · agent CONTRACT",
+                        "Agent desk contract violations:\n" + "\n".join(cv[:10]))
             except Exception:
                 pass
         print(f"{now} contract: {len(cv)} violation(s)" + (" — " + "; ".join(cv[:4]) if cv else ""))

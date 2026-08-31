@@ -122,13 +122,15 @@ def held_symbols():
 
 
 def push(topic, title, msg):
+    """Routed through Mission Control's notify.sh so box-wide tiering sees it
+    (PROJECT_STANDARDS §1). `topic` is kept for signature compatibility and is the
+    same string the `stocks` channel resolves to; the channel is what we pass now."""
     if not topic:
         return
-    try:
-        requests.post(f"https://ntfy.sh/{topic}", data=msg.encode(),
-                      headers={"Title": title, "Tags": "chart_with_upwards_trend"}, timeout=10)
-    except Exception:
-        pass
+    import sys as _s, os as _o
+    _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))
+    import notify as _n
+    _n.push(title, msg, channel="stocks")
 
 
 def alert(state, c, key, kind, symbol, msg, action=False, book=""):

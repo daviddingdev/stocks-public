@@ -261,6 +261,7 @@ def sidebar():
          "<div class=ngrp style='padding:0 10px'>Books</div>",
          f"<a class='leaf navtop' data-home href='/'>{I_HOME}<span>J.P. Morgan</span></a>",
          f"<a class='leaf navtop' data-route='/brokera' href='/brokera'>{I_DOC}<span>David brief</span></a>",
+         f"<a class='leaf navtop' data-route='/advised' href='/advised'>{I_SPARK}<span>Justin's book</span></a>",
          # 2026-08-13 (David): single flat link — the /agent page's five panes now carry
          # Mandate/journal/sessions/memos themselves; the sidebar subtree was redundant.
          f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>"]
@@ -3388,6 +3389,9 @@ CSS += today_page.CSS
 
 import jpm_page  # /brokera — PM brief + decision desk for the BROKERA book (own module)
 jpm_page.register(app, wrap)
+
+import advised_page  # /advised — David's window on Justin's book (own module)
+advised_page.register(app, wrap)
 JS += today_page.JS
 
 if __name__ == "__main__":
