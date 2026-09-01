@@ -130,7 +130,10 @@ def push(topic, title, msg):
     import sys as _s, os as _o
     _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))
     import notify as _n
-    _n.push(title, msg, channel="stocks")
+    # Declared actionable: every push from this engine is market-timed by construction,
+    # but titles like "thesis-vs-price · ARI" miss the policy's actionable regex and were
+    # held for the 23:00 rollup as digest (proven in the ledger, 2026-08-31 — 152/152 held).
+    _n.push(title, msg, channel="stocks", tier="actionable")
 
 
 def alert(state, c, key, kind, symbol, msg, action=False, book=""):

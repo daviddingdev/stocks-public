@@ -324,7 +324,15 @@ def _parse_form4_xml(xml_text):
             # answer, regardless of which account/code produced it.
             "shares_after": max((t["shares_after"] for t in txns if t["shares_after"] is not None),
                                  default=None),
-            "date": max(dates) if dates else None,
+            # feeds.py-077/diffbrief.py-077 (coo, 2026-08-29): NOT "date" -- the filing row
+            # this dict gets r.update()'d onto (edgar_filings' `row["date"]`) already means the
+            # EDGAR index/FILED date. A same-named key here clobbered it with the <transaction
+            # Date> (the TRADE date), collapsing two distinct dates into one with no way to
+            # recover the other, and silently flipped the meaning of "date" for every consumer
+            # (diffbrief.py's 14-day lookback, "Filings dated X or later", the since-last-
+            # session filter) with no code change on their end. Kept under its own key, same
+            # convention as transaction_code/price_is_weighted_avg.
+            "transaction_date": max(dates) if dates else None,
             "rule_10b5_1": any(t["rule_10b5_1"] for t in primary_group),
             "rule_10b5_1_note": plan_notes[0][:200] if plan_notes else None,
             "price_is_weighted_avg": len(priced) > 1 or any(t["price_is_weighted_avg"] for t in primary_group),

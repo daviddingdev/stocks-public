@@ -216,7 +216,14 @@ ERROR_WORDS = ("erroneous", "error", "incorrect", "mistaken", "wrong",
 MODEL_WORDS = ("implied", "modelled", "modeled", "my ", "derived", "scenario", "assumes",
                "assumed", "bear case", "base case", "bull case", "back-of", "reverse dcf",
                "sotp", "rnpv", "haircut", "stress", "stressed", "levered", "anchor",
-               "cash interest")
+               "cash interest", "headroom", "straight-line", "pro-rata", "base-period",
+               "capitalized at", "capitalised at")
+# "headroom"/"straight-line"/"pro-rata"/"base-period" (numbers-078 follow-up, 2026-09-01):
+# a contract-ceiling analysis pro-rates a disclosed total across a shorter task-order
+# period, then reports the unused slack as "headroom" — TLS's own sell memo (2026-08-31)
+# computed a $34,300,000 task order's straight-line base-period share ($3,235,849) and
+# the ceiling's remaining headroom ($3,475,000) from one verbatim-quoted IDIQ figure, and
+# cried UNSOURCED on all three because none of these labels matched any existing keyword.
 # "anchor": an EV/valuation figure computed at the PM's OWN anchor price ("$9,608M
 # (anchor enterprise value)") is by design not equal to the card's live enterprise_value —
 # same class as "levered"/"stressed". "cash interest": the sum of stated coupon rate x
@@ -690,7 +697,13 @@ def _find_amount(text, literal, a):
 
 
 def sweep_prose(tk, texts):
-    """texts: {label: prose}. Returns unsourced-number findings for one name."""
+    """texts: {label: prose}. Returns (finds, evidence): finds are unsourced/mislabel
+    defects; evidence is one detail string per number cleared as in-filing/documented-
+    error/modelled — WHICH filing token or pattern proved it, not just the _INFO count
+    (numbers-078: 24 numbers cleared _INFO the night of 2026-08-29 and nothing on disk
+    recorded which filing token proved any of them — the count looked like progress,
+    the evidence behind it was thrown away). Kept OUT of `finds`/`findings` — quality.py
+    parses that list by string prefix and must not see its shape change."""
     card = _j(NAMES / tk / "fincard.json", {})
     fdir = NAMES / tk / "filings"
     filing_texts = {p.name: p.read_text(errors="replace") for p in fdir.glob("*.txt")} if fdir.exists() else {}
@@ -715,7 +728,7 @@ def sweep_prose(tk, texts):
         finds.append(f"_INFO {tk}: {len(seen_in_filing)} number(s) accounted for without being "
                      f"card concepts — " + ", ".join(f"{v} {k}" for k, v in kinds.most_common())
                      + " — sourced or by-design, not defects")
-    return finds
+    return finds, seen_in_filing
 
 
 # ---------------- orchestration ----------------
@@ -746,7 +759,8 @@ def run():
         m = re.search(rf"(?im)^- \*\*{tk}[^\n]*\n(?:(?!^- \*\*|^#).*\n)*", book)
         if m:
             texts["BOOK.md"] = m.group(0)
-        finds += sweep_prose(tk, texts)
+        prose_finds, evidence = sweep_prose(tk, texts)
+        finds += prose_finds
         report["names"][tk] = finds
         # _INFO rows explain numbers that turned out fine; they are recorded but are
         # not defects. Counting them as findings makes a night of real progress read
@@ -756,7 +770,7 @@ def run():
             1 for f in finds if str(f).startswith("_INFO"))
         (NAMES / tk / "numcheck.json").parent.mkdir(parents=True, exist_ok=True)
         (NAMES / tk / "numcheck.json").write_text(json.dumps(
-            {"ran_at": now, "findings": finds}, indent=1))
+            {"ran_at": now, "findings": finds, "evidence": evidence}, indent=1))
         print(f"{tk}: {len(finds)} finding(s)" + (f" — {finds[0][:90]}" if finds else ""))
     (DATA / "numwatch.json").write_text(json.dumps(report, indent=1))
     # _INFO rows explain numbers that turned out to be fine; counting them as findings makes
@@ -772,7 +786,7 @@ def memo_cmd(path, tk=None):
     if not p.exists():
         p = JOURNAL / path
     tk = (tk or re.search(r"_([A-Z]+)_", p.name).group(1)).upper()
-    finds = sweep_prose(tk, {p.name: p.read_text(errors="replace")})
+    finds, _evidence = sweep_prose(tk, {p.name: p.read_text(errors="replace")})
     # _INFO rows explain numbers that turned out fine; they are not defects (see run()'s
     # same split at numwatch.py:713-716) — counting them here made a clean memo report
     # "1 unsourced number(s)" and exit 1, which is indistinguishable from a real finding.

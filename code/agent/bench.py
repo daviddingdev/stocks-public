@@ -480,26 +480,56 @@ def status():
 _NUM_RE = re.compile(r"(\$[\d,.]+\s?(million|billion|thousand)?|\d[\d,]*\.?\d*\s?%)", re.I)
 _CHANGE_RE = re.compile(
     r"\b(terminat\w*|discontin\w*|withdr\w*|ceas\w*|expir\w*|cancel\w*|breach\w*|default\w*|"
-    r"impair\w*|write.?off\w*|restat\w*|resign\w*|depart\w*|non.?renewal|not\s+renew\w*|"
-    r"declin\w*|delist\w*|bankrupt\w*|covenant\s+violat\w*|going\s+concern|material\s+weakness)\b",
+    r"impair\w*|write.?off\w*|(?<!amended and )(?<!amended & )restat\w*|resign\w*|depart\w*|"
+    r"non.?renewal|not\s+renew\w*|declin\w*|delist\w*|bankrupt\w*|covenant\s+violat\w*|"
+    r"not\s+in\s+compliance|noncomplian\w*|non.compliance|going\s+concern|material\s+weakness)\b",
     re.I)
 _DATE_RE = re.compile(r"\b(20\d{2}|january|february|march|april|may|june|july|august|september|"
                       r"october|november|december)\b", re.I)
 
+# bench.py-087 (pm, 2026-08-31): _CHANGE_RE alone rewards boilerplate risk-factor language —
+# "our ... Credit Agreement requires us to comply with a total indebtedness to capitalization
+# ratio not to exceed 65%" scored 10/10 (a % figure plus "Restated" false-matching restat\w* in
+# "Amended and Restated Credit Agreement") while FLUX's "we are currently in default under the
+# Revolving Note" scored 6/10 for lacking a dollar figure. A change-word wrapped in hypothetical/
+# conditional framing ("as an example", "requires us to", "not to exceed", "in the event of") is
+# a covenant DESCRIPTION, not a breach; ACTUAL/PAST-tense framing ("we are in default", "were not
+# in compliance", "has occurred") is the live event this channel exists to find and now scores on
+# actuality first, a bare figure+change-verb second.
+_HYPOTHETICAL_RE = re.compile(
+    r"\b(as an example|for example|in the event (of|that)|would (be|result|trigger|require|occur)\w*|"
+    r"requires? us to|require\w* the company to|if we (fail|are unable|do not)|not to exceed|"
+    r"may (result|trigger|require)\w*|could (result|trigger|require)\w*|"
+    r"(?:is|are) required to maintain)\b", re.I)
+_ACTUAL_RE = re.compile(
+    r"\b(we are (currently )?in default|(?:is|are|was|were) (currently )?in default|"
+    r"(?:was|were) not in compliance|not in compliance with|noncomplian\w*|"
+    r"(?:has|have) occurred|(?:was|were) in violation|"
+    r"event of default (?:has|had) occurred|declared (?:a |an )?(?:event of )?default)\b", re.I)
+
 
 def _specificity(quote):
-    """0-10, coded — see bench.py-030 note above `rank()`. Rare at the top by design."""
+    """0-10, coded — see bench.py-030 note above `rank()`. Rare at the top by design.
+
+    bench.py-087: actuality gates the change-word credit and outweighs a bare figure — see
+    note above _HYPOTHETICAL_RE. ACTUAL carries 6 of the 10 points on its own (a live default
+    with no dollar figure still beats a covenant description that has one); a bare change-word
+    wrapped in hypothetical framing earns nothing."""
     if not quote:
         return 0
-    s = 0
-    if _NUM_RE.search(quote):
-        s += 4
-    if _CHANGE_RE.search(quote):
-        s += 4
-    if _DATE_RE.search(quote):
-        s += 1
+    num = bool(_NUM_RE.search(quote))
+    date = bool(_DATE_RE.search(quote))
     wc = len(quote.split())
-    if 8 <= wc <= 70:
+    length_ok = 8 <= wc <= 70
+    if _ACTUAL_RE.search(quote):
+        s = 6 + (2 if num else 0)
+    elif _CHANGE_RE.search(quote) and not _HYPOTHETICAL_RE.search(quote):
+        s = (4 if num else 0) + 4
+    else:
+        s = 4 if num else 0
+    if date:
+        s += 1
+    if length_ok:
         s += 1
     return min(s, 10)
 

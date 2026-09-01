@@ -94,4 +94,4 @@ The standing conclusion: **silent, data-shaped, exit-0 failure is the failure mo
 design against.** Every stage that can produce a plausible wrong answer gets an assertion
 about what it was supposed to *achieve*, not just an exit code.
 
-_Last updated August 2026._
+_Last updated September 2026._

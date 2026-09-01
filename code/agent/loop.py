@@ -369,7 +369,7 @@ stop. Never touch the non-agentic account. If ANY tool result is ambiguous about
 order targets, abort that order and write why to decisions.md."""
 
 
-def launch(mode):
+def launch(mode, attempt=1):
     # sync is a mechanical JSON fetch — CODE does it now (mcp_sync.py, 2026-08-13,
     # after David's notification archaeology found Claude sessions doing curl work).
     # A Claude session remains the FALLBACK so token expiry never leaves a gap.
@@ -417,7 +417,66 @@ def launch(mode):
                           f"while kill -0 {proc.pid} 2>/dev/null; do sleep 20; done; "
                           f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if mode == "trade":
+        died = _limit_guard(proc, attempt)
+        if died:
+            return died
     return {"ok": True, "msg": f"agent {mode} launched"}
+
+
+def _limit_guard(proc, attempt):
+    """THE TRADE SESSION NEVER DIES QUIETLY (David, 2026-08-31: "the trade session
+    should never die"). That day's 14:05 launch lasted 1 second — "You've hit your
+    session limit · resets 2:40pm (UTC)" — and the desk stayed dark until a human
+    noticed at 14:54. Watch the first 90s of the session: a usage-limit death gets a
+    critical page AND one detached relaunch just after the stated reset (≤3 attempts,
+    never after 19:30 UTC — a session that opens in the last half hour of the market
+    day can't do its job). A death that isn't the limit belongs to auth_check and the
+    reconcile watcher, not this guard."""
+    import re
+    import time as _t
+    for _ in range(18):
+        _t.sleep(5)
+        if proc.poll() is not None:
+            break
+    if proc.poll() is None:
+        return None
+    try:
+        tail = (LOGS / "agent_trade.log").read_text()[-600:]
+    except Exception:
+        tail = ""
+    if "limit" not in tail.lower():
+        return None
+    now = dt.datetime.now(dt.timezone.utc)
+    delay = 3600
+    m = re.search(r"resets (\d{1,2}):(\d{2})\s*(am|pm)\s*\(UTC\)", tail, re.I)
+    if m:
+        hh = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+        reset = now.replace(hour=hh, minute=int(m.group(2)), second=0, microsecond=0)
+        if reset <= now:
+            reset += dt.timedelta(days=1)
+        delay = int((reset - now).total_seconds()) + 300
+    launch_at = now + dt.timedelta(seconds=delay)
+    retry = attempt < 3 and (launch_at.hour, launch_at.minute) < (19, 30) \
+        and launch_at.date() == now.date()
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import notify as _n
+        _n.push("Agent trade session FAILED on usage limit",
+                f"attempt {attempt} died at launch ({tail.strip()[-120:]}). "
+                + (f"Auto-retry at {launch_at:%H:%M}Z." if retry
+                   else "NO retry (attempts exhausted or too late in the day) — needs eyes."),
+                tier="critical")
+    except Exception:
+        pass
+    if retry:
+        subprocess.Popen(["bash", "-c",
+                          f"sleep {delay}; cd {HERE}; python3 loop.py trade {attempt + 1} "
+                          f">> {LOGS}/agent_cron.log 2>&1"],
+                         start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": False, "msg": f"trade died on usage limit; retry {attempt + 1} at {launch_at:%H:%M}Z"}
+    return {"ok": False, "msg": "trade died on usage limit; no retry scheduled — needs eyes"}
 
 
 def reconcile():
@@ -531,7 +590,8 @@ def reconcile():
             try:
                 import notify as _n
                 _n.push("Stocks · agent CONTRACT",
-                        "Agent desk contract violations:\n" + "\n".join(cv[:10]))
+                        "Agent desk contract violations:\n" + "\n".join(cv[:10]),
+                        tier="actionable")  # money-book invariants; default-tiered digest, held (08-31)
             except Exception:
                 pass
         print(f"{now} contract: {len(cv)} violation(s)" + (" — " + "; ".join(cv[:4]) if cv else ""))
@@ -563,7 +623,8 @@ if __name__ == "__main__":
     if m == "reconcile":
         r = reconcile()
     elif m in ("sync", "trade"):
-        r = launch(m)
+        att = int(sys.argv[2]) if sys.argv[2:] and sys.argv[2].isdigit() else 1
+        r = launch(m, attempt=att)
     else:
         sys.exit("usage: loop.py sync | loop.py trade | loop.py reconcile")
     print(json.dumps(r))

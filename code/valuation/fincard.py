@@ -103,11 +103,30 @@ FLOW = {
     # line (GTE/Gran Tierra Energy tags "Additions to oil and gas properties" this way,
     # quality.py-open fincard-flag:GTE:capex, 2026-08-28) — same cash-outflow role as
     # PaymentsToAcquirePropertyPlantAndEquipment, sector-specific caption.
+    # PaymentsToExploreAndDevelopOilAndGasProperties: TXO Partners' E&P-stage capex
+    # line ($24.67M H1-2026 alone) — the same sector role as PaymentsToAcquireOilAnd-
+    # GasPropertyAndEquipment above, an exploration/development-phase naming variant.
+    # Checked for the MYGN/KNX collision shape (below) before adding: neither TXO nor
+    # TALO (also resolved by this tag) carries any other capex-like concept at all, so
+    # there is no coexisting bigger line this could be masking.
+    #
+    # PaymentsToAcquireOtherProductiveAssets and PaymentsToAcquireMachineryAndEquipment
+    # were BOTH tried and REVERTED here (2026-09-01, corpus-wide rebuild review): each
+    # fixed MYGN/KNX/HUT/MDXG cleanly but MACHINERYANDEQUIPMENT also silently promoted
+    # NUVB's small $27K-354K/yr lab-equipment line over its OWN already-correctly-
+    # resolved PaymentsForCapitalImprovements ($8,000,000 FY2025) — both tags are
+    # genuinely, simultaneously reported by NUVB for the SAME periods in the SAME
+    # filings, so "most recent wins" cannot tell them apart. A tag name that is one
+    # issuer's WHOLE capex line and another issuer's minor side-line is a DEFINITION
+    # collision, not a naming one (same lesson as the RESCUE table's total_liabilities
+    # disaster above) — safe only case-by-case. See MANUAL below for KNX/HUT/MDXG
+    # instead of a blanket tag-map addition.
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquirePropertyAndEquipment",
               "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements",
               "PaymentsToDevelopRealEstateAssets", "PaymentsForProceedsFromProductiveAssets",
               "PaymentsToAcquireOtherPropertyPlantAndEquipment",
-              "PaymentsToAcquireOilAndGasPropertyAndEquipment"],
+              "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+              "PaymentsToExploreAndDevelopOilAndGasProperties"],
     # SEPARATE cash-flow line from "capex" above, not an alternate tag for it — capitalized
     # software development is its own investing-activities caption, landing on the balance
     # sheet as an intangible, never PP&E. Software-heavy issuers routinely tag BOTH lines
@@ -159,6 +178,14 @@ FLOW_UNITS = {"eps_diluted": "USD/shares", "shares_diluted_wavg": "shares"}
 # 410,541,977 diluted shares against 128.2M actual — BOOK.md fincard defect (c),
 # 2026-08-13). Summing 4x'd every per-share denominator built off the card.
 FLOW_AVG = {"shares_diluted_wavg"}
+# eps_diluted is a per-share RATIO, not an additive dollar amount — GAAP gives no
+# guarantee that YTD_9mo_eps - YTD_6mo_eps reproduces the true Q3 EPS (the diluted
+# share count folded into the ratio differs period to period), and subtracting two
+# nearly-equal cumulative EPS figures amplifies float noise into nonsense: GOGO's
+# ytd-diff derived Q4 read eps_diluted -1.04e-17, JOB's -8.67e-18 (fincard.py-080).
+# Never derived by YTD-differencing — only direct quarter/FY facts are used, same
+# treatment as the FLOW_AVG stock measure.
+FLOW_NO_YTD_DIFF = FLOW_AVG | {"eps_diluted"}
 # concepts whose alternate tags are the SAME reported line under different tag
 # names, so rows may be MERGED across tags to fill period gaps (the freshest tag
 # still wins any period it reports). capex only: issuers split one "purchases of
@@ -368,6 +395,32 @@ CAPEX_SOFTWARE_DISJOINT_VERIFIED = {
                         "capex_software exactly",
     },
 }
+# the OPPOSITE finding: capitalized software is ALREADY inside PP&E-only capex (or is a
+# non-cash footnote addition, e.g. allocated SBC capitalized into the asset), so combining
+# capex_software on top of capex double-counts. Per-ticker allowlist, same rigor as
+# CAPEX_SOFTWARE_DISJOINT_VERIFIED above: every entry needs the printed cash-flow
+# statement showing capex_software does NOT appear as its own investing-activities line,
+# and the issuer's own FCF/capex definition tying to PP&E-only. capex_software still
+# shows on the card as its own figure — only the fcf/capex COMBINATION is suppressed.
+CAPEX_SOFTWARE_NONCASH_OR_INCLUDED = {
+    "DOCU": {
+        "quote_cfs": "Cash flows from investing activities: Purchases of marketable securities "
+                     "( 97,408 ) Maturities of marketable securities 93,024 Purchases of "
+                     "strategic and other investments ( 2,610 ) Purchases of property and "
+                     "equipment ( 32,253 ) Net cash used in investing activities ( 39,247 )",
+        "doc_cfs": "10-Q filed 2026-06-05, three months ended 2026-04-30 — no separate "
+                   "'capitalized software' investing-activities line at all; the MD&A's own "
+                   "words: 'net cash used in investing activities...was primarily driven by "
+                   "$32.3 million in purchases of property and equipment AS WE CONTINUED TO "
+                   "INVEST IN CAPITALIZED SOFTWARE DEVELOPMENT PROJECTS' — the software spend "
+                   "is inside the PP&E line, not a second cash outflow.",
+        "quote_fcf_def": "Free cash flow $289,435" ,
+        "doc_fcf_def": "same 10-Q, non-GAAP reconciliation — CFO 321,688 - capex 32,253 = "
+                       "289,435 exactly, PP&E-only; the CapitalizedComputerSoftwareAdditions "
+                       "XBRL tag ($44.8M same quarter) plays no role in DocuSign's own FCF "
+                       "(fincard.py-084 new-card review, 2026-09-01).",
+    },
+}
 # PM-verified figures for lines an issuer reports ONLY in the printed statement.
 # Applied in build() and never allowed to beat a real XBRL tag. Every entry needs a
 # verbatim quote and the document it came from, because this dict is the one place
@@ -432,6 +485,27 @@ MANUAL = {
             "entered": "2026-08-19",
         },
     },
+    "MYGN": {
+        # MYGN's current "Capital expenditures" cash-flow line is tagged
+        # PaymentsToAcquireOtherProductiveAssets — a real, current XBRL fact (not a
+        # print-only line) — but that tag name is NOT a safe global FLOW["capex"]
+        # alternate: KNX (Knight-Swift) tags an unrelated, trivial ~$0-1M/quarter line
+        # with the exact same concept name while its REAL fleet capex sits under
+        # PaymentsToAcquireMachineryAndEquipment — a definition collision, not a naming
+        # one, caught rebuilding the whole corpus after adding it globally
+        # (fincard.py-089, 2026-09-01). Scoped here instead of widening the tag map.
+        "capex": {
+            "value": 15_000_000,
+            "period": "TTM 2025-07-01..2026-06-30 (FY2025 15,600,000 + H1'26 7,500,000 - H1'25 8,100,000)",
+            "period_end": "2026-06-30",
+            "formula": "FY2025 15,600,000 + H1-2026 7,500,000 - H1-2025 8,100,000",
+            "quote": "Capital expenditures ( 7.5 ) ( 8.1 ) (10-Q, H1 2026 vs 2025); "
+                     "Capital expenditures ( 15.6 ) ( 19.0 ) ( 63.2 ) (10-K, FY2025/24/23)",
+            "doc": "10-Q filed 2026-07-31 (H1'26/H1'25 legs) + 10-K filed 2026-02-24 (FY2025 total) "
+                   "— cash-flow statements, tag PaymentsToAcquireOtherProductiveAssets",
+            "entered": "2026-09-01",
+        },
+    },
 }
 
 
@@ -481,11 +555,42 @@ def _partial_period_days(fig):
     return None
 
 
+# PERIODIC reports carry primary financial statements; a proxy/registration/annual-
+# report-to-shareholders does not, even when it prints the SAME concept in a table
+# (Pay-versus-Performance, say-on-pay). fincard.py-079: JAKK's DEF 14A (filed
+# 2026-04-22) tagged FY2025 NetIncomeLoss as 9,871,000,000 in its PvP table — 1000x
+# the true 9,871,000 the 10-K (filed 2026-03-02) reported for the SAME (start,end) —
+# and "latest-filed wins" with no form filter let the proxy overwrite the audited
+# statement. Matched by prefix so amendments (/A) rank with their parent form.
+_PERIODIC_FORM_PREFIXES = ("10-K", "10-Q", "8-K", "20-F", "40-F")
+
+
+def _form_rank(form):
+    """0 for a periodic report (10-K/10-Q/8-K/20-F/40-F, any /A), 1 for anything
+    else (DEF 14A/14C, ARS, S-1, ...). Lower rank always wins a tie; see _better()."""
+    return 0 if (form or "").startswith(_PERIODIC_FORM_PREFIXES) else 1
+
+
+def _better(new_row, old_row):
+    """True if new_row should replace old_row in the dedup dicts below: a periodic
+    report always beats a non-periodic one for the same (start,end), REGARDLESS of
+    filed date; only within the same rank does the later filing win (a real
+    restatement)."""
+    if old_row is None:
+        return True
+    nr, org = _form_rank(new_row.get("form")), _form_rank(old_row.get("form"))
+    if nr != org:
+        return nr < org
+    return (new_row.get("filed") or "") > (old_row.get("filed") or "")
+
+
 def _pick_flow(entries, derive=True):
-    """Raw XBRL duration entries -> (quarters, annuals), deduped by end date,
-    latest-filed restatement wins. Quarters include values DERIVED from YTD
-    differences (10-Q cash-flow statements report YTD: Q_n = YTD_n - YTD_{n-1});
-    derive=False for stock measures (FLOW_AVG) where that subtraction is meaningless."""
+    """Raw XBRL duration entries -> (quarters, annuals), deduped by end date, a
+    periodic report (10-K/10-Q/8-K/20-F/40-F) always outranks a proxy/registration
+    filing for the same period; ties within a rank go to the latest-filed (a real
+    restatement). Quarters include values DERIVED from YTD differences (10-Q
+    cash-flow statements report YTD: Q_n = YTD_n - YTD_{n-1}); derive=False for
+    stock measures (FLOW_AVG) where that subtraction is meaningless."""
     direct_q, ytd, fy = {}, {}, {}
     for e in entries:
         s, en = e.get("start"), e.get("end")
@@ -495,14 +600,14 @@ def _pick_flow(entries, derive=True):
         row = {"value": e["val"], "start": s, "end": en,
                "form": e.get("form"), "filed": e.get("filed")}
         if 75 <= d <= 100:
-            if en not in direct_q or (e.get("filed") or "") > (direct_q[en].get("filed") or ""):
+            if _better(row, direct_q.get(en)):
                 direct_q[en] = row
         elif 350 <= d <= 380:
-            if en not in fy or (e.get("filed") or "") > (fy[en].get("filed") or ""):
+            if _better(row, fy.get(en)):
                 fy[en] = row
         elif 160 <= d <= 290:  # 6- or 9-month YTD
             key = (s, en)
-            if key not in ytd or (e.get("filed") or "") > (ytd[key].get("filed") or ""):
+            if _better(row, ytd.get(key)):
                 ytd[key] = row
     # derive quarters from YTD chains sharing a fiscal-year start. The FY row joins
     # its chain too: Q4 = FY - 9-month YTD (without it, TTM never assembles for
@@ -543,9 +648,35 @@ def _ttm(quarters, annuals, ytd=None, mode="sum"):
                 run.append(q)
             else:
                 break
+        # a single quarter reported off-scale by a filer must not corrupt the average
+        # silently — TBLA's own 2026-08-05 10-Q restated Q2-2026 diluted shares as
+        # 291,392,907,000 against every neighboring quarter's ~290-345 MILLION, and
+        # "latest-filed" blended it straight into a 145,840,835,622-share average
+        # (fincard.py-080). The run being averaged is too small a sample to judge by
+        # itself (2 quarters: which of the 2 is "the outlier" is ambiguous on its own,
+        # and TBLA's corrupted quarter has no clean alternate fact at all) — the
+        # established scale comes from quarters OUTSIDE this run plus the freshest
+        # annuals, a pool the same restatement is far less likely to have corrupted
+        # in its entirety. A run member more than 5x (or under 1/5x) that reference
+        # median is dropped from the average and named, rather than blended in.
+        note = ""
+        ref_pool = [q["value"] for q in quarters[len(run):] if q["value"]] + \
+            [a["value"] for a in annuals[:2] if a["value"]]
+        if ref_pool:
+            ref_pool = sorted(abs(v) for v in ref_pool)
+            ref_med = ref_pool[len(ref_pool) // 2]
+            if ref_med:
+                clean = [x for x in run if 0.2 <= abs(x["value"]) / ref_med <= 5]
+                dropped = [x for x in run if x not in clean]
+                if dropped and clean:
+                    note = (" — excluded " + "; ".join(
+                        f"{d['end']}={d['value']:,.0f}" for d in dropped) +
+                        f" (>5x the established scale ~{ref_med:,.0f}; likely a "
+                        "restated fact scaled wrong)")
+                    run = clean
         if not annuals or run[0]["end"] > annuals[0]["end"]:
             return (sum(x["value"] for x in run) / len(run),
-                    f"avg of {len(run)} direct quarter(s) {run[-1]['start']}..{run[0]['end']}",
+                    f"avg of {len(run)} direct quarter(s) {run[-1]['start']}..{run[0]['end']}" + note,
                     run[0]["end"], run[-1]["start"])
     q_result = None
     if len(quarters) >= 4:
@@ -1236,7 +1367,7 @@ def build(tk, cik_override=None):
                 card["flags"].append(f"{name}: no XBRL tag found")
             continue
         avg = name in FLOW_AVG
-        quarters, annuals, ytd = _pick_flow(rows, derive=not avg)
+        quarters, annuals, ytd = _pick_flow(rows, derive=name not in FLOW_NO_YTD_DIFF)
         val, period, endd, startd = _ttm(quarters, annuals, ytd, mode="avg" if avg else "sum")
         if val is None:
             continue
@@ -1637,6 +1768,77 @@ def build(tk, cik_override=None):
                 f"current_assets / current_liabilities")
 
     rev, ni, opi = ttm_vals.get("revenue"), ttm_vals.get("net_income"), ttm_vals.get("op_income")
+
+    # INCOME IDENTITY (fincard.py-080): eps_diluted x shares_diluted_wavg ~= net_income
+    # is an accounting identity, and nothing on the card checked it — 47 of 603 cards
+    # failed by more than 3x. Runs on every card that states all three; the failure
+    # families found so far: a proxy overwriting the 10-K's net_income (fincard.py-079,
+    # fixed at the root in _pick_flow above), shares_diluted_wavg reported IN THOUSANDS
+    # by the filer (ratio ~1/1000; SPH/NTNX/SUJA/TEM/NUVB — a genuine filer tagging
+    # error this code cannot safely auto-correct without guessing a scale), and a
+    # nonsense/corrupted share count from a bad restatement (fincard.py-080's TBLA case,
+    # fixed at the root in _ttm's avg-branch scale guard above).
+    eps_d, shd = ttm_vals.get("eps_diluted"), ttm_vals.get("shares_diluted_wavg")
+    if ni and eps_d is not None and shd:
+        # eps_diluted can be a partial-period (single YTD period on file, no TTM/FY
+        # yet — e.g. after the FLOW_NO_YTD_DIFF fix above) while net_income is a full
+        # TTM; comparing the two raw would flag every such name as a false identity
+        # break (ARI: 6mo eps_diluted 0.27 vs 12mo net_income — ratio 0.28 with no
+        # data defect at all). Annualize eps by its own day-count first, same
+        # flat-run-rate convention _partial_period_days already uses for pe/ev_over_fcf.
+        _eps_days = _partial_period_days(F.get("eps_diluted"))
+        eps_ann = eps_d * (365.0 / _eps_days) if _eps_days else eps_d
+        implied_ni = eps_ann * shd
+        ratio = implied_ni / ni
+        ok = 0.8 <= ratio <= 1.2
+        card["cross_checks"]["income_identity"] = {
+            "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd,
+            "implied_net_income": round(implied_ni), "ratio": round(ratio, 4), "ok": ok,
+            **({"eps_annualized_from_days": _eps_days} if _eps_days else {})}
+        if not ok:
+            if 0.0001 <= abs(ratio) <= 0.005:
+                cause = ("shares_diluted_wavg looks reported IN THOUSANDS by the filer "
+                         "(ratio ~1/1000 of expected) — do not trust the raw share count")
+            elif abs(ratio) >= 5 or 0 < abs(ratio) <= 0.2:
+                cause = ("shares_diluted_wavg or net_income looks implausible — check for "
+                         "a filer scale error or bad restatement")
+            else:
+                cause = ("could be a proxy-form overwrite, wrong tag pick, or unit "
+                         "mismatch — but also check for a legitimate accounting reason "
+                         "before assuming a defect: preferred dividends removed from "
+                         "the EPS numerator but not from net_income, discontinued-ops/"
+                         "NCI allocation, or 2-decimal EPS rounding on a huge share count")
+            card["flags"].append(
+                f"INCOME IDENTITY FAILS: eps_diluted {eps_d}" +
+                (f" (annualized to {eps_ann:.4g} from a {_eps_days}d partial period)" if _eps_days else "") +
+                f" x shares_diluted_wavg {shd:,.0f} = {implied_ni:,.0f}, a {ratio:.4g}x ratio "
+                f"to stated net_income {ni:,.0f} — {cause} (fincard.py-080). eps_diluted/"
+                f"shares_diluted_wavg feed no derived value (DISPLAY_ONLY) but should not "
+                f"be quoted at face value until resolved.")
+
+    # TAX-DRIVEN EARNINGS (fincard.py-085): a card can be internally CONSISTENT (eps x
+    # shares ties to net_income) and still be externally MEANINGLESS — LYFT's FY2025
+    # $2.9B deferred-tax valuation-allowance release put net_income POSITIVE
+    # 2,865,671,000 against pretax_income NEGATIVE 5,388,000, printing pe 2.34 and
+    # roe_pct 94.78 on a business that lost money pretax. Neither the income-identity
+    # check above nor the balance-sheet identity catches this — only pretax vs net
+    # disagreeing in sign or magnitude does. Flag, never hide: the earnings-derived
+    # family (pe, net_margin_pct, roe_pct, eps_diluted) is unreliable; fcf-derived
+    # values (fcf, ev_over_fcf, fcf_yield_pct) are cash, not earnings, and unaffected.
+    pretax = ttm_vals.get("pretax_income")
+    if ni is not None and pretax is not None and ni != 0:
+        sign_flip = pretax != 0 and (ni > 0) != (pretax > 0)
+        gap_pct = abs(ni - pretax) / abs(ni) * 100
+        if sign_flip or gap_pct > 50:
+            card["flags"].append(
+                f"TAX-DRIVEN EARNINGS: net_income {ni:,.0f} vs pretax_income {pretax:,.0f} "
+                f"({'sign flip' if sign_flip else f'{gap_pct:.0f}% gap'}) — a one-time tax "
+                f"item (e.g. a deferred-tax valuation-allowance release/charge), not "
+                f"operating performance, is driving net income. pe, net_margin_pct, "
+                f"roe_pct and eps_diluted are TAX-DRIVEN, not earnings-driven — do not rank "
+                f"or screen on them without naming the tax item. fcf, ev_over_fcf and "
+                f"fcf_yield_pct are cash-derived and unaffected (fincard.py-085).")
+
     if opi is None and rev is not None and ttm_vals.get("costs_and_expenses") is not None:
         opi = rev - ttm_vals["costs_and_expenses"]
         put("op_income_calc", opi,
@@ -1644,6 +1846,10 @@ def build(tk, cik_override=None):
             "issuer's income statement has no OperatingIncomeLoss subtotal — this is "
             "revenue minus the statement's own 'Total costs and expenses' line, the "
             "subtotal that precedes Other Income/Expense on the face of the statement")
+        if F.get("op_income"):
+            F["op_income"]["note"] = (
+                f"STALE tag, retained for reference only — use derived.op_income_calc "
+                f"({opi:,.0f}) for the current computed figure (fincard.py-089).")
     cfo, capex, capex_sw = ttm_vals.get("cfo"), ttm_vals.get("capex"), ttm_vals.get("capex_software")
     capex_note = ""
     # capex_sw must cover a comparable SPAN to capex before being summed — "single period
@@ -1659,7 +1865,16 @@ def build(tk, cik_override=None):
     capex_sw_comparable = (
         "single period on file" not in (F.get("capex", {}).get("period") or "")
         and "single period on file" not in (F.get("capex_software", {}).get("period") or ""))
-    if capex is not None and capex_sw and capex_sw_comparable:
+    if tk in CAPEX_SOFTWARE_NONCASH_OR_INCLUDED and capex_sw:
+        # verified the OTHER way (see the dict above): DocuSign's own cash-flow statement
+        # has no separate capitalized-software investing line, and DocuSign's own FCF
+        # reconciliation ties to PP&E-only capex exactly — adding capex_software here
+        # would double-count against a number that is already inside "capex" (fincard.py-084
+        # new-card review, 2026-09-01). capex_software still stands as its own figure.
+        capex_note = (f" capex_software {capex_sw:,.0f} is VERIFIED already included in "
+                      f"PP&E-only capex {capex:,.0f} (not summed) — see "
+                      f"CAPEX_SOFTWARE_NONCASH_OR_INCLUDED in fincard.py.")
+    elif capex is not None and capex_sw and capex_sw_comparable:
         # ADDITIVE, not first-match (fincard.py-033, PM 2026-08-21): capex_software is a
         # separately-reported line, not an alternate tag for "capex" — see the FLOW comment
         # above. Anti-double-count: the two concepts are, by GAAP definition, mutually
@@ -1718,6 +1933,16 @@ def build(tk, cik_override=None):
     if gp is None and rev is not None and ttm_vals.get("cogs") is not None:
         gp = rev - ttm_vals["cogs"]
         put("gross_profit_calc", gp, f"revenue {rev:,.0f} - cogs {ttm_vals['cogs']:,.0f}")
+        # a STALE gross_profit tag (issuer stopped filing GrossProfit — no alternate tag
+        # exists to rescue it, e.g. HALO's last GrossProfit fact is 2020-12-31) is still
+        # excluded from ttm_vals above but its OLD value stays sitting in figures.gross_
+        # profit, unqualified — a reader pulling figures directly (not derived) sees a
+        # $12.6M "gross profit" against a $1.37B rev-cogs reality with nothing on the raw
+        # figure itself pointing at the fix (fincard.py-089). Point it at the fresh number.
+        if F.get("gross_profit"):
+            F["gross_profit"]["note"] = (
+                f"STALE tag, retained for reference only — use derived.gross_profit_calc "
+                f"({gp:,.0f}) for the current computed figure (fincard.py-089).")
     if rev:
         for label, num in (("gross_margin_pct", gp), ("op_margin_pct", opi),
                            ("net_margin_pct", ni), ("fcf_margin_pct", (D.get("fcf") or {}).get("value")),

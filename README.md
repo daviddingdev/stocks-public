@@ -140,4 +140,4 @@ Python, the regulator's filing APIs, XBRL frames, local models for reading, fron
 for judgment, and a dashboard for review. Scheduled jobs handle feeds, triggers, overnight
 reading, and weekly digests.
 
-_Last updated August 2026._
+_Last updated September 2026._

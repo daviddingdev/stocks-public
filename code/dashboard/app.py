@@ -264,7 +264,11 @@ def sidebar():
          f"<a class='leaf navtop' data-route='/advised' href='/advised'>{I_SPARK}<span>Justin's book</span></a>",
          # 2026-08-13 (David): single flat link — the /agent page's five panes now carry
          # Mandate/journal/sessions/memos themselves; the sidebar subtree was redundant.
-         f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>"]
+         f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>",
+         # /lookups — David's HBS-library upload desk (module: lookups_page.py)
+         lookups_page.sidebar_link(I_DOC),
+         # /primer — finance terms with desk applications (module: primer_page.py)
+         primer_page.sidebar_link(I_DOC)]
     s.append("<details open><summary>Watchlist</summary>")
     for t in wl:
         tag = "<span class=lheld>held</span>" if t in held else ""
@@ -2239,9 +2243,18 @@ border-radius:50%;opacity:.55;transition:opacity .1s,color .1s,border-color .1s}
 .leaf:hover .srm,.codet>summary:hover .srm{opacity:1}
 .srm:hover{color:var(--red);border-color:var(--red)}
 @media(hover:none){.srm{opacity:1}}
-main{flex:1;min-width:0;width:100%;max-width:1440px;margin:0 auto;
-padding:clamp(20px,3vw,44px) clamp(16px,3.5vw,56px) 110px}
-article{max-width:min(100%,100ch);font-size:clamp(15px,.25vw + 14px,17px);line-height:1.7}
+/* WIDTH SYSTEM (2026-08-31, David: "nothing hard coded — adjusting accordingly,
+   sizing flexible based on screen size"). The frame is FLUID: no pixel cap, padding
+   scales with the viewport. Each content type carries its own INTRINSIC constraint
+   instead — prose measures in ch (scales with its own font), card grids auto-fit
+   (column count follows real container width), rails clamp(). Add a page by giving
+   its content an intrinsic size; never by capping the frame. */
+main{flex:1;min-width:0;width:100%;margin:0 auto;
+padding:clamp(20px,3vw,64px) clamp(16px,4vw,96px) 110px}
+/* fluid type: grows with the screen (15px phone -> ~19px on the 31"), and because the
+   article measure below is in ch, the text column widens WITH its font — continuously,
+   no breakpoints */
+article{max-width:min(100%,100ch);font-size:clamp(15px,.32vw + 11.5px,19px);line-height:1.7}
 .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;flex-wrap:wrap;margin-bottom:clamp(18px,2vw,30px)}
 .pagehead h1{margin:0;font-size:clamp(26px,1.2vw + 20px,36px);letter-spacing:-.02em}.headactions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .connectbtn .ic,.btn .ic{width:14px;height:14px}
@@ -2489,7 +2502,13 @@ cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-spac
 .dlabel{font-weight:500;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dfile{font-size:12px;color:var(--fade);font-family:ui-monospace,monospace;flex-shrink:0}
 /* ---- doc reader ---- */
-.docgrid{display:grid;grid-template-columns:minmax(0,900px) 218px;gap:44px;align-items:start}
+/* reports: one fluid rule, no breakpoints — the article column is a TYPE measure
+   (ch of the same fluid font-size the article uses, set here because ch resolves
+   against THIS element's font), so the text column grows continuously with the
+   screen; the toc rail clamps; the pair centers so leftover space balances */
+.docgrid{display:grid;grid-template-columns:minmax(0,112ch) clamp(12rem,14vw,15rem);
+  gap:clamp(28px,3vw,64px);align-items:start;justify-content:center;
+  font-size:clamp(15px,.32vw + 11.5px,19px)}
 .doctoc{position:sticky;top:32px;font-size:13px;max-height:calc(100vh - 64px);overflow:auto;border-left:1px solid var(--line);padding-left:16px}
 .tochead{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fade);font-weight:600;margin-bottom:8px}
 .tocl{display:block;color:var(--mut);padding:3.5px 0;line-height:1.4}
@@ -3288,6 +3307,16 @@ function nav(route,push){
   var nv=document.getElementById('nav');if(nv)nv.checked=false;window.scrollTo(0,0);setTitle();enhance();
  });
 }
+/* ---- stale-tab self-heal (2026-08-31): nav() only version-checks on CLICK, so a tab
+   left open on one page ran the morning's CSS all day (David's screenshots). On every
+   return to the tab, ask the server its version; reload if it moved. HEAD = ~0 cost. */
+var _verChk=0;
+function checkVer(){var now=Date.now();if(now-_verChk<15000)return;_verChk=now;
+ fetch(location.pathname+location.search,{method:'HEAD'}).then(function(r){
+  var v=r.headers.get('X-App-Ver');
+  if(v&&typeof APPV!=='undefined'&&v!==APPV)location.reload();}).catch(function(){});}
+window.addEventListener('focus',checkVer);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)checkVer();});
 /* ---- search typeahead ---- */
 var _sr=[],_si=-1,_sq=null,_searchGlobals=0;
 function srender(){var box=document.getElementById('sresults');if(!box)return;
@@ -3392,6 +3421,12 @@ jpm_page.register(app, wrap)
 
 import advised_page  # /advised — David's window on Justin's book (own module)
 advised_page.register(app, wrap)
+
+import lookups_page  # /lookups — HBS-library upload desk (Capital IQ / IBISWorld exports)
+lookups_page.register(app, wrap)
+
+import primer_page  # /primer — David's finance primer (terms + desk applications)
+primer_page.register(app, wrap)
 JS += today_page.JS
 
 if __name__ == "__main__":

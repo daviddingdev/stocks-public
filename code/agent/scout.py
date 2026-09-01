@@ -198,7 +198,12 @@ def _events():
     for tk, fils in (feed.get("filings") or {}).items():
         c = sum(1 for f in fils or [] if f.get("form") == "4" and f.get("date", "") >= cutoff)
         if c >= 3 and tk not in pf_held:
-            ev.append({"id": f"f4x:{tk}:{cutoff}", "kind": "insider-cluster", "ticker": tk,
+            # Keyed by TICKER, not ticker+cutoff (scout.py-081, same class of bug as -056):
+            # cutoff is recomputed every run, so a cluster that stays inside the rolling
+            # 2-day window minted a fresh row every day — TRIP/MSGS each carried two rows
+            # for one cluster, one of them carrying a stale/reviewed verdict invisible to
+            # the other. The merge loop below carries date/detail forward on the SAME row.
+            ev.append({"id": f"f4x:{tk}", "kind": "insider-cluster", "ticker": tk,
                        "date": cutoff, "detail": f"{c} Form 4s on {tk} within 2 days "
                        "(buys or routine vesting? — check the filings)"})
     return ev
@@ -342,6 +347,12 @@ def run(max_pre=25, max_triage=8):
             # should move it off that status.
             cur["date"], cur["detail"] = e["date"], e["detail"]
             cur["runs_on_screen"] = e.get("runs_on_screen")
+            cur["last_seen"] = now
+        if cur and e.get("kind") == "insider-cluster":
+            # scout.py-081: same shape as -056 above, for the Form 4 cluster channel — the
+            # id no longer carries the rolling cutoff, so a cluster that persists across
+            # runs refreshes date/detail on the SAME row instead of minting a new one.
+            cur["date"], cur["detail"] = e["date"], e["detail"]
             cur["last_seen"] = now
     new = [e for e in evs if e["id"] not in items]
     n_pre = n_tri = 0
