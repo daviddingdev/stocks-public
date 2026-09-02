@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-The VP — night sweep and prep desk for the PM. ZERO Claude tokens.
+The VP — night sweep and prep desk for the PM. The coded stages cost ZERO Claude
+tokens; the final review stage is one Sonnet session (model from roster.py).
 
 David, 2026-08-14: "this local model at night should sweep as much as possible and
 ensure enough prep is ready for the PM. It should act as a VP now, review everything
@@ -247,6 +248,12 @@ def brief(stages=None):
 
     # --- the funnel, pre-triaged so the PM spends judgment not search
     counts = q.get("counts") or {}
+    # KPI watch (LEARNING.md, 2026-09-01): the numbers each thesis lives on, first
+    try:
+        import learn
+        L += ["## KPI watch — the numbers the PM said each thesis lives on", "", learn.kpi_table(), ""]
+    except Exception as e:
+        L += ["## KPI watch", "", f"_learn.py unavailable ({type(e).__name__})_", ""]
     L.append("## Data-quality queue")
     L.append("")
     L.append(f"- open {counts.get('open', 0)} · planned {counts.get('planned', 0)} "
@@ -320,7 +327,7 @@ def brief(stages=None):
           "treat the stage output as raw and do your own triage._"]
     # ASKS, BEFORE THE TRADING DAY (David 2026-08-19: the VP should "ensure all asks are
     # addressed for the PM before the trading day and highlight areas not addressed"). The PM
-    # wakes at 14:05Z; this brief is written at 20:40Z the evening before, so it is the last
+    # wakes at 14:05Z; this brief is written overnight (see crontab), so it is the last
     # checkpoint between an ask being filed and the PM trading without having seen it.
     try:
         import asks as _asks
@@ -376,46 +383,7 @@ def brief(stages=None):
 # the brief; it may not delete, downgrade or hide a single coded finding. Everything it
 # says is labelled as the VP's opinion so the PM can disagree with it, and if it fails
 # the brief still stands exactly as the coded stages wrote it.
-REVIEW_PROMPT = """You are the VP of an autonomous equity book at {root}. The night sweep just
-finished. You have NO broker access, you place no orders, and you decide nothing — your PM reads
-your work at 14:05 UTC and makes every call.
-
-Read, in this order:
-  {data}/vp_brief.md        the sweep you are reviewing (stages, per-name prep, findings)
-  {data}/unknowns.md        numbers the machine knows it cannot vouch for
-  {data}/bench_brief.md     the overnight whole-market read
-  {agent}/names/<TK>/numcheck.json   the raw watchdog findings behind the counts
-
-Then APPEND to {data}/vp_brief.md a section headed exactly:
-
-## VP review — judgment layer (Sonnet, not code)
-
-with these four parts, tight, no preamble:
-
-1. **What actually needs the PM this session** — at most 5 items, each one line, ranked. This is
-   the whole point of you: the sweep produces hundreds of rows and only a handful move a decision.
-1b. **Candidate desk verdicts** (David 2026-08-27: "at least 5 options per day considered") —
-   for EVERY name under '## Candidate desk' in the brief, one line each: verdict
-   **PM-READ-NOW** / **PARK until <date or event>** / **DROP**, then the single number that
-   decides it, QUOTED from that name's `names/<TK>/terms.json`, fincard or dossier — never
-   estimated. A desk you skip is a desk that silently reverts to zero options considered;
-   if a name's dossier failed to build, say so and verdict on what exists.
-2. **Watchdog triage** — group the open numwatch findings by ROOT CAUSE, give each group a count,
-   and name the ones that are NOT structural noise. Be concrete: "37 = quarterly figure compared
-   against a TTM card value" beats "many are false positives".
-3. **What I could not verify** — anything in the sweep you could not stand behind, and why. If a
-   stage FAILED, say what the PM must now do by hand.
-4. **One process observation** — the thing you would change about this machine if it were yours.
-
-RULES, absolute:
-- **You may not delete, downgrade, reword or hide any coded finding.** Append only. If you think
-  a coded flag is wrong, SAY SO in your section and leave the flag standing.
-- **Every number you write is quoted from a document or computed by a tool, never estimated**
-  (MANDATE rail 7). If you do not know a number, write UNKNOWN and name what would settle it.
-- Cite the file each claim came from. Prefer counting to characterising.
-- If you are unsure whether something matters, include it and say you are unsure. Under-reporting
-  costs the PM more than over-reporting.
-Finish with one line to stdout: "vp review: N items for the PM, M root-cause groups"."""
+# The review's instructions are prompts/vp.md (PM-owned), rendered by prompts.py.
 
 
 def review(timeout=1800):
@@ -431,7 +399,12 @@ def review(timeout=1800):
         nomcp.parent.mkdir(parents=True, exist_ok=True)
         nomcp.write_text(json.dumps({"_doc": "no MCP — the VP has no broker and no external tools",
                                      "mcpServers": {}}, indent=1))
-    prompt = REVIEW_PROMPT.format(root=ROOT, data=DATA, agent=HERE)
+    try:
+        import prompts
+        prompt = prompts.render("vp")
+    except Exception as e:
+        print(f"  [FAIL] review     prompt did not render: {e}")
+        return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": str(e)[:200]}
     t0 = time.time()
     try:
         p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
@@ -449,6 +422,62 @@ def review(timeout=1800):
     dur = time.time() - t0
     print(f"  [{'ok ' if ok2 else 'FAIL'}] {'review':<10} {dur:6.1f}s  {tail or err}")
     return {"stage": "review", "ok": ok2, "seconds": round(dur, 1), "out": tail, "err": err}
+
+
+def rotation_name():
+    """The held name with the oldest documents-first re-underwrite (thesis.json), or None."""
+    th = _j(DATA / "thesis.json", {})
+    best = None
+    for tk in held_names():
+        t = th.get(tk) or {}
+        key = str(t.get("last_reunderwrite") or "0000-00-00")
+        if best is None or key < best[1]:
+            best = (tk, key)
+    return best
+
+
+def analyst(timeout=2400):
+    """The overnight ANALYST (Sonnet): a documents-first re-underwrite of the rotation name so
+    the PM judges an analyst's work instead of doing it (David, 2026-09-01 — the human split:
+    the analyst re-derives, the PM decides). Instructions: prompts/analyst.md (PM-owned)."""
+    sys.path.insert(0, str(ENGINE / "research"))
+    import runner
+    ok, msg = runner.auth_check()
+    if not ok:
+        print(f"  [FAIL] analyst    auth: {msg}")
+        return {"stage": "analyst", "ok": False, "seconds": 0, "out": "", "err": msg[:200]}
+    rot = rotation_name()
+    if not rot:
+        print("  [skip] analyst    no held names")
+        return {"stage": "analyst", "ok": True, "seconds": 0, "out": "no held names", "err": ""}
+    tk, last = rot
+    memos = sorted(JOURNAL.glob(f"*_{tk}_*.md"))
+    try:
+        import prompts
+        prompt = prompts.render("analyst", SYMBOL=tk, LAST_REUNDERWRITE=last if last != "0000-00-00" else "never",
+                                MEMOS=", ".join(str(m) for m in memos[-4:]) or "(no memos yet)")
+    except Exception as e:
+        print(f"  [FAIL] analyst    prompt did not render: {e}")
+        return {"stage": "analyst", "ok": False, "seconds": 0, "out": "", "err": str(e)[:200]}
+    nomcp = ENGINE / "config" / "ops_mcp.json"
+    t0 = time.time()
+    try:
+        p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
+                            "--strict-mcp-config", "--mcp-config", str(nomcp),
+                            "--model", runner.job_model("analyst")],
+                           cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=runner.clean_env())
+        out = (p.stdout or "").strip().splitlines()
+        ok2 = p.returncode == 0 and (DATA / "analyst_brief.md").exists() \
+            and (time.time() - (DATA / "analyst_brief.md").stat().st_mtime) < timeout + 60
+        tail = out[-1][:200] if out else ""
+        err = "" if ok2 else (((p.stderr or "").strip().splitlines() or ["no analyst_brief.md written"])[-1][:200])
+    except subprocess.TimeoutExpired:
+        ok2, tail, err = False, "", f"timed out after {timeout}s"
+    except Exception as e:
+        ok2, tail, err = False, "", f"{type(e).__name__}: {e}"[:200]
+    dur = time.time() - t0
+    print(f"  [{'ok ' if ok2 else 'FAIL'}] {'analyst':<10} {dur:6.1f}s  {tk}: {tail or err}")
+    return {"stage": "analyst", "ok": ok2, "seconds": round(dur, 1), "out": tail, "err": err}
 
 
 def _asof_header(title):
@@ -516,6 +545,9 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     # rather than being folded in, so a review failure leaves the coded brief intact.
     if not fast and not no_review:
         stages.append(review())
+        stages.append(analyst())
+    # The packet (desk.py): one file the PM reads first, built from every brief above.
+    stages.append(run("desk", ["python3", "desk.py", "build"], 300))
     bad = [s["stage"] for s in stages if not s["ok"]]
     print(f"\nVP sweep done in {(time.time() - t0) / 60:.1f} min · "
           f"{len(stages) - len(bad)}/{len(stages)} stages ok · {nfind} open watchdog finding(s)")

@@ -26,11 +26,12 @@ overnight for free — plain code and local models, no API cost:
 
 ```mermaid
 flowchart TB
-  subgraph Night["overnight — code + local models, zero API cost"]
+  subgraph Night["overnight — code + local models + analyst (Opus)"]
     direction LR
     SC["scout<br/><small>intel → ranked shortlist</small>"]:::c
-    VP["the VP<br/><small>11-stage sweep → one brief</small>"]:::c
-    BN["the Bench<br/><small>durable queue, primary-document reads</small>"]:::c
+    BN["the Bench<br/><small>durable queue, primary-document reads<br/>22:00, ~5h window</small>"]:::c
+    AN["overnight analyst<br/><small>documents-first re-underwrite<br/>inside VP sweep</small>"]:::ai
+    VP["the VP<br/><small>prep desk from Bench output<br/>04:05 (post-bench)</small>"]:::c
     NW["numbers watchdog<br/><small>audits memo figures vs filings</small>"]:::c
   end
   R["roster<br/><small>org chart as DATA — what ran, how fresh</small>"]:::d
@@ -39,7 +40,10 @@ flowchart TB
   REC["reconcile vs broker"]:::g
   PH["phone"]:::o
 
-  SC --> VP --> BN --> NW --> R --> PM --> REC
+  SC --> BN
+  SC --> VP
+  BN --> VP
+  VP --> AN --> NW --> R --> PM --> REC
   T --> PH
   PM --> PH
   REC -->|"unresolved → alarm"| PH

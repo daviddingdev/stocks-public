@@ -485,6 +485,66 @@ MANUAL = {
             "entered": "2026-08-19",
         },
     },
+    "FLY": {
+        # FLY carries two distinct, non-overlapping long-term debt lines at 2026-06-30 —
+        # "Finance lease liability, less current portion" (1,462,000) and "Notes payable,
+        # less current portion" (19,588,000) — and two current ones, "Finance lease
+        # liability, current" (1,066,000) and "Notes payable, current" (7,410,000). Same
+        # INSG/SEDG shape: rows_for's single-tag pick took FinanceLeaseLiabilityNoncurrent
+        # alone for debt_lt (the smaller of two same-date tags, list-order tie) and
+        # DebtCurrent alone for debt_current (correct value but missing the finance-lease
+        # leg) — both understating. Verified against the balance sheet: Total liabilities
+        # 416,298,000 includes both notes-payable legs, both finance-lease legs, plus
+        # deferred revenue/warrant/other liabilities/leases not part of debt_lt/current by
+        # definition (2026-09-02).
+        "debt_lt": {
+            "value": 21_050_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Notes payable, less current portion 19,588,000 + Finance lease liability, less current portion 1,462,000",
+            "quote": "Finance lease liability, less current portion 1,462 2,004 ... Notes "
+                     "payable, less current portion 19,588 281,441 (condensed consolidated "
+                     "balance sheet, $ in Thousands)",
+            "doc": "10-Q filed 2026-08-11 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-09-02",
+        },
+        "debt_current": {
+            "value": 8_476_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Notes payable, current 7,410,000 + Finance lease liability, current 1,066,000",
+            "quote": "Finance lease liability, current 1,066 1,056 ... Notes payable, "
+                     "current 7,410 7,099 (condensed consolidated balance sheet, $ in Thousands)",
+            "doc": "10-Q filed 2026-08-11 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-09-02",
+        },
+    },
+    "SEDG": {
+        # SEDG (SolarEdge) carries two distinct, non-overlapping long-term debt lines at
+        # 2026-06-30: Convertible senior notes, net (332,332,000) and Finance lease
+        # liabilities (19,171,000), both on the SAME balance sheet caption group "LONG-TERM
+        # LIABILITIES". Our tag map can only pick ONE freshest tag per concept — before this
+        # fix, rows_for picked FinanceLeaseLiabilityNoncurrent alone (both tags share the
+        # same 2026-06-30 freshest date; list-order ties in rows_for go to whichever tag is
+        # listed first, not the larger one) and the card's own fincard-flag:SEDG:debt_lt
+        # text ("no other debt-like XBRL concept found") was WRONG — ConvertibleDebtNoncurrent
+        # is already a debt_lt tag-map member and IS current, it just lost the tie. Same
+        # INSG shape (quality.py-043): summing here avoids understating debt_lt by whichever
+        # leg loses the pick — verified against the balance sheet's own "Total long-term
+        # liabilities" 971,120,000 (which also includes non-debt warranty/deferred-revenue/
+        # operating-lease captions the sum below correctly excludes).
+        "debt_lt": {
+            "value": 351_503_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Convertible senior notes, net 332,332,000 + Finance lease liabilities 19,171,000",
+            "quote": "Convertible senior notes, net 332,332 331,561 ... Finance lease "
+                     "liabilities 19,171 18,558 (condensed consolidated balance sheet, "
+                     "$ in Thousands)",
+            "doc": "10-Q filed 2026-08-05 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-09-02",
+        },
+    },
     "MYGN": {
         # MYGN's current "Capital expenditures" cash-flow line is tagged
         # PaymentsToAcquireOtherProductiveAssets — a real, current XBRL fact (not a
@@ -553,6 +613,21 @@ def _partial_period_days(fig):
             and fig.get("period_start") and fig.get("period_end"):
         return _days(fig["period_start"], fig["period_end"])
     return None
+
+
+def _same_period(fig_a, fig_b, tol_days=7):
+    """True if two F[name] entries cover the same window (start AND end within
+    tol_days of each other — small slop for 52/53-week fiscal calendars tagging the
+    'same' TTM a few days apart). fincard.py-092 PERIOD GATE: an accounting identity
+    across two figures only holds when they are measured over the SAME period; flat
+    run-rate annualizing a partial YTD figure to compare against a DIFFERENT window's
+    TTM (e.g. eps YTD Jan-Jun vs net_income TTM Jul-Jun) is not reconstructing the
+    true TTM, it is comparing two unrelated numbers and calling the gap a defect."""
+    if not (fig_a and fig_b and fig_a.get("period_start") and fig_a.get("period_end")
+            and fig_b.get("period_start") and fig_b.get("period_end")):
+        return False
+    return (abs(_days(fig_a["period_start"], fig_b["period_start"])) <= tol_days
+            and abs(_days(fig_a["period_end"], fig_b["period_end"])) <= tol_days)
 
 
 # PERIODIC reports carry primary financial statements; a proxy/registration/annual-
@@ -1778,43 +1853,59 @@ def build(tk, cik_override=None):
     # error this code cannot safely auto-correct without guessing a scale), and a
     # nonsense/corrupted share count from a bad restatement (fincard.py-080's TBLA case,
     # fixed at the root in _ttm's avg-branch scale guard above).
+    #
+    # PERIOD GATE (fincard.py-092, PM 2026-09-01, closed as a corpus diagnosis: 323/348
+    # income-identity failures were this ONE shape, not 323 separate defects): the
+    # original fix for a partial-period eps_diluted (ARI: 6mo eps 0.27, no TTM/FY yet)
+    # was to flat-annualize it by day-count before comparing to net_income. That is
+    # sound ONLY when net_income covers the annualized-to window. In practice
+    # eps_diluted's only period on file is fiscal YTD (e.g. 2026-01-01..06-30) while
+    # net_income has already assembled a true TTM via ytd-diff quarters (e.g.
+    # 2025-07-01..2026-06-30) — a DIFFERENT 12 months, half of which (H2'25) the flat
+    # H1'26-run-rate never saw. Annualizing does not reconstruct that TTM; it compares
+    # two numbers for different windows and calls the gap a defect (ANGX, ARVN, CENX,
+    # ... 20 of tonight's 22 opens). Gate: only run the identity check when eps_diluted
+    # and net_income cover the SAME window (_same_period) and compare them RAW, no
+    # annualization — which also fixes the inverse bug the annualize-always approach
+    # introduced (KEEL: eps_diluted and net_income already share the same 180d YTD
+    # window, so annualizing eps and comparing to the un-annualized net_income falsely
+    # doubled the implied figure; ratio 2.03x with the raw comparison at 1.0026x).
     eps_d, shd = ttm_vals.get("eps_diluted"), ttm_vals.get("shares_diluted_wavg")
     if ni and eps_d is not None and shd:
-        # eps_diluted can be a partial-period (single YTD period on file, no TTM/FY
-        # yet — e.g. after the FLOW_NO_YTD_DIFF fix above) while net_income is a full
-        # TTM; comparing the two raw would flag every such name as a false identity
-        # break (ARI: 6mo eps_diluted 0.27 vs 12mo net_income — ratio 0.28 with no
-        # data defect at all). Annualize eps by its own day-count first, same
-        # flat-run-rate convention _partial_period_days already uses for pe/ev_over_fcf.
-        _eps_days = _partial_period_days(F.get("eps_diluted"))
-        eps_ann = eps_d * (365.0 / _eps_days) if _eps_days else eps_d
-        implied_ni = eps_ann * shd
-        ratio = implied_ni / ni
-        ok = 0.8 <= ratio <= 1.2
-        card["cross_checks"]["income_identity"] = {
-            "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd,
-            "implied_net_income": round(implied_ni), "ratio": round(ratio, 4), "ok": ok,
-            **({"eps_annualized_from_days": _eps_days} if _eps_days else {})}
-        if not ok:
-            if 0.0001 <= abs(ratio) <= 0.005:
-                cause = ("shares_diluted_wavg looks reported IN THOUSANDS by the filer "
-                         "(ratio ~1/1000 of expected) — do not trust the raw share count")
-            elif abs(ratio) >= 5 or 0 < abs(ratio) <= 0.2:
-                cause = ("shares_diluted_wavg or net_income looks implausible — check for "
-                         "a filer scale error or bad restatement")
-            else:
-                cause = ("could be a proxy-form overwrite, wrong tag pick, or unit "
-                         "mismatch — but also check for a legitimate accounting reason "
-                         "before assuming a defect: preferred dividends removed from "
-                         "the EPS numerator but not from net_income, discontinued-ops/"
-                         "NCI allocation, or 2-decimal EPS rounding on a huge share count")
-            card["flags"].append(
-                f"INCOME IDENTITY FAILS: eps_diluted {eps_d}" +
-                (f" (annualized to {eps_ann:.4g} from a {_eps_days}d partial period)" if _eps_days else "") +
-                f" x shares_diluted_wavg {shd:,.0f} = {implied_ni:,.0f}, a {ratio:.4g}x ratio "
-                f"to stated net_income {ni:,.0f} — {cause} (fincard.py-080). eps_diluted/"
-                f"shares_diluted_wavg feed no derived value (DISPLAY_ONLY) but should not "
-                f"be quoted at face value until resolved.")
+        if not _same_period(F.get("eps_diluted"), F.get("net_income")):
+            card["cross_checks"]["income_identity"] = {
+                "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd,
+                "ok": None,
+                "skipped": "period mismatch: eps_diluted covers "
+                    f"{(F.get('eps_diluted') or {}).get('period')!r}, net_income covers "
+                    f"{(F.get('net_income') or {}).get('period')!r} — not the same "
+                    "window, so the identity does not apply (fincard.py-092)."}
+        else:
+            implied_ni = eps_d * shd
+            ratio = implied_ni / ni
+            ok = 0.8 <= ratio <= 1.2
+            card["cross_checks"]["income_identity"] = {
+                "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd,
+                "implied_net_income": round(implied_ni), "ratio": round(ratio, 4), "ok": ok}
+            if not ok:
+                if 0.0001 <= abs(ratio) <= 0.005:
+                    cause = ("shares_diluted_wavg looks reported IN THOUSANDS by the filer "
+                             "(ratio ~1/1000 of expected) — do not trust the raw share count")
+                elif abs(ratio) >= 5 or 0 < abs(ratio) <= 0.2:
+                    cause = ("shares_diluted_wavg or net_income looks implausible — check for "
+                             "a filer scale error or bad restatement")
+                else:
+                    cause = ("could be a proxy-form overwrite, wrong tag pick, or unit "
+                             "mismatch — but also check for a legitimate accounting reason "
+                             "before assuming a defect: preferred dividends removed from "
+                             "the EPS numerator but not from net_income, discontinued-ops/"
+                             "NCI allocation, or 2-decimal EPS rounding on a huge share count")
+                card["flags"].append(
+                    f"INCOME IDENTITY FAILS: eps_diluted {eps_d} x shares_diluted_wavg "
+                    f"{shd:,.0f} = {implied_ni:,.0f}, a {ratio:.4g}x ratio to stated "
+                    f"net_income {ni:,.0f} — {cause} (fincard.py-080/092). eps_diluted/"
+                    f"shares_diluted_wavg feed no derived value (DISPLAY_ONLY) but should not "
+                    f"be quoted at face value until resolved.")
 
     # TAX-DRIVEN EARNINGS (fincard.py-085): a card can be internally CONSISTENT (eps x
     # shares ties to net_income) and still be externally MEANINGLESS — LYFT's FY2025
@@ -1825,8 +1916,14 @@ def build(tk, cik_override=None):
     # disagreeing in sign or magnitude does. Flag, never hide: the earnings-derived
     # family (pe, net_margin_pct, roe_pct, eps_diluted) is unreliable; fcf-derived
     # values (fcf, ev_over_fcf, fcf_yield_pct) are cash, not earnings, and unaffected.
+    # PERIOD GATE (fincard.py-092): same defect as the income-identity check above —
+    # pretax_income's only period on file can be a fiscal-YTD window that does not
+    # match net_income's assembled TTM (ARVN: pretax YTD 2026-01-01..06-30 vs net_income
+    # TTM 2025-07-01..2026-06-30 — a 1105% "gap" between two different 12/6-month
+    # windows, not a real tax item). Only compare when both cover the same window.
     pretax = ttm_vals.get("pretax_income")
-    if ni is not None and pretax is not None and ni != 0:
+    if ni is not None and pretax is not None and ni != 0 \
+            and _same_period(F.get("net_income"), F.get("pretax_income")):
         sign_flip = pretax != 0 and (ni > 0) != (pretax > 0)
         gap_pct = abs(ni - pretax) / abs(ni) * 100
         if sign_flip or gap_pct > 50:

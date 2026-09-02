@@ -55,6 +55,7 @@ CONF = ENGINE / "config"
 sys.path.insert(0, str(HERE))
 import feeds  # noqa: E402  (fh_get, cik_map, UA, universe)
 import loop   # noqa: E402
+import learn  # noqa: E402  (kpi_breaches: reads data/kpis.json sources, judges hit/miss)
 
 STATE_F = DATA / "trigger_state.json"
 ALERTS_F = DATA / "alerts.json"
@@ -385,6 +386,23 @@ def run():
                                f"Agent book: {', '.join(t for t, _ in members)} are all '{g}' — "
                                f"{w:.0f}% of book moves together. One macro headline hits all of them.",
                                book="Agent")
+
+    # --- 8: KPI breach (triggers.py-095) — the number a thesis actually lives on, checked
+    # every run instead of waiting for the Friday learning brief. learn.py owns reading the
+    # source (fincard:<field> etc.) and judging hit/miss; this rule only turns a miss on a
+    # HELD name into a same-day alert (reflect.ev_kpi already turns it into a PM finding
+    # after the fact — this makes it same-day). ACTION only when the name is agent-held.
+    for b in learn.kpi_breaches():
+        tk = b["symbol"]
+        if tk not in set(held):
+            continue
+        books = [n for n, pos in (("BROKERA", jpm_pos), ("Agent", ag_pos)) if tk in pos]
+        book = "+".join(books)
+        val = b["value"]
+        vs = f"{val:,.0f}" if isinstance(val, (int, float)) and abs(val) >= 1000 else f"{val}"
+        fired += alert(state, c, f"kpi:{tk}:{b['kpi']}", "kpi breach", tk,
+                       f"{tk} {b['kpi']} {vs} vs expect {b['expect']} — {b['why']}",
+                       action=(tk in ag_pos), book=book)
 
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "

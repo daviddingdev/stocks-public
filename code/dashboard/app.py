@@ -47,7 +47,7 @@ LABELS = {
     "imvt1402-market.md": "IMVT-1402 market", "imvt1402-omniab-economics.md": "IMVT-1402 economics",
     "tracker-log.md": "Tracker log", "model.csv": "Financial snapshot", "quarterly.csv": "Quarterly series",
     "ARCHITECTURE.md": "Architecture", "EVALUATION-FRAMEWORK.md": "Evaluation framework",
-    "COMMANDS.md": "Commands", "RUNBOOK.md": "Research runbook",
+    "COMMS.md": "Comms protocol", "RUNBOOK.md": "Research runbook",
 }
 ORDER = list(LABELS.keys())
 GROUPS = [("Reports & analysis", "analysis"), ("Updates", "analysis/updates"),
@@ -225,7 +225,7 @@ def boards():
 
 def sysdocs():
     e = ROOT / "_engine"
-    return [e / r for r in ["INFORMATION-ARCHITECTURE.md", "ARCHITECTURE.md", "COMMANDS.md",
+    return [e / r for r in ["INFORMATION-ARCHITECTURE.md", "ARCHITECTURE.md", "agent/COMMS.md",
             "research/EVALUATION-FRAMEWORK.md", "research/RUNBOOK.md"] if (e / r).exists()]
 
 def a(p):

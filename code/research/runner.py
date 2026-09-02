@@ -103,30 +103,34 @@ def clean_env():
     return env
 
 
-def job_model(role=None):
-    """Model for a headless session. David's standing instruction (2026-08-04): research
-    and recommendation sessions are always Opus, tracking the most recent release — the
-    'opus' alias resolves to the latest.
+def job_models(role=None):
+    """ORDERED model list for a headless session; the launcher tries them in turn.
 
-    With a `role`, the ORG CHART decides (agent/roster.py `model` field), because a role's
-    cost/capability belongs next to its purpose and charter rather than in a --model flag
-    at each call site. That is how the fixer stayed on Opus for weeks after its work had
-    become mechanical. keys.json `claude_model` still overrides everything, globally."""
+    David 2026-08-04: research and recommendation sessions are always Opus, tracking the
+    most recent release (the `opus` alias). David 2026-09-01: ONLY the PM runs on the best
+    model available (`best` tier = Fable 5.1 today); everything else stays on the best Opus
+    or Sonnet. Tiers live in agent/roster.py CLAUDE_TIERS — one place to edit when a newer
+    model lands; a role's tier comes from the ORG CHART (roster `model` field) because
+    cost/capability belongs next to purpose and charter. keys.json `claude_model` still
+    overrides everything, globally."""
     try:
         override = json.loads((CONF / "keys.json").read_text()).get("claude_model")
     except Exception:
         override = None
     if override:
-        return override
-    if role:
-        try:
-            import sys as _s
-            _s.path.insert(0, str(ENGINE / "agent"))
-            import roster
-            return roster.claude_model(role)
-        except Exception:
-            pass
-    return "opus"
+        return [override]
+    try:
+        import sys as _s
+        _s.path.insert(0, str(ENGINE / "agent"))
+        import roster
+        return roster.claude_models(role) if role else list(roster.CLAUDE_TIERS["opus"])
+    except Exception:
+        return ["opus"]
+
+
+def job_model(role=None):
+    """The first choice for a role — see job_models() for the fallback order."""
+    return job_models(role)[0]
 
 
 _CHILDREN = {}   # pid -> Popen, so this process reaps what it spawned

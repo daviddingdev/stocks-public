@@ -508,6 +508,24 @@ _ACTUAL_RE = re.compile(
     r"event of default (?:has|had) occurred|declared (?:a |an )?(?:event of )?default)\b", re.I)
 
 
+def _is_hypothetical(quote):
+    """bench.py-093: _HYPOTHETICAL_RE alone missed a mid-sentence conditional whose 'if' sits
+    well before the actual-sounding phrase it governs — INVX's 'Additionally, if at any time
+    an Event of Default ... has occurred and is continuing or if Excess Availability ... is
+    less than 20%, the Company must maintain ...' scored ACTUAL credit off '(?:has|have)
+    occurred' even though that phrase is inside an unresolved 'if' clause, not a fact. Any
+    'if' preceding the _ACTUAL_RE match (other than 'even if', which concedes the fact) means
+    the actual-sounding phrase is conditional, not live."""
+    if _HYPOTHETICAL_RE.search(quote):
+        return True
+    m = _ACTUAL_RE.search(quote)
+    if m:
+        prefix = quote[:m.start()]
+        if re.search(r"\bif\b", prefix, re.I) and not re.search(r"\beven\s+if\b", prefix, re.I):
+            return True
+    return False
+
+
 def _specificity(quote):
     """0-10, coded — see bench.py-030 note above `rank()`. Rare at the top by design.
 
@@ -521,9 +539,10 @@ def _specificity(quote):
     date = bool(_DATE_RE.search(quote))
     wc = len(quote.split())
     length_ok = 8 <= wc <= 70
-    if _ACTUAL_RE.search(quote):
+    hyp = _is_hypothetical(quote)
+    if _ACTUAL_RE.search(quote) and not hyp:
         s = 6 + (2 if num else 0)
-    elif _CHANGE_RE.search(quote) and not _HYPOTHETICAL_RE.search(quote):
+    elif _CHANGE_RE.search(quote) and not hyp:
         s = (4 if num else 0) + 4
     else:
         s = 4 if num else 0
