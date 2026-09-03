@@ -54,8 +54,31 @@ import feeds                    # noqa: E402  (cik_map cache, UA)
 UA = feeds.UA
 # forms worth having on file per name (count each). 8-A = security terms;
 # PREM/DEFM14A = deal terms — exactly the class of document the LBRDP error never read.
+# 10-12B(/A) = Form 10 registration for a spin-off; its EX-99.1 is the information statement.
 FORM_COUNTS = {"10-K": 1, "10-Q": 2, "8-K": 4, "DEF 14A": 1, "DEFM14A": 1,
-               "PREM14A": 1, "8-A12B": 1, "8-A12G": 1}
+               "PREM14A": 1, "8-A12B": 1, "8-A12G": 1, "10-12B": 1, "10-12B/A": 1}
+# filings whose primaryDocument is only the cover/body — the load-bearing numbers sit in
+# an EX-99.x exhibit (earnings/supplemental-financial exhibits, spin-off info statements)
+# that SEC's submissions API never lists (dossier.py-096: MBGL's Ex-99.2 supplemental
+# financials and Form 10 info statement were both silently absent from every dossier).
+EXHIBIT_FORMS = {"8-K", "10-12B", "10-12B/A"}
+EXHIBIT_TYPE_RE = re.compile(r"^EX-99(\.\d+)?$", re.I)
+
+
+def list_exhibits(cik, acc):
+    """EX-99.x exhibits in a filing's index page: [(type, document_filename), ...]."""
+    url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{acc}-index.htm"
+    try:
+        idx = get(url)
+    except Exception:
+        return []
+    out = []
+    for row in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", idx):
+        cells = [htmllib.unescape(re.sub(r"<[^>]+>", "", c)).strip()
+                 for c in re.findall(r"(?is)<td[^>]*>(.*?)</td>", row)]
+        if len(cells) >= 4 and EXHIBIT_TYPE_RE.match(cells[3]):
+            out.append((cells[3].upper(), cells[2]))
+    return out
 FACT_TAGS = {
     "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],
     "net_income": ["NetIncomeLoss"],
@@ -123,7 +146,9 @@ def build(tk, cik_override=None):
         if form in counts and counts[form] < FORM_COUNTS[form] and doc:
             counts[form] += 1
             picked.append({"form": form, "date": date, "acc": acc, "doc": doc})
+    extra = []
     for f in picked:
+        form_clean = f["form"].replace(" ", "").replace("/", "")
         url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
         try:
             txt = strip_html(get(url))
@@ -132,9 +157,30 @@ def build(tk, cik_override=None):
             continue
         if len(txt) > 3_000_000:
             txt, f["truncated"] = txt[:3_000_000], True
-        name = f"{f['date']}_{f['form'].replace(' ', '').replace('/', '')}.txt"
+        name = f"{f['date']}_{form_clean}.txt"
         (d / "filings" / name).write_text(txt)
         f["file"], f["chars"] = f"filings/{name}", len(txt)
+
+        if f["form"] not in EXHIBIT_FORMS:
+            continue
+        for ex_type, ex_doc in list_exhibits(cik, f["acc"]):
+            if ex_doc == f["doc"]:
+                continue  # already fetched as the primary document
+            ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{ex_doc}"
+            ex = {"form": f["form"], "date": f["date"], "acc": f["acc"], "doc": ex_doc, "exhibit": ex_type}
+            try:
+                ex_txt = strip_html(get(ex_url))
+            except Exception as e:
+                ex["error"] = str(e)[:80]
+                extra.append(ex)
+                continue
+            if len(ex_txt) > 3_000_000:
+                ex_txt, ex["truncated"] = ex_txt[:3_000_000], True
+            ex_name = f"{f['date']}_{form_clean}_{ex_type.replace(' ', '')}.txt"
+            (d / "filings" / ex_name).write_text(ex_txt)
+            ex["file"], ex["chars"] = f"filings/{ex_name}", len(ex_txt)
+            extra.append(ex)
+    picked.extend(extra)
 
     facts = {}
     try:

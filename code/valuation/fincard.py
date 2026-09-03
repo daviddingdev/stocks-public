@@ -444,6 +444,118 @@ MANUAL = {
             "entered": "2026-08-14",
         },
     },
+    "BMBL": {
+        # BMBL (Bumble) tags no cash-capex concept at all — companyfacts has none of the
+        # FLOW["capex"] tags (checked full us-gaap namespace: only PP&E stock/depreciation
+        # and unrelated PaymentsToAcquireBusinesses/Intangibles). "Capital expenditures" is
+        # printed as its own cash-flow-statement line every period, same LYFT shape (a real
+        # line the company just doesn't tag).
+        "capex": {
+            "value": 11_697_000,
+            "period": "TTM 2025-07-01..2026-06-30 (FY25 11,682 + H1'26 5,935 - H1'25 5,920)",
+            "period_end": "2026-06-30",
+            "formula": "FY2025 11,682,000 + H1-2026 5,935,000 - H1-2025 5,920,000",
+            "quote": "Capital expenditures ( 5,935 ) ( 5,920 )",
+            "doc": "10-Q filed 2026-08-06 (H1 legs, period 2026-06-30) + 10-K filed 2026-03-16 "
+                   "('Capital expenditures (11,682) (9,319) (14,935)', FY2025 leg) — "
+                   "condensed consolidated statements of cash flows",
+            "entered": "2026-09-03",
+        },
+    },
+    "PRDO": {
+        # PRDO's pretax_income tag (IncomeLossFromContinuingOperationsBeforeIncomeTaxes-
+        # ExtraordinaryItemsNoncontrollingInterest) died at 2015-12-31. NOT added as a global
+        # FLOW["pretax_income"] alternate: the successor tag
+        # IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic is fresh through
+        # 2026-06-30, but rows_for picks freshest-tag-wins across ALL alternates — adding
+        # "...Domestic" globally risks silently dropping the foreign leg for any OTHER
+        # issuer that still files a matching "...Foreign" split fresh (PRDO's own Foreign
+        # tag died in 2014, so "Domestic" alone equals total pretax income for THIS issuer,
+        # confirmed against the printed income statement's own line label, "Pretax income
+        # from domestic-based operations" — not a segment split PRDO discloses further).
+        "pretax_income": {
+            "value": 232_429_000,
+            "period": "TTM 2025-07-01..2026-06-30 (FY25 216,836 + H1'26 128,336 - H1'25 112,743)",
+            "period_end": "2026-06-30",
+            "formula": "FY2025 216,836,000 + H1-2026 128,336,000 - H1-2025 112,743,000",
+            "quote": "PRETAX INCOME 216,836 (10-K); Pretax income from domestic-based "
+                     "operations $ 128,336 / $ 112,743 (10-Q, H1'26 vs H1'25 columns)",
+            "doc": "10-Q filed 2026-08-06 (H1 legs, period 2026-06-30) + 10-K filed 2026-02-19 "
+                   "('PRETAX INCOME 216,836', FY2025 leg) — consolidated statements of income",
+            "entered": "2026-09-03",
+        },
+    },
+    "ONTO": {
+        # ConvertibleLongTermNotesPayable (ONTO's 0.00% Convertible Senior Notes due 2031,
+        # 1,471,731,000 at 2026-06-30, first issued May 2026 — the 10-Q states outright "the
+        # Company has classified the 2031 Notes as a non-current liability") is NOT a safe
+        # global FLOW/INSTANT debt_lt alternate despite the self-describing name: grepped
+        # every card on disk and found 10 OTHER tickers (CNVS, COLL, COSM, IPW, NTNX, PLUG,
+        # SNDX, SHAZW, VNET, WIX) that ALSO report this tag ALONGSIDE a separate debt
+        # instrument at the same date (COLL: LongTermLoansPayable 797,824,000 +
+        # ConvertibleLongTermNotesPayable 238,733,000, both real and additive; PLUG: a
+        # 19,343,000 finance lease + a 577,998,000 convertible note — a 30x understatement
+        # if rows_for's freshest-tag-wins pick took only one). ONTO itself is clean (this is
+        # its ONLY debt-like concept, verified against the 10-Q — no double-count risk), but
+        # a global alternate can't know that per-issuer; MANUAL, scoped to ONTO only
+        # (fincard.py-096, 2026-09-03 — caught by the mandatory blast-radius grep BEFORE
+        # shipping, not after).
+        "debt_lt": {
+            "value": 1_471_731_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "0.00% Convertible Senior Notes due 2031, principal amount, classified non-current",
+            "quote": "Total senior convertible notes 1,471,731 ... the Company has classified "
+                     "the 2031 Notes as a non-current liability",
+            "doc": "10-Q filed 2026-08-06 (period 2026-06-30) — Note 7 debt disclosure",
+            "entered": "2026-09-03",
+        },
+        "debt_current": {
+            "value": 0,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "the 2031 Notes are classified entirely non-current; no other debt-like concept found",
+            "quote": "the Company has classified the 2031 Notes as a non-current liability",
+            "doc": "10-Q filed 2026-08-06 (period 2026-06-30) — Note 7 debt disclosure",
+            "entered": "2026-09-03",
+        },
+    },
+    "RMR": {
+        # RMR carries two distinct, non-overlapping non-current debt lines at 2026-06-30:
+        # "Mortgage notes payable, net" (138,807,000, tagged NotesPayable, already resolved
+        # into debt_lt) and "Secured revolving credit facility" (25,000,000, tagged bare
+        # "LineOfCredit" — not in our debt_lt/debt_current alternates at all, current or
+        # noncurrent). Both sit in the SAME non-current section of the balance sheet, below
+        # "Total current liabilities" and above "Total liabilities" (10-Q: maturity January
+        # 22, 2028, well outside 12 months) — same INSG/SEDG/FLY shape, single-tag pick
+        # missing the second instrument entirely (understating debt_lt by 25,000,000/18%).
+        "debt_lt": {
+            "value": 163_807_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Mortgage notes payable, net 138,807,000 + Secured revolving credit facility 25,000,000",
+            "quote": "Secured financing facility, net of current portion — 18,260 ... Secured "
+                     "revolving credit facility 25,000 — ... Mortgage notes payable, net "
+                     "138,807 136,168 (condensed consolidated balance sheet, $ in Thousands)",
+            "doc": "10-Q filed 2026-08-05 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-09-03",
+        },
+        # Same LPLA shape: the LineOfCredit hit that leaves debt_current UNKNOWN is the
+        # SAME non-current revolver draw already counted in debt_lt above (matures 2028) —
+        # not a second, current instrument. The balance sheet's own "Current portion of
+        # secured financing facility, net" line reads "—" (zero) at 2026-06-30 (26,326,000
+        # at the prior period end only), and no other current-debt line exists.
+        "debt_current": {
+            "value": 0,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "no current-debt line at 2026-06-30 — Current portion of secured financing facility reads \"—\"",
+            "quote": "Current portion of secured financing facility, net — 26,326 (condensed "
+                     "consolidated balance sheet, $ in Thousands, current col is 2026-06-30)",
+            "doc": "10-Q filed 2026-08-05 (period 2026-06-30) — condensed consolidated balance sheet",
+            "entered": "2026-09-03",
+        },
+    },
     "INSG": {
         # INSG (Inseego) carries two distinct, non-overlapping long-term debt lines at
         # 2026-06-30: a drawn revolver (LongTermLineOfCredit) and secured notes
@@ -543,6 +655,29 @@ MANUAL = {
                      "$ in Thousands)",
             "doc": "10-Q filed 2026-08-05 (period 2026-06-30) — condensed consolidated balance sheet",
             "entered": "2026-09-02",
+        },
+    },
+    "LPLA": {
+        # LPLA's debt_current tag (LongTermDebtCurrent) died at 2015-09-30, and
+        # OtherLongTermDebt=276,000,000 at 2026-06-30 (the revolving credit facility draw)
+        # matched _debt_like_hits as an unmapped debt-like concept, tripping "UNKNOWN, not
+        # zero" — but it is NOT a missed line: Note 9's own table shows the $276,000,000
+        # revolver is a component OF the $7,460,510,000 "Corporate Debt and Other
+        # Borrowings, Net" total already captured whole by the debt_lt tag (LongTermDebt).
+        # Every instrument on the maturity schedule (Term Loan A + 11 tranches of Senior
+        # Notes + the Revolving Credit Facility) matures 2027 or later — nothing is due
+        # within 12 months, so debt_current is genuinely, provably $0, not unknown.
+        "debt_current": {
+            "value": 0,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "every corporate-debt/revolver tranche matures 5/2027 or later — zero due within 12 months",
+            "quote": "Term Loan A ... 12/5/2028; 2027 Senior Notes ... 5/20/2027; [...]; "
+                     "Revolving Credit Facility 276,000 ... 5/20/2029; Corporate Debt and "
+                     "Other Borrowings, Net $ 7,460,510 $ 7,258,694 (Note 9 - Corporate Debt "
+                     "and Other Borrowings, Net)",
+            "doc": "10-Q filed 2026-08-03 (period 2026-06-30) — Note 9 debt table + maturity schedule",
+            "entered": "2026-09-03",
         },
     },
     "MYGN": {
@@ -1199,7 +1334,28 @@ MEZZANINE_TAGS = ("MinorityInterest", "TemporaryEquityCarryingAmountAttributable
 # (120,524,000 + 97,393,000 = 217,917,000, the exact reported 17.0% gap).
 
 
-def _mezzanine_equity(gaap, asof, parent_eq):
+# RMR: MinorityInterest (174,376,000 at 2026-06-30) is already the reported "Total
+# noncontrolling interests" line on the face of the balance sheet — the sum of "Noncontrolling
+# interest in The RMR Group LLC" (173,275,000, the redeemable Class A Units ABP Trust holds)
+# and "Noncontrolling interest in other consolidated entities" (1,101,000), both presented
+# INSIDE total equity, not as mezzanine between liabilities and equity. RedeemableNon-
+# controllingInterestEquityCarryingAmount (173,275,000, exact match to the "in RMR LLC" sub-
+# line) is a disclosure-only re-tag of a COMPONENT already inside MinorityInterest, not an
+# additional instrument — summing both (as the U/Unity dedup only catches when the values are
+# IDENTICAL) double-counted by 173,275,000, turning a footing identity that closes exactly
+# (315,014,000 liabilities + 398,562,000 total-equity-incl-NCI = 713,576,000 assets, verified
+# against the 10-Q's own subtotal lines) into a manufactured 122% "gap" (fincard.py-096,
+# 2026-09-03). Scoped per-ticker, not a MEZZANINE_TAGS change: the ATNI precedent this
+# function documents (MinorityInterest 120,524,000 + TemporaryEquity...Including...
+# 97,393,000 = 217,917,000, genuinely additive) uses a DIFFERENT tag pairing and a smaller-
+# than-MinorityInterest redeemable figure too, so a magnitude heuristic would have silently
+# broken ATNI to fix RMR.
+MEZZANINE_EXCLUDE = {
+    "RMR": {"RedeemableNoncontrollingInterestEquityCarryingAmount"},
+}
+
+
+def _mezzanine_equity(gaap, asof, parent_eq, ticker=None):
     """Sum of NCI/temporary-equity concepts reported AT the balance-sheet date. Read from
     the ALREADY-FETCHED companyfacts blob, not a fresh companyconcept call: the per-tag
     companyconcept endpoint served an empty units.USD for WELL's MinorityInterest (939.184M
@@ -1208,7 +1364,10 @@ def _mezzanine_equity(gaap, asof, parent_eq):
     nothing is found, so the caller can tell 'no mezzanine equity' from 'not present'."""
     total, found, got_minority = 0.0, False, False
     seen_vals = set()
+    exclude = MEZZANINE_EXCLUDE.get((ticker or "").upper(), ())
     for tag in MEZZANINE_TAGS:
+        if tag in exclude:
+            continue
         rows = [r for r in gaap.get(tag, {}).get("units", {}).get("USD", [])
                 if r.get("end") == asof and r.get("val") is not None]
         if rows:
@@ -1288,7 +1447,7 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
     gap = implied - tl
     err = abs(gap) / implied
     if err > tol:
-        mezz = _mezzanine_equity(gaap, asof, eq)
+        mezz = _mezzanine_equity(gaap, asof, eq, ticker=card.get("ticker"))
         if mezz:
             implied2 = ta - (eq + mezz)
             gap2 = implied2 - tl

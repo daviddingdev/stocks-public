@@ -100,6 +100,36 @@ def corp_actions(c, tk):
     return raw if isinstance(raw, list) else [raw]
 
 
+def _kpi_set_ts(sym, kpi_name):
+    """The 'set' timestamp of a kpis.json row (sym, kpi) — read directly rather than via
+    learn.kpi_breaches(), which doesn't carry it through. learn.py is coo-owned; this stays
+    a plain file read inside triggers.py's own rule."""
+    for r in (_j(DATA / "kpis.json", {}) or {}).get(sym, []):
+        if r.get("kpi") == kpi_name:
+            return r.get("set")
+    return None
+
+
+def _trading_days_since(iso_ts):
+    """Weekday count between an ISO timestamp and now (today counts as 0). Used to keep
+    Rule 8 from ACTIONing on a KPI the currently-running PM session just set two minutes
+    earlier (triggers.py-099, 2026-09-02: a KPI set at 14:13Z fired a second concurrent PM
+    session at 14:15Z judging a number that session itself had just written)."""
+    if not iso_ts:
+        return 999
+    try:
+        d0 = dt.datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).date()
+    except Exception:
+        return 999
+    d1 = dt.datetime.now(dt.timezone.utc).date()
+    days, cur = 0, d0
+    while cur < d1:
+        cur += dt.timedelta(days=1)
+        if cur.weekday() < 5:
+            days += 1
+    return days
+
+
 def cum_distributions(c, tk, as_of=None):
     """Total $/share tk has distributed with ex_date <= as_of (default today). Used to keep
     a position's cost basis and a thesis's implied value comparable to a post-distribution
@@ -400,9 +430,12 @@ def run():
         book = "+".join(books)
         val = b["value"]
         vs = f"{val:,.0f}" if isinstance(val, (int, float)) and abs(val) >= 1000 else f"{val}"
+        # triggers.py-099: a KPI the PM itself set less than one trading day ago is that
+        # PM's own number to judge, not a fresh event — ALERT still fires, ACTION does not.
+        fresh = _trading_days_since(_kpi_set_ts(tk, b["kpi"])) < 1
         fired += alert(state, c, f"kpi:{tk}:{b['kpi']}", "kpi breach", tk,
                        f"{tk} {b['kpi']} {vs} vs expect {b['expect']} — {b['why']}",
-                       action=(tk in ag_pos), book=book)
+                       action=(tk in ag_pos and not fresh), book=book)
 
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "

@@ -245,7 +245,16 @@ FORWARD_WORDS = ("guide", "guidance", "target", "estimate", "expected", "forecas
 # H1 capex delta (50,718 - 20,786 = 29,932K) fell through to the coincidental-card-concept
 # check and cried MISLABEL against a 2024 balance-sheet figure with no relationship to it
 # (numwatch.py-028, 2026-08-20). Re-derivation is the memo audit's job, not this watchdog's.
+# "run-rate"/"midpoint" (numbers-096 follow-up, 2026-09-03): MBGL's thesis note —
+# "the standalone run-rate is H2 x 2 = $733.0M not the $752.5M midpoint" — annualizes one
+# filing figure (H2 x2) and averages a guided range (the midpoint) into two numbers that,
+# like the LYFT capex delta above, are real, correct, and by construction printed nowhere
+# in a single filing line. Confirmed against MBGL's dossier after dossier.py-096 added the
+# missing Ex-99.2/Form-10 exhibits: no filing text contains "733" or "752" anywhere, so
+# these were never going to resolve to in-filing — the same non-resolvable-by-design shape
+# as every other DELTA_WORDS entry, not evidence of a bad number.
 DELTA_WORDS = ("delta", "swing", " vs ", "vs.", "up from", "down from", "increase", "decrease",
+               "run-rate", "midpoint",
                "reserve build", "reserve release")
 # "reserve build"/"release": standard accounting shorthand for an increase/decrease in a
 # reserve balance — itself a delta by definition, but neither the word nor the figure

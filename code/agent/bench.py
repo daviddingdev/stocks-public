@@ -714,6 +714,38 @@ def cards(limit=15):
     return built
 
 
+def _fmt_m(v):
+    """v in dollars -> '$-931.3M' etc.; None/missing -> 'n/a'."""
+    if v is None:
+        return "n/a"
+    return f"${v / 1_000_000:,.1f}M"
+
+
+def _fincard_line(tk):
+    """bench.py-097: net_cash, fcf, ev_over_fcf, market_cap (+ card build date, flag count)
+    from names/<TK>/fincard.json, so the balance-sheet kill happens reading the brief instead
+    of the PM re-deriving it with an ad-hoc loop over fincard.json every morning (80% of
+    channel-13 leads died on that pass on 2026-09-01/02 alone). ev_over_fcf isn't a fincard
+    field (fincard.py is numbers-owned) — computed here from its own enterprise_value/fcf."""
+    f = NAMES / tk / "fincard.json"
+    if not f.exists():
+        return None
+    c = _j(f, {})
+    d = c.get("derived") or {}
+
+    def v(key):
+        row = d.get(key)
+        return row.get("value") if isinstance(row, dict) else None
+
+    net_cash, fcf, ev, mcap = v("net_cash"), v("fcf"), v("enterprise_value"), v("market_cap")
+    ev_over_fcf = "n/m" if not fcf else f"{ev / fcf:.1f}x" if ev is not None else "n/a"
+    flags = c.get("flags") or []
+    built = (c.get("built") or "?")[:10]
+    return (f"- **Balance sheet** (`fincard` built {built}, {len(flags)} flag(s)): "
+            f"net cash {_fmt_m(net_cash)} · FCF {_fmt_m(fcf)} · EV/FCF {ev_over_fcf} · "
+            f"mkt cap {_fmt_m(mcap)}")
+
+
 def brief(top=25):
     """bench_brief.md — the overnight read, written up for the PM's desk.
 
@@ -786,8 +818,11 @@ def brief(top=25):
         L += [f"### {r['ticker']} — {r.get('best', '?')}/10 · {len(r.get('evidence', []))} quote(s)",
               f"- **The story it contradicts:** {e.get('narrative') or '—'}",
               f"- **Why it matters:** {e.get('why') or '—'}",
-              f"- **Verbatim, from `{e.get('doc') or '?'}`:** > {(e.get('quote') or '—')[:600]}",
-              ""]
+              f"- **Verbatim, from `{e.get('doc') or '?'}`:** > {(e.get('quote') or '—')[:600]}"]
+        fc = _fincard_line(r["ticker"].upper())
+        if fc:
+            L.append(fc)
+        L.append("")
     if len(fresh) > top:
         L.append(f"_…and {len(fresh) - top} more in `data/bench.json`._\n")
     already = [r for r in rows if r["ticker"].upper() in held or r["ticker"].upper() in seen]

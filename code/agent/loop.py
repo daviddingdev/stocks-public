@@ -80,6 +80,21 @@ def launch(mode, attempt=1, model_idx=0):
             return {"ok": True, "msg": "code-sync complete (no model)"}
         except Exception as e:
             print(f"code-sync failed ({str(e)[:100]}) — falling back to claude session")
+    if mode == "trade":
+        # ONE PM AT A TIME (ask triggers.py-099, 2026-09-02): the KPI-breach ACTION launched a
+        # second PM session at 14:15Z while the 14:05Z one was alive — two writers on
+        # BOOK.md / trades.json / thesis.json. A live pid refuses the launch; the trigger's
+        # alert still fires and the live session sees it in its feed.
+        pidf = DATA / "trade_session.pid"
+        try:
+            old_pid = int(pidf.read_text().strip())
+            import os as _os
+            _os.kill(old_pid, 0)
+            with open(f"/proc/{old_pid}/cmdline", "rb") as fh:
+                if b"claude" in fh.read():
+                    return {"ok": False, "msg": f"trade session already live (pid {old_pid}) — not launching a second PM"}
+        except Exception:
+            pass
     ok, msg = runner.auth_check()
     if not ok:
         return {"ok": False, "msg": msg}
@@ -115,6 +130,10 @@ def launch(mode, attempt=1, model_idx=0):
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
                             start_new_session=True, env=runner.clean_env())
     if mode == "trade":
+        try:
+            (DATA / "trade_session.pid").write_text(str(proc.pid))
+        except Exception:
+            pass
         # order-lifecycle experiment (memo 2026-08-08): after the session exits, a detached
         # watcher runs `loop.py reconcile` — real broker ledger vs. the agent's claimed states.
         # Fast broker sync FOR AS LONG AS THE PM IS LIVE (David, 2026-08-18: "when PM is
