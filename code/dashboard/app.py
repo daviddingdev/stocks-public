@@ -19,7 +19,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import markdown
@@ -109,13 +111,38 @@ def cik_of(sym):
     return ticker_map().get(sym.upper())
 
 _CACHE = {}
-def cached(k, ttl, fn):
-    now = time.time()
-    if k in _CACHE and now - _CACHE[k][0] < ttl:
-        return _CACHE[k][1]
-    v = fn()
-    _CACHE[k] = (now, v)
-    return v
+_CACHE_LOCKS = {}
+_CACHE_GUARD = threading.Lock()
+def _cache_lock(k):
+    with _CACHE_GUARD:
+        return _CACHE_LOCKS.setdefault(k, threading.Lock())
+
+def cached(k, ttl, fn, stale=False):
+    """TTL cache, single-flight: a second caller arriving mid-fetch waits for the first
+    result instead of fetching again (a phone and a laptop opening together used to pay
+    every upstream call twice). stale=True hands back the expired value at once and
+    refreshes it on a background thread — for panes that are minutes-old by nature (the
+    digest), never for prices or broker state (David 2026-09-03: "data feels slow")."""
+    hit = _CACHE.get(k)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    lock = _cache_lock(k)
+    if stale and hit:
+        if lock.acquire(blocking=False):
+            def refresh():
+                try:
+                    _CACHE[k] = (time.time(), fn())
+                finally:
+                    lock.release()
+            threading.Thread(target=refresh, daemon=True).start()
+        return hit[1]
+    with lock:
+        hit = _CACHE.get(k)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        v = fn()
+        _CACHE[k] = (time.time(), v)
+        return v
 
 def edgar_filings(cik, n=20):
     def fetch():
@@ -528,6 +555,11 @@ def sig_cls(s):
     # "Speculative Buy" must read as caution (amber), not buy, so the warn set wins first;
     # "Pass" is a bearish verdict and colors accordingly.
     s = (s or "").strip().lower()
+    if "not a buy" in s:          # the substring hazard the 2026-08-27 hunt recorded
+        return "sell"
+    if s.startswith("buy below") or s.startswith("follow"):
+        # v0.3 scale (EVALUATION-FRAMEWORK §Verdict): actionable at a price, not yet — amber
+        return "warn"
     if any(k in s for k in ("caution", "warn", "mixed", "risk", "speculative")):
         return "warn"
     if any(k in s for k in ("bear", "sell", "negative", "avoid", "pass")):
@@ -554,10 +586,29 @@ def render_lenses(cdir):
     o = data.get("overall", {})
     out = ["<div class=lenswrap>"]
     if o:
+        # v0.3 verdict fields (EVALUATION-FRAMEWORK §Verdict): the price that changes the answer
+        def _m(v):
+            try:
+                return f"${float(v):,.2f}"
+            except Exception:
+                return "—"
+        vline = ""
+        if o.get("buy_below") is not None or o.get("base") is not None:
+            parts = []
+            if o.get("bar"):
+                parts.append(f"{html.escape(str(o['bar']))} bar")
+            if o.get("buy_below") is not None:
+                parts.append(f"buy below <b>{_m(o['buy_below'])}</b>")
+            if o.get("base") is not None:
+                parts.append(f"bear {_m(o.get('bear'))} · base {_m(o.get('base'))} · bull {_m(o.get('bull'))}")
+            if o.get("price") is not None:
+                parts.append(f"struck at {_m(o['price'])}{' on ' + html.escape(str(o['as_of'])) if o.get('as_of') else ''}")
+            vline = f"<div class=vbar>{' · '.join(parts)}</div>"
         out.append(f"<div class='verdict {sig_cls(o.get('signal'))}'>"
                    f"<div class=vlab>Overall read</div>"
                    f"<div class=vsig>{html.escape(o.get('signal',''))}"
                    f"<span class=vconf>{html.escape(o.get('confidence',''))} confidence</span></div>"
+                   f"{vline}"
                    f"<div class=vsum>{html.escape(o.get('summary',''))}</div></div>")
     out.append("<div class=lensgrid>")
     for l in data.get("lenses", []):
@@ -1172,6 +1223,27 @@ def journal():
     return wrap("Journal", journal_inner(), request.args.get("partial"))
 
 _QCACHE = {}
+_QMETA = {}   # market cap + 52-week range: slow-moving, so refreshed every 6h, not every price tick
+
+def _quote_meta(t, key):
+    now = time.time()
+    if t in _QMETA and now - _QMETA[t][0] < 6 * 3600:
+        return _QMETA[t][1]
+    d = {}
+    try:
+        p2 = requests.get("https://finnhub.io/api/v1/stock/profile2", params={"symbol": t, "token": key}, timeout=10).json()
+        if p2.get("marketCapitalization"):
+            d["cap"] = p2["marketCapitalization"] * 1e6
+    except Exception:
+        pass
+    try:
+        m = requests.get("https://finnhub.io/api/v1/stock/metric", params={"symbol": t, "metric": "price", "token": key}, timeout=10).json().get("metric", {})
+        d["yhi"], d["ylo"] = m.get("52WeekHigh"), m.get("52WeekLow")
+    except Exception:
+        pass
+    if d:   # a failed lookup is retried on the next price refresh, not remembered for 6h
+        _QMETA[t] = (now, d)
+    return d
 def research_inner():
     """/research — the intel surface (David 2026-08-13 v2): what's-new digest +
     coming-up calendar. Companies/boards/system docs returned to the sidebar
@@ -1249,6 +1321,11 @@ def quotes():
     per sidebar row, so a phone on the tailnet paid a full round trip for each — and the
     Account widget can't compute until the LAST of them lands. Same cache underneath."""
     tks = [t.strip().upper() for t in request.args.get("tickers", "").split(",") if t.strip()][:40]
+    # fan out: serially this was ~1s per cold ticker, so fourteen watchlist names cost
+    # 15s and the phone re-requested it three times while waiting (server log 2026-09-03)
+    if len(tks) > 1:
+        with ThreadPoolExecutor(min(16, len(tks))) as ex:   # Finnhub allows a 30/s burst
+            return jsonify(dict(zip(tks, ex.map(_quote, tks))))
     return jsonify({t: _quote(t) for t in tks})
 
 @app.route("/api/quote")
@@ -1256,28 +1333,29 @@ def quote():
     return jsonify(_quote(request.args.get("ticker", "").upper()))
 
 def _quote(t):
-    now = time.time()
-    if t in _QCACHE and now - _QCACHE[t][0] < 120:
+    if t in _QCACHE and time.time() - _QCACHE[t][0] < 120:
         return _QCACHE[t][1]
+    with _cache_lock(f"q:{t}"):   # single-flight: the warmer and a page open share one fetch
+        if t in _QCACHE and time.time() - _QCACHE[t][0] < 120:
+            return _QCACHE[t][1]
+        return _quote_fetch(t)
+
+def _quote_fetch(t):
+    now = time.time()
     key = load_key("finnhub"); d = {}
     if key:
         try:
             q = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": t, "token": key}, timeout=10).json()
             if q.get("c"):
                 d = {"price": q.get("c"), "prev": q.get("pc"), "dhi": q.get("h"), "dlo": q.get("l")}
-                try:
-                    p2 = requests.get("https://finnhub.io/api/v1/stock/profile2", params={"symbol": t, "token": key}, timeout=10).json()
-                    if p2.get("marketCapitalization"):
-                        d["cap"] = p2["marketCapitalization"] * 1e6
-                except Exception:
-                    pass
-                try:
-                    m = requests.get("https://finnhub.io/api/v1/stock/metric", params={"symbol": t, "metric": "price", "token": key}, timeout=10).json().get("metric", {})
-                    d["yhi"], d["ylo"] = m.get("52WeekHigh"), m.get("52WeekLow")
-                except Exception:
-                    pass
+                d.update(_quote_meta(t, key))   # one price call per refresh, not three
         except Exception:
             d = {}
+    if not d.get("price") and t in _QCACHE and _QCACHE[t][1].get("price"):
+        # Finnhub refused (rate limit, blip): keep the last good price for another
+        # 120s rather than stall on the Yahoo fallback, which throttles bursts hard
+        _QCACHE[t] = (now, _QCACHE[t][1])
+        return _QCACHE[t][1]
     if not d.get("price"):
         try:
             import yfinance as yf
@@ -1477,26 +1555,38 @@ def st_sync():
     except Exception as e:
         return jsonify({"msg": "Sync error: " + str(getattr(e, "body", e))[:160]})
 
+def _digest_items():
+    """Filings + news across the watchlist. One ticker per worker: serially this was
+    EDGAR + Finnhub for each of fourteen names, 42s cold (measured 2026-09-03)."""
+    def one(tk):
+        items = []
+        cik = cik_of(tk)
+        if cik:
+            for f in edgar_filings(cik, 8):
+                items.append({"tk": tk, "date": f["date"], "kind": "filing", "label": f["form"],
+                              "earn": f["earnings"], "mat": f["material"], "desc": f["desc"] or f["form"], "url": f["url"]})
+        nw = finnhub_news(tk)
+        if nw:
+            for n in nw[:4]:
+                d = dt.datetime.fromtimestamp(n.get("datetime", 0), dt.timezone.utc).strftime("%Y-%m-%d") if n.get("datetime") else ""
+                items.append({"tk": tk, "date": d, "kind": "news", "label": n.get("source", ""),
+                              "earn": False, "mat": False, "desc": n.get("headline", ""), "url": n.get("url", ""),
+                              "summary": n.get("summary", "")})
+        return items
+    wl = watchlist()
+    ticker_map()   # populate once before the fan-out
+    items = []
+    if wl:
+        with ThreadPoolExecutor(min(6, len(wl))) as ex:
+            for chunk in ex.map(one, wl):
+                items.extend(chunk)
+    items.sort(key=lambda x: x["date"], reverse=True)
+    return items[:22]
+
 @app.route("/api/digest")
 def digest():
-    def fetch():
-        items = []
-        for tk in watchlist():
-            cik = cik_of(tk)
-            if cik:
-                for f in edgar_filings(cik, 8):
-                    items.append({"tk": tk, "date": f["date"], "kind": "filing", "label": f["form"],
-                                  "earn": f["earnings"], "mat": f["material"], "desc": f["desc"] or f["form"], "url": f["url"]})
-            nw = finnhub_news(tk)
-            if nw:
-                for n in nw[:4]:
-                    d = dt.datetime.utcfromtimestamp(n.get("datetime", 0)).strftime("%Y-%m-%d") if n.get("datetime") else ""
-                    items.append({"tk": tk, "date": d, "kind": "news", "label": n.get("source", ""),
-                                  "earn": False, "mat": False, "desc": n.get("headline", ""), "url": n.get("url", ""),
-                                  "summary": n.get("summary", "")})
-        items.sort(key=lambda x: x["date"], reverse=True)
-        return items[:22]
-    return jsonify(cached("digest", 600, fetch))
+    # stale=True: an expired digest is shown at once and refreshed behind it
+    return jsonify(cached("digest", 600, _digest_items, stale=True))
 
 def tracked_tickers():
     """Every name the operation follows: owned, watched, or with a research folder."""
@@ -1515,49 +1605,48 @@ def api_sidebar():
     appeared on sync) just went quietly stale. One refresh path replaces all of it."""
     return sidebar()
 
-@app.route("/api/perf")
-def api_perf():
+def _perf_data():
     """Batch performance for every tracked name. One yfinance download covers the whole
     list (~0.3s for ten) — the per-row /api/quote fan-out this replaces was one request
     per ticker and carried no history at all."""
-    def fetch():
-        tks = tracked_tickers()
-        if not tks:
-            return {}
+    tks = tracked_tickers()
+    if not tks:
+        return {}
+    try:
+        import yfinance as yf
+        df = yf.download(tks, period="1y", interval="1d", progress=False,
+                         auto_adjust=True, threads=True)["Close"]
+    except Exception:
+        return {}
+    today = dt.date.today(); out = {}
+    for tk in tks:
         try:
-            import yfinance as yf
-            df = yf.download(tks, period="1y", interval="1d", progress=False,
-                             auto_adjust=True, threads=True)["Close"]
+            s = (df[tk] if getattr(df, "ndim", 1) > 1 else df).dropna()
         except Exception:
-            return {}
-        today = dt.date.today(); out = {}
-        for tk in tks:
-            try:
-                s = (df[tk] if getattr(df, "ndim", 1) > 1 else df).dropna()
-            except Exception:
-                continue
-            if len(s) < 2:
-                continue
-            last = float(s.iloc[-1])
-            def since(cut):  # last close on or before `cut`
-                sub = s[s.index.date <= cut]
-                return float(sub.iloc[-1]) if len(sub) else None
-            def pct(base):
-                return round((last / base - 1) * 100, 2) if base else None
-            jan = s[s.index.year < today.year]
-            out[tk] = {"price": round(last, 2),
-                       "d1": pct(float(s.iloc[-2])),
-                       "m1": pct(since(today - dt.timedelta(30))),
-                       "m6": pct(since(today - dt.timedelta(182))),
-                       "ytd": pct(float(jan.iloc[-1])) if len(jan) else None,
-                       "y1": pct(float(s.iloc[0])),
-                       "lo": round(float(s.min()), 2), "hi": round(float(s.max()), 2)}
-        return out
-    return jsonify(cached("perf", 900, fetch))
+            continue
+        if len(s) < 2:
+            continue
+        last = float(s.iloc[-1])
+        def since(cut):  # last close on or before `cut`
+            sub = s[s.index.date <= cut]
+            return float(sub.iloc[-1]) if len(sub) else None
+        def pct(base):
+            return round((last / base - 1) * 100, 2) if base else None
+        jan = s[s.index.year < today.year]
+        out[tk] = {"price": round(last, 2),
+                   "d1": pct(float(s.iloc[-2])),
+                   "m1": pct(since(today - dt.timedelta(30))),
+                   "m6": pct(since(today - dt.timedelta(182))),
+                   "ytd": pct(float(jan.iloc[-1])) if len(jan) else None,
+                   "y1": pct(float(s.iloc[0])),
+                   "lo": round(float(s.min()), 2), "hi": round(float(s.max()), 2)}
+    return out
 
-@app.route("/api/history")
-def api_history():
-    t = request.args.get("ticker", "").upper(); rng = request.args.get("range", "6mo")
+@app.route("/api/perf")
+def api_perf():
+    return jsonify(cached("perf", 900, _perf_data))
+
+def _hist_data(t, rng):
     def fetch():
         try:
             import yfinance as yf
@@ -1567,7 +1656,22 @@ def api_history():
             return {"dates": [d.strftime("%Y-%m-%d") for d in cl.index], "closes": [round(float(x), 2) for x in cl.tolist()]}
         except Exception:
             return {"dates": [], "closes": []}
-    return jsonify(cached(f"hist:{t}:{rng}", 1800, fetch))
+    return cached(f"hist:{t}:{rng}", 1800, fetch)
+
+@app.route("/api/history")
+def api_history():
+    return jsonify(_hist_data(request.args.get("ticker", "").upper(), request.args.get("range", "6mo")))
+
+def _st_activities(st):
+    """The account's activity list, fetched once and shared by /api/transactions and
+    /api/lots — each used to make its own two AggregatorA round trips (3–6s) for the
+    same rows."""
+    def fetch():
+        u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
+        aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
+        act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
+        return act if isinstance(act, list) else act.get("data", [])
+    return cached("st_activities", 600, fetch)
 
 @app.route("/api/transactions")
 def api_tx():
@@ -1576,10 +1680,7 @@ def api_tx():
         return jsonify([])
     def fetch():
         try:
-            u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-            aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
-            act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
-            rows = act if isinstance(act, list) else act.get("data", [])
+            rows = _st_activities(st)
             out = []
             names = ticker_names()
             for a in rows:
@@ -2024,10 +2125,7 @@ def api_lots():
         return jsonify([])
     def fetch():
         try:
-            u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-            aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
-            act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
-            rows = act if isinstance(act, list) else act.get("data", [])
+            rows = _st_activities(st)
             best = {}  # AggregatorA double-reports some fills (with/without price) — keep the priced row
             for a in rows:
                 sym = a.get("symbol") or {}
@@ -2378,7 +2476,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .vlab{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fade);margin-bottom:3px}
 .vsig{font-size:21px;font-weight:600;display:flex;align-items:baseline;gap:10px}
 .vconf{font-size:12px;font-weight:400;color:var(--mut);text-transform:none}
-.vsum{font-size:14px;color:var(--mut);margin-top:6px;max-width:78ch}
+.vsum{font-size:14px;color:var(--mut);margin-top:6px;max-width:78ch}.vbar{font-size:12.5px;color:var(--muted,#8a8a8a);margin:2px 0 6px}.vbar b{font-weight:600;color:inherit}
 .lensgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px}
 .lens{border:1px solid var(--line);border-radius:11px;padding:13px 15px;background:var(--panel);transition:border-color .12s}
 .lens:hover{border-color:var(--mut)}
@@ -3429,6 +3527,67 @@ import primer_page  # /primer — David's finance primer (terms + desk applicati
 primer_page.register(app, wrap)
 JS += today_page.JS
 
+def _fresh(k, ttl):
+    hit = _CACHE.get(k)
+    return bool(hit) and time.time() - hit[0] < ttl
+
+def _warm_ticker(t):
+    """The EDGAR filing list, Finnhub news and next earnings date behind /ticker/<t>
+    (2–5s together cold, measured 2026-09-04 03:59Z — David clicking between watchlist
+    names late evening, when every 10–30 min TTL had long expired). Paced: only an
+    expired entry is fetched, and each Finnhub call is followed by a pause, because a
+    fan-out over 16 names blew through Finnhub's 60/min cap and pushed every quote onto
+    the Yahoo fallback (measured 2026-09-04 04:17Z)."""
+    cik = cik_of(t)
+    if cik and not _fresh(f"edgar:{cik}", 600):
+        edgar_filings(cik)
+    if not _fresh(f"news:{t}", 600):
+        finnhub_news(t); time.sleep(1.0)
+    if not _fresh(f"earn:{t}", 86400):
+        next_earnings(t); time.sleep(1.0)
+
+def _warm_yahoo(t):
+    """The two yfinance calls a ticker page needs: the company profile (name, sector)
+    and the 5y close series. Yahoo answers a burst with 429s and long backoffs, so these
+    run one at a time with a pause after each real fetch."""
+    if not _fresh(f"prof:{t}", 3600):
+        profile(t); time.sleep(1.5)
+    if not _fresh(f"hist:{t}:5y", 1800):
+        _hist_data(t, "5y"); time.sleep(1.5)
+
+def _warm_loop():
+    """Keeps every pane a page open touches hot, so no click pays for a fetch:
+    prices for every tracked name (every 100s in US market hours, every 10 min outside
+    — the 120s TTL otherwise leaves the whole row cold by evening), the per-ticker
+    filings/news/earnings/history behind /ticker/<t>, the digest and the 1y perf table on
+    their own TTLs. Each cached() call returns at once while fresh, so a tick costs
+    nothing until something expires. Steady state ≈ 9 Finnhub calls/min in market hours,
+    ~4/min outside, against the 60/min cap."""
+    tick = 0
+    while True:
+        try:
+            nowu = dt.datetime.now(dt.timezone.utc)
+            market = nowu.weekday() < 5 and 13 <= nowu.hour < 21
+            tks = tracked_tickers()
+            if tks and (tick == 0 or market or tick % 6 == 0):
+                with ThreadPoolExecutor(min(16, len(tks))) as ex:
+                    list(ex.map(_quote, tks))
+            cached("digest", 600, _digest_items, stale=True)
+            if tks and tick >= 1:   # not on the boot tick: the quote pass + digest already spend ~55 Finnhub calls
+                for t in tks:
+                    _warm_ticker(t)
+                for t in tks:
+                    _warm_yahoo(t)
+            cached("perf", 900, _perf_data)   # 1y yfinance batch, ~5s cold
+            st = _st()
+            if st:
+                _st_activities(st)   # transactions + lots, one AggregatorA fetch per 10 min
+        except Exception:
+            pass
+        tick += 1
+        time.sleep(100)
+
 if __name__ == "__main__":
     print(f"Stocks dashboard -> http://<host-ip>:{PORT}")
+    threading.Thread(target=_warm_loop, name="warm", daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False)

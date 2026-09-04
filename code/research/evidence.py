@@ -98,13 +98,27 @@ def build(tk, skip_local=False):
             break
 
     sections = {}
+    # the same stripped text may already sit on the agent's shelf — the dossier's filings/
+    # or the Bench corpus (2,491 filers) use the identical <date>_<FORM>.txt name; reading it
+    # from disk saves the download and the strip (David 2026-09-04: "repeat work")
+    agent = Path(__file__).resolve().parent.parent / "agent"
     for f in picked:
-        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
-        try:
-            txt = strip_html(get(url))
-        except Exception as e:
-            f["error"] = str(e)[:80]
-            continue
+        fname = f"{f['date']}_{f['form'].replace(' ', '').replace('/', '')}.txt"
+        local = next((p for p in (agent / "names" / tk / "filings" / fname,
+                                  agent / "data" / "bench_corpus" / tk / fname) if p.exists()), None)
+        if local:
+            try:
+                txt = local.read_text()
+                f["source"] = str(local.relative_to(ROOT))
+            except Exception:
+                local = None
+        if not local:
+            url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
+            try:
+                txt = strip_html(get(url))
+            except Exception as e:
+                f["error"] = str(e)[:80]
+                continue
         # 3M-char sanity cap only (a stripped 10-K is ~600k). The old 400k cap silently
         # dropped Part II Items 5/9B — caught by the FLYW adversarial review 2026-08-11.
         if len(txt) > 3_000_000:
