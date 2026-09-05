@@ -1948,7 +1948,9 @@ def api_research():
     r = runner.launch_research(tk)
     if not r.get("ok"):
         return jsonify({"msg": r.get("msg", "launch failed")})
-    return jsonify({"ok": True, "msg": f"Research on {tk} started — a full Claude session is running in the background (several minutes). It'll appear under Research when done."})
+    if r.get("queued"):
+        return jsonify({"ok": True, "queued": True, "msg": f"Research on {tk} {r.get('msg', 'queued')} — one Claude session at a time, in the next open window."})
+    return jsonify({"ok": True, "msg": f"Research on {tk} started — a full Claude session is running in the background (an hour or two). It'll appear under Research when done."})
 
 # The teardown is specified as an ordered set of deliverables (runner.research_prompt
 # / RUNBOOK.md), so progress is a fact on disk, not a guess. The old bar tailed the last
@@ -2006,6 +2008,15 @@ def _run_status(logf, err_hint=""):
     except Exception:
         return "running", "running…"
 
+def _queued(key):
+    """ETA line for a job waiting in the Claude queue (claudeq), or '' when not queued."""
+    try:
+        import claudeq
+        j = claudeq.pending_for(key)
+        return claudeq.eta_msg(j) if j else ""
+    except Exception:
+        return ""
+
 @app.route("/api/research/status")
 def research_status():
     tk = request.args.get("ticker", "").upper().strip()
@@ -2015,6 +2026,9 @@ def research_status():
     if cf and (cf / "analysis" / "FINAL-REPORT.md").exists():
         return jsonify({"done": True, "status": "done", "progress": prog,
                         "link": str((cf / "analysis" / "FINAL-REPORT.md").relative_to(ROOT))})
+    q = _queued(f"research:{tk}")
+    if q:
+        return jsonify({"done": False, "status": "queued", "msg": q, "progress": prog})
     logf = runner.research_log(tk)
     if not logf.exists():  # legacy location
         logf = ROOT / f"_engine/candidate-boards/_research_{tk}.log"
@@ -2038,6 +2052,8 @@ def api_research_update():
     r = runner.launch_update(tk)
     if not r.get("ok"):
         return jsonify({"msg": r.get("msg", "launch failed")})
+    if r.get("queued"):
+        return jsonify({"ok": True, "queued": True, "msg": f"Update for {tk} {r.get('msg', 'queued')}."})
     return jsonify({"ok": True, "msg": f"Updating {tk} research — reading everything new since the report date (a few minutes)."})
 
 @app.route("/api/research/update/status")
@@ -2048,6 +2064,9 @@ def research_update_status():
     for cand in ([cf / "analysis" / "updates" / f"update-{today}.md", cf / "analysis" / f"update-{today}.md"] if cf else []):
         if cand.exists():
             return jsonify({"done": True, "status": "done", "link": str(cand.relative_to(ROOT))})
+    q = _queued(f"update:{tk}")
+    if q:
+        return jsonify({"done": False, "status": "queued", "msg": q})
     status, msg = _run_status(runner.update_log(tk))
     return jsonify({"done": False, "status": status, "msg": msg})
 
@@ -2056,6 +2075,8 @@ def api_recommend():
     r = runner.launch_rec()
     if not r.get("ok"):
         return jsonify({"msg": r.get("msg", "launch failed")})
+    if r.get("queued"):
+        return jsonify({"ok": True, "queued": True, "msg": f"Recommendation {r.get('msg', 'queued')}."})
     return jsonify({"ok": True, "msg": "Generating today's recommendation — a Claude session is reading the portfolio (a few minutes)."})
 
 @app.route("/api/recommend/status")
@@ -2063,6 +2084,9 @@ def recommend_status():
     p = runner.rec_path()
     if p.exists():
         return jsonify({"done": True, "status": "done", "link": str(p.relative_to(ROOT))})
+    q = _queued("rec")
+    if q:
+        return jsonify({"done": False, "status": "queued", "msg": q})
     status, msg = _run_status(runner.rec_log())
     return jsonify({"done": False, "status": status, "msg": msg})
 
@@ -3158,6 +3182,10 @@ function renderResearch(tk,s,box,poll){
    +(pr.done?'<button class=btn onclick=\'genResearch(event,"'+tk+'")\'>Resume — finish the remaining '+(pr.total-pr.done)+'</button>':'');
   return true;}
  box.className='rstatus';
+ if(s.status==='queued'){
+  box.innerHTML='⏳ '+esc(tk)+' '+esc((s.msg||'queued').slice(0,120))+' <span class=rmsg>(one Claude session at a time)</span>'+rProgress(s.progress);
+  if(poll)pollResearch(tk,box);
+  return false;}
  box.innerHTML='<span class=spin></span> Researching '+esc(tk)+'…  <span class=rmsg>'+esc((s.msg||'running').slice(0,90))+'</span>'+rProgress(s.progress);
  if(poll)pollResearch(tk,box);
  return false;}

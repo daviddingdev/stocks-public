@@ -279,14 +279,39 @@ def run():
                                headers=feeds.UA, timeout=20).json()["filings"]["recent"]
         except Exception:
             continue
-        for form, date, acc in zip(rec["form"], rec["filingDate"], rec["accessionNumber"]):
+        form4_today = []
+        for form, date, acc, doc in zip(rec["form"], rec["filingDate"], rec["accessionNumber"],
+                                        rec["primaryDocument"]):
             if date != today_s or form not in feeds.INTERESTING:
+                continue
+            if form == "4":
+                form4_today.append((acc, doc))
                 continue
             q = feeds.fh_get("quote", symbol=tk) or {}
             ctx, book = impact(tk, q.get("c") or 0, q.get("pc") or q.get("c") or 0)
             fired += alert(state, c, f"filing:{acc}", "filing", tk,
                            f"{tk} filed {form} today — holding: {ctx}",
                            action=(tk in ag_pos and form == "8-K"), book=book)
+        if form4_today:
+            # feeds.py-124: a spin-off/annual-grant day can file the SAME fact (an RSU
+            # grant) once per insider -- MBGL filed 8 identical code-A $0 grants on
+            # 2026-09-02 and the desk saw 8 copies of "filed 4 today". Classify and roll
+            # the whole day into one line instead.
+            entries = feeds.form4_day_details(cik, form4_today)
+            buckets = feeds.classify_form4_entries(entries)
+            n, k, m = len(form4_today), len(buckets["open_market"]), len(buckets["grants"])
+            q = feeds.fh_get("quote", symbol=tk) or {}
+            ctx, book = impact(tk, q.get("c") or 0, q.get("pc") or q.get("c") or 0)
+            if k:
+                verb = "net bought" if buckets["net_dollars"] >= 0 else "net sold"
+                detail = f"{k} open-market (${abs(buckets['net_dollars']):,.0f} {verb})" + \
+                    (f", {m} grants" if m else "")
+            else:
+                detail = f"all {m} grants/tax" if m == n else f"{m} grants/tax, {n - m} other"
+            fired += alert(state, c, f"filing4:{tk}:{today_s}", "filing", tk,
+                           f"{tk} filed {n} Form 4{'s' if n > 1 else ''} today: {detail}"
+                           f" — holding: {ctx}",
+                           action=False, book=book)
 
     # --- 3: radar 13Ds + earnings, HELD names only ---
     feed = _j(DATA / "feed.json", {})

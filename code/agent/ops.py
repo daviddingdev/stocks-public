@@ -137,8 +137,8 @@ def single_turn_note():
 # on 2026-09-01.
 _FINISH_GLOBS = {"numbers": ("*_numbers.md", "*_fixer.md"), "signals": ("*_signals.md",),
                  "hunt": ("*_hunt.md",), "coo": ("*_coo.md",), "build": ("*_build.md",)}
-_FINISH_FALLBACK = {"numbers": (7, 5, {1, 2, 3, 4, 5}), "signals": (7, 35, {1, 2, 3, 4, 5}),
-                    "hunt": (8, 30, {3, 5}), "coo": (15, 0, {5}), "build": (8, 30, {4})}
+_FINISH_FALLBACK = {"numbers": (6, 30, {1, 2, 3, 4, 5}), "signals": (6, 50, {1, 2, 3, 4, 5}),
+                    "hunt": (7, 10, {3, 5}), "coo": (15, 0, {5}), "build": (7, 10, {4})}
 
 
 def _finish():
@@ -161,10 +161,19 @@ def _finish():
             # one launch a day per role; several fixed times would be several finishes,
             # which no role has — take the first and let roster.cron_drift say if that changes
             h, m, days = sched[0]
+        elif by_id and r is not None and not roster.cron_error():
+            # crontab readable and the role has NO line: it is ON DEMAND (build, since
+            # 2026-09-04 — two weekly runs found nothing). verify() launches it when asks
+            # are waiting instead of on a clock, and never counts a quiet week as a miss.
+            ON_DEMAND.add(role)
+            continue
         else:
             h, m, days = _FINISH_FALLBACK[role]
         out[role] = (globs, h, m, days)
     return out
+
+
+ON_DEMAND = set()
 
 
 FINISH = _finish()
@@ -206,21 +215,27 @@ def verify():
         if role in PROMPTS and not marker.exists():
             marker.write_text(msg)
             # USAGE-WINDOW RULE (David 2026-08-31 / 2026-09-01): no Claude session starts inside
-            # 09:05-14:05 UTC Mon-Fri, the 14:05 trade session's 5-hour lookback. verify runs at
-            # 11:35, so a same-day relaunch would land exactly there. Defer it to 14:40Z.
-            now_utc = _dt.datetime.now(_dt.timezone.utc)
-            in_band = now_utc.weekday() < 5 and (9, 5) <= (now_utc.hour, now_utc.minute) < (14, 5)
-            if in_band:
-                at = now_utc.replace(hour=14, minute=40, second=0, microsecond=0)
-                delay = int((at - now_utc).total_seconds())
-                subprocess.Popen(["bash", "-c", f"sleep {delay}; cd {HERE}; python3 ops.py {role} "
-                                                f">> {LOGS}/ops_cron.log 2>&1"],
-                                 start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                healed.append(f"{role} relaunch DEFERRED to {at:%H:%M}Z (usage-window rule)")
-            else:
-                r = launch(role)
-                healed.append(f"{role} relaunched ({'ok' if r.get('ok') else r.get('msg', '?')[:60]})")
+            # 09:05-14:05 UTC Mon-Fri. verify runs at 11:35, so the relaunch is FILED with the
+            # queue (claudeq), whose fit rule starts it in the first window after the trade
+            # session — the same 14:40Z-ish slot the old hand-rolled sleep aimed at.
+            r = launch(role)
+            healed.append(f"{role} re-filed ({r.get('msg', '?')[:70]})")
             misses.remove(msg)
+    # ON-DEMAND roles (no cron line): file a run when asks are waiting for them, once a day.
+    for role in sorted(ON_DEMAND):
+        marker = DATA / f"verify_ondemand_{role}_{_dt.date.today().isoformat()}"
+        if marker.exists():
+            continue
+        try:
+            sys.path.insert(0, str(HERE))
+            import asks
+            waiting = [a for a in asks.load()["asks"] if a.get("status") == "open" and a.get("to") == role]
+        except Exception:
+            waiting = []
+        if waiting:
+            marker.write_text(f"{len(waiting)} open ask(s)")
+            r = launch(role)
+            healed.append(f"{role} (on demand, {len(waiting)} ask(s) waiting) filed: {r.get('msg', '?')[:60]}")
     if healed:
         subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
                         "Ops role missed its run — self-heal relaunched",
@@ -248,8 +263,17 @@ def verify():
     return 0 if not misses else 1
 
 
-def launch(role):
+def launch(role, now=False):
+    """An ops role's cron line FILES the job (claudeq) — the queue runs it when the Claude
+    slot is free and the clock allows, one session at a time (David 2026-09-04). now=True
+    is the queue dispatching it."""
     role = ROLE_ALIASES.get(role, role)
+    if role not in PROMPTS:
+        return {"ok": False, "msg": f"unknown ops role {role}"}
+    if not now:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        return claudeq.enqueue("ops", {"role": role}, sub=role, by="ops-cron")
     ok, msg = runner.auth_check()
     if not ok:
         return {"ok": False, "msg": msg}
@@ -271,10 +295,17 @@ def launch(role):
            # to sonnet"; PROJECT_STANDARDS §2 per-job sign-off). The COO and hunt stay on
            # Opus because their whole value is catching what the cheaper roles got wrong.
            "--model", runner.job_model(role)]
-    log = open(LOGS / f"ops_{role}.log", "w")
-    subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
-                     start_new_session=True, env=runner.clean_env())
-    return {"ok": True, "msg": f"ops {role} launched"}
+    logp = LOGS / f"ops_{role}.log"
+    log = open(logp, "w")
+    proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
+                            start_new_session=True, env=runner.clean_env())
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        claudeq.watcher(proc.pid)
+    except Exception:
+        pass
+    return {"ok": True, "msg": f"ops {role} launched", "pid": proc.pid, "log": str(logp)}
 
 
 if __name__ == "__main__":

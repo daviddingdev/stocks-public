@@ -23,6 +23,7 @@ builds fresh via fincard.py. Works for both books.
 """
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -68,12 +69,32 @@ def run(tk, expr):
                        ("min", "max", "sum", "abs", "round", "len", "math", "sorted"))
         print("available variables:", ", ".join(avail))
         return 1
-    used = sorted(k for k in prov if k in expr)
+    # IDENTIFIERS, not substrings (hunt 2026-09-05). `k in expr` made every variable whose
+    # name is a substring of another one look like an input to a calculation that never
+    # referenced it: `query.py TLS "net_cash / shares_out"` listed `cash = 50,647,000` with
+    # full provenance among its inputs. A query printout is pasted into memos as the proof
+    # of a number (MANDATE rail 7) — an input line that names a figure the expression never
+    # read is a false provenance claim, in the one artifact whose whole job is provenance.
+    _idents = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", expr))
+    used = sorted(k for k in prov if k in _idents)
     print(f"# {tk} query — card {card.get('built')} ({src})")
     for k in used:
         print(f"#   {k} = {prov[k]}")
+    # FLAG MATCHING IS CASE- AND PUNCTUATION-BLIND (hunt 2026-09-05). fincard writes its
+    # flags as English prose in caps — "NET CASH UNRELIABLE: debt_lt tag STALE (last known
+    # 11,500,000 at 2019-12-31) excluded" — while the variables are snake_case, so a plain
+    # `"net_cash" in fl` matched NOTHING and the flag written to stop that exact number
+    # being trusted was the one flag a `query.py COLL "net_cash"` did not print. COLL's card
+    # carries six flags; the query showed three, and both suppressed ones were the debt
+    # staleness that makes its 129,467,000 "net cash" wrong against ~1.09B of loans payable
+    # the card can see but not resolve. Normalise both sides before matching, and always
+    # print a flag that invalidates the card as a whole rather than one named figure.
+    _ALWAYS = ("MISMATCH", "MIXED", "UNRELIABLE", "DOES NOT FOOT", "IDENTITY FAILS")
+    def _norm(t):
+        return re.sub(r"[^a-z0-9]+", "_", t.lower())
     for fl in card.get("flags", []):
-        if any(k in fl for k in used) or "MISMATCH" in fl or "MIXED" in fl:
+        nfl = _norm(fl)
+        if any(k in nfl for k in used) or any(a in fl for a in _ALWAYS):
             print(f"#   FLAG: {fl}")
     print(f"{expr}\n= {result:,.4f}" if isinstance(result, float) else f"{expr}\n= {result}")
     return 0

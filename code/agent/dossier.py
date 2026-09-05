@@ -94,6 +94,18 @@ TERM_KEYWORDS = ["redemption", "redeem", "redeemable", "conversion", "convert",
                  "exchange ratio", "liquidation preference", "change of control",
                  "dividend rate", "cumulative", "tender offer", "dissolution",
                  "distribution", "maturity", "call date", "par value"]
+# DEFM14A/PREM14A carry the DEAL the position IS, not a security's coupon terms — a proxy
+# can be 51/51 quote-verified on redemption/liquidation-preference language from an OLD
+# preferred while never reading the vote it is actually about (dossier.py-126, ARI: 18 rows
+# on a 2016 preferred redeemed 2026-07-15, zero on the $7.75-8.50 distribution range or the
+# 2026-09-29 Special Meeting). These keywords only fire on DEFM14A/PREM14A docs, additive to
+# TERM_KEYWORDS above.
+DEAL_KEYWORDS = ["estimated total stockholder distributions", "distribution range",
+                 "special meeting", "record date", "majority of all the votes",
+                 "broker non-votes", "abstentions", "plan of dissolution",
+                 "plan of liquidation", "liquidating trust", "non-transferable",
+                 "asset sale", "dissolution proposal"]
+DEAL_FORMS = ("DEFM14A", "PREM14A")
 STOP = set("the a an and or of to in for on by with as at from that this is are was were be been "
            "has have had its it their which will shall may any all such per share shares company".split())
 
@@ -253,11 +265,14 @@ def fincheck(d, card):
         "MOST RECENT date; never take the second (prior-year) column. Note the table's stated "
         "scale ('in thousands'/'in millions') if visible. Extract: cash & cash equivalents "
         "(balance sheet); net cash provided by operating activities; purchases of property & "
-        "equipment (capex); and debt_lt = the balance sheet's borrowings line, whatever it is "
-        "called at this issuer — 'Long-term debt', 'Notes payable', 'Secured debt arrangements, "
-        "net', 'Senior secured notes, net', 'Term loan', 'Debt related to real estate owned' — "
-        "copying the SINGLE largest current-column debt line; if every debt line shows a dash or "
-        "the balance sheet has none, debt_lt is NOT_SHOWN. "
+        "equipment (capex); and debt_lt = the balance sheet's NONCURRENT (long-term) borrowings "
+        "line, whatever it is called at this issuer — 'Long-term debt', 'Notes payable', "
+        "'Secured debt arrangements, net', 'Senior secured notes, net', 'Term loan', 'Debt "
+        "related to real estate owned' — copying the SINGLE largest current-column debt line. "
+        "If a debt note shows BOTH a gross/total debt line AND a 'net of current portion' (or "
+        "'noncurrent') line for the same column, copy the NET-OF-CURRENT-PORTION (noncurrent) "
+        "figure, never the gross total — debt_lt excludes the current portion by definition. "
+        "If every debt line shows a dash or the balance sheet has none, debt_lt is NOT_SHOWN. "
         "JSON {\"cash\":\"<digits or NOT_SHOWN>\",\"cfo\":\"...\",\"capex\":"
         "\"...\",\"debt_lt\":\"...\",\"scale\":\"thousands|millions|units|unknown\"}\n\n"
         + "\n\n[---]\n\n".join(wins), num_predict=400)
@@ -304,30 +319,64 @@ def fincheck(d, card):
           f"fincheck: {len(out['checks'])} figures vs {docs[0].name} — all consistent")
 
 
-def keyword_windows(txt, keywords, width=1200, cap=4, total_cap=14000):
-    """Code locates candidate passages; the model only reads these."""
-    spots = []
+def keyword_windows(txt, keywords, width=1200, cap=4, total_cap=14000, per_group=3):
+    """Code locates candidate passages; the model only reads these.
+
+    Windows are built PER KEYWORD, rarest keyword first (a rarer keyword is a more
+    specific — higher-signal — anchor), and EVERY keyword group is capped at
+    `per_group` windows so no single group can exhaust the whole budget before the
+    others get a turn. Both limits matter: without the per-group cap, a keyword with
+    a middling hit count (e.g. "record date", 53 hits -> 30 windows on its own) can
+    still fill the entire cap before a later, equally relevant group (e.g. "special
+    meeting", 283 hits, but whose FIRST hit in an ARI proxy is literally "NOTICE OF
+    SPECIAL MEETING ... TO BE HELD ON SEPTEMBER 29, 2026") ever gets a window
+    (dossier.py-126). Without the merge-span cap, a single dense group can chain
+    every early hit into one giant window that alone exceeds the budget."""
     low = txt.lower()
+    max_span = width * 3
+
+    def merge(spots):
+        windows, last_end = [], -1
+        for s in sorted(spots):
+            a, b = max(0, s - width // 2), min(len(txt), s + width)
+            # snap to line boundaries: a raw character offset can slice a caption in
+            # half (VSNT: window started mid-word inside "Long-term debt 2,841", the
+            # model never saw the caption and picked a different, fully-visible "Total
+            # long-term debt" figure elsewhere instead — quality.py
+            # fincheck-mismatch:VSNT:debt_lt, 2026-09-05). Extending to the enclosing
+            # line never drops information, only adds a little more of it.
+            nl = txt.rfind("\n", 0, a)
+            a = nl + 1 if nl != -1 else 0
+            nl = txt.find("\n", b)
+            b = nl if nl != -1 else len(txt)
+            if a < last_end and b - windows[-1][0] <= max_span:
+                windows[-1] = (windows[-1][0], b)
+            else:
+                windows.append((a, b))
+            last_end = b
+        return windows
+
+    groups = []
     for kw in keywords:
-        for m in re.finditer(re.escape(kw), low):
-            spots.append(m.start())
-    spots.sort()
-    windows, last_end = [], -1
-    for s in spots:
-        a, b = max(0, s - width // 2), min(len(txt), s + width)
-        if a < last_end:          # merge overlapping windows
-            windows[-1] = (windows[-1][0], b)
-        else:
-            windows.append((a, b))
-        last_end = b
-    windows = windows[:cap * 3]
-    out, used = [], 0
-    for a, b in windows:
+        spots = [m.start() for m in re.finditer(re.escape(kw), low)]
+        if spots:
+            groups.append(spots)
+    groups.sort(key=len)  # rarest keyword's windows first
+
+    out, used, seen = [], 0, []
+    for spots in groups:
+        taken = 0
+        for a, b in merge(spots):
+            if taken >= per_group or used >= total_cap or len(out) >= cap * 2:
+                break
+            if any(a < e and b > s for s, e in seen):   # skip near-duplicate coverage
+                continue
+            out.append(txt[a:b])
+            used += b - a
+            seen.append((a, b))
+            taken += 1
         if used >= total_cap or len(out) >= cap * 2:
             break
-        chunk = txt[a:b]
-        out.append(chunk)
-        used += len(chunk)
     return out
 
 
@@ -338,20 +387,38 @@ def extract_terms(d, title):
            "model": f"{DEFAULT_MODEL} (local)", "terms": []}
     for doc in sorted((d / "filings").glob("*.txt")):
         txt = doc.read_text(errors="replace")
-        wins = keyword_windows(txt, TERM_KEYWORDS)
+        is_deal_doc = any(f in doc.name for f in DEAL_FORMS)
+        if is_deal_doc:
+            # DEAL_KEYWORDS windowed in their OWN budgeted pass, narrower width, ahead of
+            # TERM_KEYWORDS: in a Plan-of-Dissolution proxy, "special meeting"/"liquidating
+            # trust" run 280+ times each and would otherwise outrun rarer TERM_KEYWORDS hits
+            # for the same budget before a single deal-term window is ever built.
+            wins = (keyword_windows(txt, DEAL_KEYWORDS, width=600, cap=15, total_cap=30000)
+                    + keyword_windows(txt, TERM_KEYWORDS, width=900, cap=4, total_cap=6000))
+        else:
+            wins = keyword_windows(txt, TERM_KEYWORDS)
         if not wins:
             continue
         excerpt = "\n\n[---]\n\n".join(wins)
+        deal_ask = (
+            " Also extract PLAN/DEAL terms if present: the Estimated Total Stockholder "
+            "Distributions Range or any other liquidation/distribution dollar range "
+            "(type \"distribution_range\"), the Special Meeting date (type \"meeting_date\"), "
+            "the Record Date (type \"record_date\"), the vote/approval threshold required and "
+            "how broker non-votes/abstentions are treated (type \"vote_threshold\"), and "
+            "Liquidating Trust interest transferability (type \"trust_transferability\")."
+        ) if is_deal_doc else ""
         v = ask_json(
             f"These are excerpts from an SEC filing ({doc.name}) for {title}. Extract every "
             "explicit SECURITY or DEAL TERM present: redemption (optional/mandatory, dates, "
             "prices), conversion/exchange ratios, dividend rate & cumulative status, liquidation "
             "preference, change-of-control provisions, tender/dissolution/distribution terms, "
-            "maturity/call dates. Return JSON {\"terms\":[{\"type\":\"...\",\"detail\":\"<one "
+            "maturity/call dates." + deal_ask +
+            " Return JSON {\"terms\":[{\"type\":\"...\",\"detail\":\"<one "
             "precise clause with numbers/dates>\",\"quote\":\"<supporting sentence copied "
             "CHARACTER-FOR-CHARACTER from the excerpt, max 40 words>\"}]}. Only terms explicitly "
             "in the text — omit anything you cannot quote. Empty list if none.\n\n" + excerpt,
-            num_predict=1400)
+            num_predict=1800 if is_deal_doc else 1400)
         ntxt = norm(txt)
         for t in (v.get("terms") or []) if isinstance(v, dict) else []:
             q = str(t.get("quote", ""))

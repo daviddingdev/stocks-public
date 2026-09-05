@@ -69,7 +69,37 @@ def trade_prompt():
     return prompts.render("pm", REFLECTIONS=block)
 
 
-def launch(mode, attempt=1, model_idx=0):
+# NYSE full-day closures for 2026 — the trade cron does not know a holiday from a Monday.
+# 2026-09-07 is Labor Day: the strategy arc runs instead (David 2026-09-04).
+MARKET_HOLIDAYS = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+                   "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"}
+
+STRATEGY_ARC = ["2026-09-05", "2026-09-06", "2026-09-07"]   # David's three-day arc, markets closed
+
+
+def strategy_prompt(today=None):
+    """The PM's strategy-arc brief (prompts/pm_strategy.md, David-owned): which day of the arc
+    this is, and the prior drafts it must read first."""
+    import prompts
+    today = today or dt.date.today().isoformat()
+    day = STRATEGY_ARC.index(today) + 1 if today in STRATEGY_ARC else len(STRATEGY_ARC)
+    sdir = JOURNAL / "strategy"
+    sdir.mkdir(parents=True, exist_ok=True)
+    prior = sorted(p.name for p in sdir.glob("*.md"))
+    prior_txt = "\n".join(f"  - {sdir / n}" for n in prior) or "  (none yet — this is the first session of the arc)"
+    return prompts.render("pm_strategy", ARC=" / ".join(STRATEGY_ARC), DAY=str(day), DATE=today, PRIOR=prior_txt)
+
+
+def launch(mode, attempt=1, model_idx=0, now=False):
+    if mode == "trade" and dt.date.today().isoformat() in MARKET_HOLIDAYS:
+        return {"ok": False, "msg": f"market holiday {dt.date.today()} — no trade session (loop.py MARKET_HOLIDAYS)"}
+    if mode == "strategy" and not now:
+        # Filed with the queue (claudeq), like every other Claude job on the desk — the PM
+        # itself may call this to give itself another session (David 2026-09-04: "full freedom").
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        key = f"strategy:{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H%M}"
+        return claudeq.enqueue("strategy", {}, key=key, by="loop", ignore_windows=True)
     # sync is a mechanical JSON fetch — CODE does it now (mcp_sync.py, 2026-08-13,
     # after David's notification archaeology found Claude sessions doing curl work).
     # A Claude session remains the FALLBACK so token expiry never leaves a gap.
@@ -103,7 +133,7 @@ def launch(mode, attempt=1, model_idx=0):
     (JOURNAL / "sessions").mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     try:
-        prompt = SYNC_PROMPT if mode == "sync" else trade_prompt()
+        prompt = SYNC_PROMPT if mode == "sync" else strategy_prompt() if mode == "strategy" else trade_prompt()
     except Exception as e:   # a prompt with a hole is not a session; say so, do not launch
         return {"ok": False, "msg": f"prompt did not render: {type(e).__name__}: {e}"}
     if mode == "trade":
@@ -121,14 +151,40 @@ def launch(mode, attempt=1, model_idx=0):
             pass
     log = open(LOGS / f"agent_{mode}.log", "w")
     # trade sessions think on Opus (David, 2026-08-04); syncs are mechanical — default model
-    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + MCP_RESTRICT
+    if mode == "strategy":
+        # no broker: the strategy arc reads the synced portfolio.json and places nothing
+        nomcp = ENGINE / "config" / "ops_mcp.json"
+        mcp = ["--strict-mcp-config", "--mcp-config", str(nomcp)] if nomcp.exists() else MCP_RESTRICT
+    else:
+        mcp = MCP_RESTRICT
+    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + mcp
     models = runner.job_models("pm")
+    if mode in ("trade", "strategy"):
+        cmd += ["--model", models[min(model_idx, len(models) - 1)]]
     if mode == "trade":
         # the org chart's tier for the PM (roster CLAUDE_TIERS["best"]); _launch_guard falls
         # back to the next entry if the installed CLI cannot run this one
         cmd += ["--model", models[min(model_idx, len(models) - 1)]]
+    # ONE CLAUDE SESSION AT A TIME (claudeq, David 2026-09-04). The TRADE session never
+    # waits: it takes the slot over whatever is running (the queue's fit rule keeps the
+    # 09:05–14:05Z band clear, so a collision is a bug and gets paged). A sync waits.
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        if mode != "trade":
+            claudeq.wait_free(600)
+    except Exception:
+        claudeq = None
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
                             start_new_session=True, env=runner.clean_env())
+    if claudeq is not None:
+        try:
+            if mode != "strategy":     # a strategy session is dispatched BY the queue, which holds the slot for it
+                claudeq.take(f"agent {mode}", proc.pid, "trade" if mode == "trade" else "sync",
+                             log=LOGS / f"agent_{mode}.log", preempt=(mode == "trade"))
+            claudeq.watcher(proc.pid)
+        except Exception:
+            pass
     if mode == "trade":
         try:
             (DATA / "trade_session.pid").write_text(str(proc.pid))
@@ -148,11 +204,19 @@ def launch(mode, attempt=1, model_idx=0):
                           f"while kill -0 {proc.pid} 2>/dev/null; do sleep 20; done; "
                           f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if mode == "strategy":
+        # same post-session accounting as a trade session (contract, reflect, learn, pmusage,
+        # pmreport) so David's report and the reflection ledger see the arc
+        subprocess.Popen(["bash", "-c",
+                          f"while kill -0 {proc.pid} 2>/dev/null; do sleep 20; done; "
+                          f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1"],
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if mode == "trade":
         died = _launch_guard(proc, attempt, model_idx, models)
         if died:
             return died
-    return {"ok": True, "msg": f"agent {mode} launched on {models[min(model_idx, len(models) - 1)]}"}
+    return {"ok": True, "msg": f"agent {mode} launched on {models[min(model_idx, len(models) - 1)]}",
+            "pid": proc.pid, "log": str(LOGS / f"agent_{mode}.log")}
 
 
 def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
@@ -254,9 +318,12 @@ def reconcile():
         mcp_sync.sync()
     except Exception as e:
         print(f"code-sync failed in reconcile ({str(e)[:100]}) — claude fallback")
-        subprocess.run([runner.CLAUDE_BIN, "-p", SYNC_PROMPT, "--dangerously-skip-permissions"] + MCP_RESTRICT,
-                       cwd=str(ROOT), env=runner.clean_env(), timeout=600,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        with claudeq.slot("agent sync (reconcile fallback)", "sync", timeout_s=900):
+            subprocess.run([runner.CLAUDE_BIN, "-p", SYNC_PROMPT, "--dangerously-skip-permissions"] + MCP_RESTRICT,
+                           cwd=str(ROOT), env=runner.clean_env(), timeout=600,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rows = _load_trades()
     now = dtm.datetime.now(dtm.timezone.utc).isoformat(timespec="seconds")
     problems = []
@@ -408,11 +475,11 @@ if __name__ == "__main__":
     m = sys.argv[1] if sys.argv[1:] else ""
     if m == "reconcile":
         r = reconcile()
-    elif m in ("sync", "trade"):
+    elif m in ("sync", "trade", "strategy"):
         att = int(sys.argv[2]) if sys.argv[2:] and sys.argv[2].isdigit() else 1
         midx = int(sys.argv[3]) if sys.argv[3:] and sys.argv[3].isdigit() else 0
-        r = launch(m, attempt=att, model_idx=midx)
+        r = launch(m, attempt=att, model_idx=midx, now="--now" in sys.argv)
     else:
-        sys.exit("usage: loop.py sync | loop.py trade | loop.py reconcile")
+        sys.exit("usage: loop.py sync | loop.py trade | loop.py strategy [--now] | loop.py reconcile")
     print(json.dumps(r))
     sys.exit(0 if r["ok"] else 1)

@@ -297,7 +297,13 @@ INSTANT = {
     # (zero the three prior quarters, then drawn — genuinely current, not a stale figure).
     # ICLR ties the same LinesOfCreditCurrent tag (1,279,762,000 at 2026-06-30) to the
     # issuer's own combined DebtInstrumentCarryingAmount to the dollar once summed with its
-    # already-correct debt_lt and unamortized discount. NotesPayable last, LOWEST priority
+    # already-correct debt_lt and unamortized discount. DebtLongtermAndShorttermCombinedAmount
+    # added 2026-09-05 (quality.py fincheck-mismatch:MRP:debt_lt): MRP's single balance-sheet
+    # line "Debt obligations, net" (no current/noncurrent split at all) ties to this tag
+    # exactly — 2,478,732,000 at 2026-06-30, 2,112,062,000 at 2025-12-31, matching the 10-Q's
+    # two printed columns to the dollar. The card had been falling back to NotesPayable
+    # (13,000,000, flat every quarter since 2025-Q1 — a separate, immaterial note, not the
+    # main debt facility), understating debt_lt by ~99.5%. NotesPayable last, LOWEST priority
     # (only wins when nothing else reports fresher): PRI's entire disclosed debt is
     # NotesPayable 595,716,000 at 2026-06-30 — the prior debt_lt pick was a stale/trivial
     # FinanceLeaseLiability figure understating real debt by ~$595M. NotesPayable is
@@ -308,7 +314,8 @@ INSTANT = {
                 "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
                 "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
                 "FinanceLeaseLiability", "LongTermNotesPayable", "ConvertibleDebtNoncurrent",
-                "UnsecuredLongTermDebt", "NotesPayable"],
+                "UnsecuredLongTermDebt", "DebtLongtermAndShorttermCombinedAmount",
+                "NotesPayable"],
     "debt_current": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
                      "LongTermDebtAndCapitalLeaseObligationsCurrent",
                      "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent",
@@ -392,6 +399,20 @@ CAPEX_SOFTWARE_DISJOINT_VERIFIED = {
                           "activities, less net purchases of property and equipment, and "
                           "capitalized software development costs.",
         "doc_fcf_def": "EX-99.2 filed 2026-08-10 — matches the card's capex = capex + "
+                        "capex_software exactly",
+    },
+    "MKTW": {
+        "quote_cfs": "Investing activities: Purchases of property and equipment ( 627 ) "
+                      "Capitalized software development costs ( 992 ) Net cash used in "
+                      "investing activities ( 1,619 )",
+        "doc_cfs": "10-Q filed 2026-08-06, six months ended 2026-06-30 — 627 + 992 = 1,619 "
+                   "exactly, footing to total investing: two disjoint lines, neither subsumes "
+                   "the other",
+        "quote_fcf_def": "We define Free Cash Flow as net cash provided by (used in) operating "
+                          "activities less capital expenditures. We define capital expenditures "
+                          "as purchases of property and equipment plus capitalized software "
+                          "development costs.",
+        "doc_fcf_def": "10-Q filed 2026-08-06 — matches the card's capex = capex + "
                         "capex_software exactly",
     },
 }
@@ -1354,6 +1375,28 @@ MEZZANINE_EXCLUDE = {
     "RMR": {"RedeemableNoncontrollingInterestEquityCarryingAmount"},
 }
 
+# Temporary equity an issuer discloses on the FACE of its own balance sheet but tags under
+# a namespace none of MEZZANINE_TAGS or the NCI-backout (StockholdersEquityIncludingPortion...
+# / PartnersCapitalIncludingPortion...) can see — same "companyfacts drops the extension
+# namespace" shape as ONTO's debt_lt and ARES's NCI, just landing on temporary equity
+# instead. DYNR's "TEMPORARY EQUITY" section (Series C + Series D Senior Convertible
+# Preferred, redeemable, carried OUTSIDE both total_liabilities and StockholdersEquity) has
+# no dollar-valued XBRL tag in companyfacts at all — only TemporaryEquitySharesOutstanding
+# (a share count) survives the API; the two dollar lines never appear under ANY tag,
+# confirmed by grepping every companyfacts value for 4,337,480 / 1,520,000 (fincard.py-126,
+# 2026-09-04: 10.2% "BALANCE SHEET DOES NOT FOOT" gap, exact dollar match to the printed
+# TEMPORARY EQUITY subtotal). Same MANUAL contract as MANUAL below: PM-verified, quoted,
+# applied only where the standard scan finds nothing at this issuer's own balance-sheet date.
+MEZZANINE_MANUAL = {
+    "DYNR": {
+        "value": 5_857_480, "asof": "2026-06-30",
+        "quote": "TEMPORARY EQUITY (Note 10) ... Series C Senior Convertible Preferred Stock "
+                 "... 4,337,480 ... Series D Senior Convertible Preferred Stock ... 1,520,000",
+        "doc": "10-Q filed 2026-08-18 (period 2026-06-30) — condensed consolidated balance sheet",
+        "entered": "2026-09-04",
+    },
+}
+
 
 def _mezzanine_equity(gaap, asof, parent_eq, ticker=None):
     """Sum of NCI/temporary-equity concepts reported AT the balance-sheet date. Read from
@@ -1409,6 +1452,10 @@ def _mezzanine_equity(gaap, asof, parent_eq, ticker=None):
             incl = max(rows, key=lambda r: r.get("filed") or "")["val"]
             total += incl - parent_eq
             found = True
+    if not found:
+        man = MEZZANINE_MANUAL.get((ticker or "").upper())
+        if man and man["asof"] == asof:
+            total, found = total + man["value"], True
     return total if found else None
 
 

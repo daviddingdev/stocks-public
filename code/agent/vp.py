@@ -407,16 +407,24 @@ def review(timeout=1800):
         return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": str(e)[:200]}
     t0 = time.time()
     try:
-        p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
-                            "--strict-mcp-config", "--mcp-config", str(nomcp),
-                            "--model", runner.job_model("vp")],
-                           cwd=str(ROOT), capture_output=True, text=True,
-                           timeout=timeout, env=runner.clean_env())
+        # ONE CLAUDE SESSION AT A TIME (claudeq): wait for the slot — a queued research job
+        # may be live — then run. The wait is outside the stage timeout.
+        import claudeq
+        with claudeq.slot("vp review", "vp", "review"):
+            p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
+                                "--strict-mcp-config", "--mcp-config", str(nomcp),
+                                "--model", runner.job_model("vp")],
+                               cwd=str(ROOT), capture_output=True, text=True,
+                               timeout=timeout, env=runner.clean_env())
         out = (p.stdout or "").strip().splitlines()
         ok2, tail = p.returncode == 0, (out[-1][:200] if out else "")
         err = "" if ok2 else ((p.stderr or "").strip().splitlines() or [""])[-1][:200]
+        if not ok2 and claudeq.limit_reset("\n".join(out[-3:]) + err):
+            err = f"USAGE LIMIT — {err or tail}"[:200]
     except subprocess.TimeoutExpired:
         ok2, tail, err = False, "", f"timed out after {timeout}s"
+    except TimeoutError as e:            # the slot never freed — fail closed, visibly
+        ok2, tail, err = False, "", str(e)[:200]
     except Exception as e:
         ok2, tail, err = False, "", f"{type(e).__name__}: {e}"[:200]
     dur = time.time() - t0
@@ -462,10 +470,12 @@ def analyst(timeout=2400):
     nomcp = ENGINE / "config" / "ops_mcp.json"
     t0 = time.time()
     try:
-        p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
-                            "--strict-mcp-config", "--mcp-config", str(nomcp),
-                            "--model", runner.job_model("analyst")],
-                           cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=runner.clean_env())
+        import claudeq
+        with claudeq.slot("vp analyst", "vp", "analyst"):
+            p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
+                                "--strict-mcp-config", "--mcp-config", str(nomcp),
+                                "--model", runner.job_model("analyst")],
+                               cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=runner.clean_env())
         out = (p.stdout or "").strip().splitlines()
         ok2 = p.returncode == 0 and (DATA / "analyst_brief.md").exists() \
             and (time.time() - (DATA / "analyst_brief.md").stat().st_mtime) < timeout + 60
@@ -558,9 +568,15 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     # which it can only do if it is told — so failures go to `alerts`, on state, not on
     # every run.
     if bad:
+        # Name the cause. A limit death and the two nightly soft-fails (drift, filings) used to
+        # share one headline; the PM's own retrospective (2026-09-04) had to dig the cause out
+        # of vp_sweep.log line 414.
+        limited = [s["stage"] for s in stages if not s["ok"]
+                   and ("limit" in (s.get("err") or "").lower() or "limit" in (s.get("out") or "").lower())]
+        head = f"USAGE LIMIT killed {', '.join(limited)} · " if limited else ""
         try:
             subprocess.run([str(pathlib.Path.home() / "maintenance/bin/notify.sh"), "alerts",
-                            "VP night sweep", f"{len(bad)}/{len(stages)} stage(s) FAILED: "
+                            "VP night sweep", f"{head}{len(bad)}/{len(stages)} stage(s) FAILED: "
                             f"{', '.join(bad)[:160]} — the PM's desk is incomplete for tomorrow"],
                            capture_output=True, timeout=30)
         except Exception as e:

@@ -140,10 +140,21 @@ def pid_file(log_path):
     return Path(str(log_path) + ".pid")
 
 
-def launch(prompt, log_path):
+def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s=0):
+    """Spawn ONE headless Claude session. ONE AT A TIME (claudeq, David 2026-09-04): a
+    caller that names its `job` is a fixed cron launch (board, primer) — it waits up to
+    wait_s for the Claude slot and then holds it; a caller that does not is being
+    dispatched by claudeq.tick(), which already holds the slot for it. Either way a
+    detached watcher ticks the queue when the session exits, so the next job starts
+    within seconds instead of at the next cron minute."""
     ok, msg = auth_check()
     if not ok:
         return {"ok": False, "msg": msg}
+    if job:
+        import claudeq
+        if not claudeq.wait_free(wait_s):
+            h = claudeq._read(claudeq.HOLDER) or {}
+            return {"ok": False, "msg": f"Claude slot busy after {wait_s}s: {h.get('job', '?')} still running"}
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "w")
     try:
@@ -161,7 +172,14 @@ def launch(prompt, log_path):
         pid_file(log_path).write_text(str(p.pid))
     except Exception:
         pass
-    return {"ok": True, "pid": p.pid}
+    try:
+        import claudeq
+        if job:
+            claudeq.take(job, p.pid, kind or job, sub, est_min, log_path)
+        claudeq.watcher(p.pid)
+    except Exception:
+        pass
+    return {"ok": True, "pid": p.pid, "log": str(log_path)}
 
 
 def reap():
@@ -214,6 +232,14 @@ def log_error(log_path):
         tail = log_path.read_text(errors="ignore")[-4000:]
     except Exception:
         return ""
+    try:
+        import claudeq
+        reset = claudeq.limit_reset(tail[-600:])
+    except Exception:
+        reset = None
+    if reset:
+        return (f"Run died on the shared Claude usage limit (resets {reset:%H:%MZ}) — the queue "
+                f"re-files it for after the reset; nothing here is done.")
     if "401" in tail and "authentication" in tail.lower():
         return "Run failed: Claude CLI auth expired — run `claude auth login` on the Spark, then retry."
     if "API Error" in tail:
@@ -279,7 +305,65 @@ def research_prompt(tk):
     )
 
 
-def launch_research(tk):
+def finish_applicable(tk):
+    """A teardown that collected everything and died before synthesis: research/*.md incl.
+    the adversarial review exist, analysis/FINAL-REPORT.md does not. CNNE (2026-09-04), ETD
+    and MRP (08-31) all died this way on the usage limit — two hours of collection on disk
+    and no verdict. Finishing is a ~25-min synthesis session, not a two-hour re-teardown."""
+    cd = company_dir(tk)
+    if not cd:
+        return False
+    return ((cd / "research" / "adversarial-review.md").exists()
+            and not (cd / "analysis" / "FINAL-REPORT.md").exists())
+
+
+def finish_prompt(tk):
+    """Step (3) of the teardown ONLY, over the research already on disk. The step-3 text
+    is sliced out of research_prompt() so the two can never drift."""
+    tk = tk.upper()
+    full = research_prompt(tk)
+    step3 = full[full.index("(3) synthesize"):]
+    cd = company_dir(tk)
+    return (
+        f"finish {tk} — FINISH MODE for an existing deep-research teardown in ~/Stocks/{cd.name}/. The "
+        f"collection steps are DONE and on disk: research/*.md (every pillar), research/adversarial-review.md "
+        f"(the refuter's per-claim verdicts), research/_evidence/ (facts.json, INDEX.md, sections.json, the "
+        f"text-extracted filings) and the model files under financials/. Do NOT re-run evidence.py, do NOT "
+        f"re-spawn pillar agents, do NOT re-run the refuter — a session doing that died on the usage limit "
+        f"after two hours with nothing in analysis/. If research/_evidence/SHELF.md is missing, run ONLY "
+        f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` first. Then READ, in this order: SHELF.md, "
+        f"shelf/fincard.json, research/adversarial-review.md, every research/*.md, financials/*. Where the "
+        f"refuter OVERTURNED a claim, the synthesis must carry the overturned version, never the original. "
+        f"Apply ~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry, "
+        f"kill-the-thesis) and RUNBOOK.md §3. Now do step {step3}"
+    )
+
+
+def launch_finish(tk, now=False):
+    tk = tk.upper()
+    if not finish_applicable(tk):
+        return {"ok": False, "msg": f"{tk} is not finishable: needs research/adversarial-review.md and no FINAL-REPORT yet."}
+    if run_state(research_log(tk)) == "alive":
+        return {"ok": False, "msg": f"Research on {tk} is already running."}
+    if not now:
+        import claudeq
+        return claudeq.enqueue("finish", {"tk": tk}, by="runner")
+    return launch(finish_prompt(tk), research_log(tk))
+
+
+def launch_research(tk, now=False, full=False):
+    """Deep teardown. Files a queue job (claudeq) unless dispatched by the queue itself
+    (now=True). One per ticker: a live run refuses a second launch — OABI launched twice
+    nine seconds apart on 2026-09-04 and one copy died at 94s for nothing. A teardown that
+    only lacks its synthesis is FINISHED, not redone, unless full=True."""
+    tk = tk.upper()
+    if run_state(research_log(tk)) == "alive":
+        return {"ok": False, "msg": f"Research on {tk} is already running."}
+    if not full and finish_applicable(tk):
+        return launch_finish(tk, now=now)
+    if not now:
+        import claudeq
+        return claudeq.enqueue("research", {"tk": tk}, by="runner")
     return launch(research_prompt(tk), research_log(tk))
 
 
@@ -362,7 +446,7 @@ def _ntfy_topic():
         return ""
 
 
-def launch_update(tk):
+def launch_update(tk, now=False):
     tk = tk.upper()
     cd = company_dir(tk)
     if not cd:
@@ -371,8 +455,11 @@ def launch_update(tk):
     if (cd / "analysis" / "updates" / today_f).exists() or (cd / "analysis" / today_f).exists():
         return {"ok": False, "msg": f"{tk} already has an update dated today."}
     lg = update_log(tk)
-    if lg.exists() and time.time() - lg.stat().st_mtime < 900:
-        return {"ok": False, "msg": f"An update for {tk} looks in-flight (log active <15 min ago)."}
+    if run_state(lg) == "alive":
+        return {"ok": False, "msg": f"An update for {tk} is already running."}
+    if not now:
+        import claudeq
+        return claudeq.enqueue("update", {"tk": tk}, by="runner")
     rep = cd / "analysis" / "FINAL-REPORT.md"
     rdate = dt.date.fromtimestamp(rep.stat().st_mtime).isoformat() if rep.exists() else "unknown"
     prompt = update_prompt(tk, cd.name, rdate)
@@ -527,9 +614,14 @@ def rec_prompt():
     )
 
 
-def launch_rec():
+def launch_rec(now=False):
     if rec_path().exists():
         return {"ok": False, "msg": f"Today's recommendation already exists (rec_{dt.date.today().isoformat()}.md)."}
+    if run_state(rec_log()) == "alive":
+        return {"ok": False, "msg": "A recommendation session is already running."}
+    if not now:
+        import claudeq
+        return claudeq.enqueue("rec", {}, by="runner")
     return launch(rec_prompt(), rec_log())
 
 
@@ -608,15 +700,23 @@ def brief_prompt():
     )
 
 
-def launch_brief(force=False):
+def launch_brief(force=False, now=False):
     p = brief_path()
     if p.exists() and not force:
         return {"ok": False, "msg": f"Today's brief already exists ({p.name}) — use Rewrite to redo it."}
+    lg = brief_log()
+    if run_state(lg) == "alive":
+        return {"ok": False, "msg": "A brief is already being written."}
+    if not now:
+        # David asked for it now, so the clock windows do not apply — but it still takes
+        # its turn behind whatever Claude session is live (one at a time).
+        import claudeq
+        r = claudeq.enqueue("brief", {"force": bool(force)}, by="runner", ignore_windows=True)
+        if r.get("started"):
+            r["msg"] = "Writing today's brief — Claude is reading the day's events against every thesis (a few minutes)."
+        return r
     if force and p.exists():
         p.unlink()
-    lg = brief_log()
-    if lg.exists() and time.time() - lg.stat().st_mtime < 300 and not log_error(lg):
-        return {"ok": False, "msg": "A brief looks in-flight (log active <5 min ago)."}
     BRIEF_DIR.mkdir(parents=True, exist_ok=True)
     r = launch(brief_prompt(), lg)
     if r.get("ok"):
@@ -652,18 +752,29 @@ if __name__ == "__main__":
     if args[:1] == ["save-token"]:
         save_token_interactive()
         sys.exit(0)
+    now = "--now" in args          # bypass the queue: interactive use only, one at a time still
     if args[:1] == ["rec"]:
-        r = launch_rec()
+        r = launch_rec(now=now)
     elif args[:1] == ["brief"]:
-        r = launch_brief(force="--force" in args)
+        r = launch_brief(force="--force" in args, now=now)
     elif args[:1] == ["research"] and len(args) > 1:
-        r = launch_research(args[1])
+        r = launch_research(args[1], now=now, full="--full" in args)
+    elif args[:1] == ["finish"] and len(args) > 1:
+        r = launch_finish(args[1], now=now)
     elif args[:1] == ["update"] and len(args) > 1:
-        r = launch_update(args[1])
+        r = launch_update(args[1], now=now)
+    elif args[:1] == ["chain"] and len(args) > 1:
+        # N focused updates, one queue job each — the queue serialises them and a limit
+        # death re-files the one that died instead of announcing stale verdicts as new
+        # (the 2026-09-04 rescore_chain.sh lesson).
+        rs = [launch_update(t, now=False) for t in args[1:] if not t.startswith("--")]
+        r = {"ok": all(x.get("ok") for x in rs), "jobs": rs,
+             "msg": "; ".join(f"{t.upper()}: {x.get('msg', '')}" for t, x in zip([a for a in args[1:] if not a.startswith('--')], rs))}
     elif args[:1] == ["autorefresh"]:
         r = launch_autorefresh()
     else:
         sys.exit("usage: runner.py rec | runner.py brief [--force] | runner.py research TICKER | "
-                 "runner.py update TICKER | runner.py save-token")
+                 "runner.py finish TICKER | runner.py update TICKER | runner.py chain TICKER... | runner.py save-token   "
+                 "(--now skips the queue's clock; the slot is still one at a time)")
     print(json.dumps(r))
     sys.exit(0 if r.get("ok") else 1)

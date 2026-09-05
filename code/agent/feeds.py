@@ -382,6 +382,120 @@ def _resolve_form4_transactions(filings, cap=30):
     return filings
 
 
+def form4_day_details(cik, acc_doc_pairs):
+    """Parse (or pull from the accession-keyed cache) every Form 4 an issuer filed on one
+    day, for classify_form4_entries to bucket. Same cache file/key convention as
+    _resolve_form4_transactions (accession with dashes stripped) so a filing fetched here
+    is never re-fetched there, or vice versa."""
+    cache_f = DATA / "form4_transactions.json"
+    try:
+        cache = json.loads(cache_f.read_text())
+    except Exception:
+        cache = {}
+    dirty = False
+    out = []
+    for acc, doc in acc_doc_pairs:
+        acc_nodash = acc.replace("-", "")
+        entry = cache.get(acc_nodash)
+        if entry is None:
+            xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/{doc.rsplit('/', 1)[-1]}"
+            try:
+                entry = _parse_form4_xml(requests.get(xml_url, headers=UA, timeout=30).text)
+            except Exception:
+                entry = {}
+            cache[acc_nodash] = entry
+            dirty = True
+            time.sleep(0.15)
+        out.append(entry)
+    if dirty:
+        cache_f.write_text(json.dumps(cache, indent=1))
+    return out
+
+
+def classify_form4_entries(entries):
+    """Bucket one issuer-day's parsed Form 4s into open-market (code P/S, priced) vs
+    grant/tax (code A/M/F) per feeds.py-124 -- a spin-off's identical all-grant Form 4s
+    (MBGL 2026-09-02: 8 filings, all code A, $0 RSU grants under the LTIP) should read as
+    ONE line saying so, not eight copies of 'filed 4 today'. Codes outside both sets (gifts,
+    conversions, ...) land in 'other' and count toward N but neither bucket."""
+    open_market, grants, other = [], [], []
+    net_dollars = 0.0
+    for e in entries:
+        code = e.get("transaction_code")
+        shares = e.get("shares") or 0
+        price = e.get("price") or 0
+        if code in ("P", "S") and price:
+            open_market.append(e)
+            net_dollars += shares * price * (1 if code == "P" else -1)
+        elif code in ("A", "M", "F"):
+            grants.append(e)
+        else:
+            other.append(e)
+    return {"open_market": open_market, "grants": grants, "other": other, "net_dollars": net_dollars}
+
+
+_DATED_FORM_RE = re.compile(
+    r"\b(SC 13D/A|SC 13G/A|SC 13D|SC 13G|8-K/A|8-K|10-K|10-Q|DEFM14A|DEF 14A|424B5)\b")
+
+
+def resolve_dated_form_expectations():
+    """feeds.py-128 (PM, delegated 2026-09-01): a dates.json item that names an expected
+    SEC form and a date is a lookup, not judgment -- the PM did this by hand for ARI's
+    Brooklyn 8-K window on 2026-09-04 (curl the submissions JSON, read off form/filingDate).
+    Once an item's date arrives, check EDGAR for the issuer (ticker read off the item's
+    leading token in 'what', the desk's own convention: 'ARI Brooklyn...', 'ETD $3.00/sh
+    ...', 'MBGL:...') and write the outcome onto the item so the next session reads a fact
+    instead of re-deriving it. Idempotent via '_form_resolved'; returns the resolved lines
+    for session_brief.md's Watching section."""
+    path = DATA / "dates.json"
+    try:
+        doc = json.loads(path.read_text())
+    except Exception:
+        return []
+    items = doc.get("items") or []
+    m_cmap = cik_map()
+    today = dt.date.today().isoformat()
+    resolved = []
+    changed = False
+    for it in items:
+        if it.get("_form_resolved") or it.get("date", "") > today:
+            continue
+        what = it.get("what", "")
+        # 'what' only, not 'expect' -- 'expect' regularly cites a form ALREADY on file as
+        # evidence ("The 10-Q filed 2026-08-10 says...") and that read as a pending
+        # expectation for the item's OWN date (ARI's 2026-08-31 item, false-positive
+        # caught in review before this shipped). 'what' is the short label the desk
+        # itself wrote for what this date IS, so a form named there names what's due.
+        form_m = _DATED_FORM_RE.search(what)
+        if form_m and what[form_m.end():form_m.end() + 15].strip().lower().startswith("filed"):
+            form_m = None  # "10-Q filed 2026-08-07" in the label itself is also evidence, not a due date
+        tk_m = re.match(r"\s*([A-Z]{2,6})\b", what)
+        if not form_m or not tk_m or tk_m.group(1) not in m_cmap:
+            continue
+        tk, form, cik = tk_m.group(1), form_m.group(1), m_cmap[tk_m.group(1)]
+        try:
+            rec = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                               headers=UA, timeout=20).json()["filings"]["recent"]
+        except Exception:
+            continue
+        hit = next(((f, d, a) for f, d, a in
+                    zip(rec["form"], rec["filingDate"], rec["accessionNumber"])
+                    if f == form and d >= it["date"]), None)
+        if hit:
+            outcome = f"filed {hit[0]} {hit[1]} (acc {hit[2]})"
+        else:
+            last = next(((f, d) for f, d in zip(rec["form"], rec["filingDate"])), (None, None))
+            outcome = f"no {form} by {it['date']}; last filing {last[0] or '?'} {last[1] or '?'}"
+        it["expect"] = f"{it.get('expect', '')} RESOLVED {today}: {outcome}."
+        it["_form_resolved"] = today
+        resolved.append(f"{tk}: {outcome} (was watching for {form} by {it['date']})")
+        changed = True
+        time.sleep(0.15)
+    if changed:
+        _write_json(path, doc)
+    return resolved
+
+
 # ---------- special-situations radar (market-wide, not universe-bound) ----------
 # Sourcing doctrine: _engine/research/SOURCING.md — mechanism-driven channels.
 # SC 13D = fresh activist/concentrated stakes · 10-12B = spinoff registrations ·
@@ -894,9 +1008,16 @@ def refresh():
           + (f"  ⚠ DEGRADED (carried over): {', '.join(degraded)}" if degraded else "")
           + (f"  [vendor: {'; '.join(FH_FAILS[-3:])}]" if FH_FAILS else ""))
 
+    resolved = resolve_dated_form_expectations()
+    if resolved:
+        print(f"dates.json: {len(resolved)} dated form expectation(s) resolved — " + "; ".join(resolved))
+
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["refresh"]:
         refresh()
+    elif sys.argv[1:2] == ["dates"]:
+        for line in resolve_dated_form_expectations():
+            print(line)
     else:
-        sys.exit("usage: feeds.py refresh")
+        sys.exit("usage: feeds.py refresh | feeds.py dates")

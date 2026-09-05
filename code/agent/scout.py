@@ -410,7 +410,13 @@ def run(max_pre=25, max_triage=8):
                 (NAMES / tk).mkdir(parents=True, exist_ok=True)
                 (NAMES / tk / "fincard.json").write_text(json.dumps(card, indent=1))
                 summary, _ = _fincard_summary(tk)
-            except Exception as ex:
+            # (Exception, SystemExit), not Exception (hunt 2026-09-05): fincard.resolve_cik
+            # raises SystemExit — a BaseException — when SEC's company_tickers.json has no
+            # entry for the symbol. Scout's tickers come from news and filing feeds, which
+            # is exactly where an unresolvable symbol shows up, and a bare `except Exception`
+            # let that one row kill the whole scout run instead of marking itself
+            # enrich_failed and moving on.
+            except (Exception, SystemExit) as ex:
                 it["status"] = "enrich_failed"
                 it["error"] = str(ex)[:120]
                 continue
