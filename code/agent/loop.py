@@ -99,7 +99,9 @@ def launch(mode, attempt=1, model_idx=0, now=False):
         sys.path.insert(0, str(ENGINE))
         import claudeq
         key = f"strategy:{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H%M}"
-        return claudeq.enqueue("strategy", {}, key=key, by="loop", ignore_windows=True)
+        # tier 35: a session the PM files for itself runs AFTER the research and staff it also
+        # filed (research is 30) — otherwise back-to-back PM sessions would starve their own work.
+        return claudeq.enqueue("strategy", {}, key=key, by="pm", tier=35, ignore_windows=True)
     # sync is a mechanical JSON fetch — CODE does it now (mcp_sync.py, 2026-08-13,
     # after David's notification archaeology found Claude sessions doing curl work).
     # A Claude session remains the FALLBACK so token expiry never leaves a gap.
@@ -171,8 +173,10 @@ def launch(mode, attempt=1, model_idx=0, now=False):
     try:
         sys.path.insert(0, str(ENGINE))
         import claudeq
-        if mode != "trade":
+        if mode == "sync":
             claudeq.wait_free(600)
+        # strategy is DISPATCHED BY THE QUEUE, which already holds the slot and the lock for
+        # this call: waiting here deadlocked the tick on 2026-09-05 (five hours of idle slot).
     except Exception:
         claudeq = None
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,

@@ -914,8 +914,18 @@ def _ttm(quarters, annuals, ytd=None, mode="sum"):
         qs = quarters[:4]
         if _contig(qs) and 350 <= _days(qs[3]["start"], qs[0]["end"]) <= 380:
             how = "incl. ytd-diff derived" if any(q.get("derived") for q in qs) else "4 direct 10-Q quarters"
-            q_result = (sum(x["value"] for x in qs), f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})",
-                        qs[0]["end"], qs[3]["start"])
+            total = sum(x["value"] for x in qs)
+            if mode == "avg":
+                # a stock measure (e.g. weighted-average share count) is never summed —
+                # this branch is normally pre-empted by the run[0] > annuals[0] check
+                # above, but a tie or a stale run falls through here and must still
+                # average, not sum (fincard.py-131: a tie was returning ~4x the true count)
+                avg_how = " (incl. ytd-diff derived)" if any(q.get("derived") for q in qs) else ""
+                q_result = (total / 4.0, f"avg of 4 direct 10-Q quarters {qs[3]['start']}..{qs[0]['end']}{avg_how}",
+                            qs[0]["end"], qs[3]["start"])
+            else:
+                q_result = (total, f"TTM {qs[3]['start']}..{qs[0]['end']} ({how})",
+                            qs[0]["end"], qs[3]["start"])
     a_result = None
     if annuals:
         a = annuals[0]
@@ -948,11 +958,11 @@ def _prior_ttm(quarters, annuals, mode="sum"):
     if len(quarters) >= 8 and _contig(quarters[4:8]):
         tot = sum(x["value"] for x in quarters[4:8])
         if mode == "avg":
-            return tot / 4.0, f"avg of 4 quarters to {quarters[4]['end']}"
-        return tot, f"TTM to {quarters[4]['end']}"
+            return tot / 4.0, f"avg of 4 quarters to {quarters[4]['end']}", quarters[4]["end"]
+        return tot, f"TTM to {quarters[4]['end']}", quarters[4]["end"]
     if len(annuals) >= 2:
-        return annuals[1]["value"], f"FY to {annuals[1]['end']}"
-    return None, None
+        return annuals[1]["value"], f"FY to {annuals[1]['end']}", annuals[1]["end"]
+    return None, None, None
 
 
 def _price(tk):
@@ -1045,11 +1055,15 @@ AUX_ONLY_FLOWS = {"costs_and_expenses", "capex_software", "bank_net_interest_inc
 # (sbc_pct_revenue), total_assets and total_liabilities (the footing identity), and
 # everything feeding net_cash / EV / FCF / BVPS.
 #
-# A stale `goodwill` tag changes no number this book acts on. Raising it to the same flag
-# list as a stale `debt_lt` is how a flag list becomes wallpaper — 50 of 99 open rows on
-# 2026-08-18 were exactly this. Recorded on the figure, left off the card's flags.
+# A stale `goodwill` tag used to change no number this book acts on. Raising it to the
+# same flag list as a stale `debt_lt` is how a flag list becomes wallpaper — 50 of 99
+# open rows on 2026-08-18 were exactly this. Recorded on the figure, left off the card's
+# flags — UNTIL fincard.py-141 (2026-09-05) added tangible_book/tangible_book_per_share,
+# which DO consume goodwill and intangibles. The self-check below caught this the same
+# night: `goodwill`/`intangibles` moved out of DISPLAY_ONLY so a stale tag flags loudly
+# again, same as debt_lt already does for net_cash.
 DISPLAY_ONLY = {
-    "goodwill", "intangibles", "receivables", "inventory", "ppe_net", "operating_lease_liab",
+    "receivables", "inventory", "ppe_net", "operating_lease_liab",
     "lt_investments", "rnd", "sga", "acquisitions", "eps_diluted", "shares_diluted_wavg",
 }
 
@@ -1656,9 +1670,10 @@ def build(tk, cik_override=None):
                    "period_end": endd, "period_start": startd, "tag": tag,
                    "latest_quarter_end": quarters[0]["end"] if quarters else None}
         ttm_vals[name] = val
-        pv, pp = _prior_ttm(quarters, annuals, mode="avg" if avg else "sum")
+        pv, pp, pend = _prior_ttm(quarters, annuals, mode="avg" if avg else "sum")
         if pv is not None:
             F[name]["prior_period_value"], F[name]["prior_period"] = pv, pp
+            F[name]["prior_period_end"] = pend
         S[name] = {"quarters": [{"end": q["end"], "value": q["value"],
                                  **({"derived": q["derived"]} if q.get("derived") else {})}
                                 for q in quarters[:12]],
@@ -2253,9 +2268,42 @@ def build(tk, cik_override=None):
             if num is not None:
                 put(label, num / rev * 100, f"{num:,.0f} / revenue {rev:,.0f}")
     fr = F.get("revenue")
-    if fr and fr.get("prior_period_value"):
-        put("revenue_growth_pct", (fr["value"] / fr["prior_period_value"] - 1) * 100,
-            f"{fr['value']:,.0f} vs {fr['prior_period_value']:,.0f} ({fr['prior_period']})")
+    if fr and fr.get("prior_period_value") is not None:
+        # fincard.py-130: a raw value/prior-1 with no period check let VSNT print a
+        # 181-day numerator over a 365-day prior as -52.8% "growth" and CALM compare
+        # against a prior period ending 2282 days early — gate on alignment, annualize
+        # a partial current window the way ev_over_revenue already does, and flag
+        # rather than silently drop so the dashboard/scout consumers see why.
+        pv = fr["prior_period_value"]
+        cur_start, cur_end = fr.get("period_start"), fr.get("period_end")
+        prior_end = fr.get("prior_period_end")
+        cur_days = _days(cur_start, cur_end) if cur_start and cur_end else None
+        gap_days = _days(prior_end, cur_end) if prior_end and cur_end else None
+        if pv <= 0:
+            card["flags"].append(
+                f"revenue_growth_pct SKIPPED — prior period revenue {pv:,.0f} "
+                f"({fr.get('prior_period')}) is <= 0; percent growth is not meaningful "
+                f"(fincard.py-130).")
+        elif gap_days is None or not (270 <= gap_days <= 460):
+            card["flags"].append(
+                f"revenue_growth_pct SKIPPED — prior period ({fr.get('prior_period')}) does "
+                f"not end 270-460d before the current period end ({cur_end}); not a comparable "
+                f"window (fincard.py-130).")
+        else:
+            cur_val, note = fr["value"], ""
+            if not cur_days or not (350 <= cur_days <= 380):
+                if cur_days:
+                    cur_val = fr["value"] * 365.0 / cur_days
+                    note = (f"revenue annualized from a {cur_days}d partial-period flow "
+                            f"({fr['value']:,.0f} -> {cur_val:,.0f}/yr) before comparing to the "
+                            f"prior full period — no TTM/FY on file yet (fincard.py-130).")
+                else:
+                    note = ("current period length unknown — comparison may span an "
+                            "unannualized partial period (fincard.py-130).")
+            put("revenue_growth_pct", (cur_val / pv - 1) * 100,
+                f"{cur_val:,.0f} vs {pv:,.0f} ({fr.get('prior_period')})", note)
+            if note:
+                card["flags"].append("revenue_growth_pct " + note)
     if ni is not None and gv("equity"):
         put("roe_pct", ni / gv("equity") * 100, f"net_income {ni:,.0f} / equity {gv('equity'):,.0f}",
             "period-end equity, not average")
@@ -2466,6 +2514,43 @@ def build(tk, cik_override=None):
                     if pref else "no preferred liquidation preference tagged as of the equity date")
             put("price_over_book", mc / ce, f"market_cap {mc:,.0f} / {pref_txt}", note)
             put("book_value_per_share", ce / sh, f"{pref_txt} / shares {sh:,.0f}", note)
+            # TANGIBLE BOOK (fincard.py-141): book_value_per_share/price_over_book rest on
+            # total equity with no goodwill/intangible adjustment — MBGL prints 0.62x book
+            # while its balance sheet is 96% goodwill+intangibles and tangible book is
+            # NEGATIVE. Same class as the TAX-DRIVEN EARNINGS check above: a derived
+            # multiple that re-derives exactly and is still economically misleading unless
+            # the card says what it rests on.
+            gw, intang = gv("goodwill") or 0, gv("intangibles") or 0
+            # a stale goodwill/intangibles tag must poison tangible_book LOUDLY, not
+            # silently treat unknown-but-likely-nonzero as 0 — same DXC/net_cash lesson
+            # as the debt_lt handling above: excluding a stale figure always flatters.
+            stale_gi = ""
+            for gk in ("goodwill", "intangibles"):
+                gf = F.get(gk) or {}
+                if gf.get("STALE") and gf.get("value"):
+                    stale_gi += (f" {gk} tag STALE (last known {gf['value']:,.0f} at "
+                                 f"{gf.get('asof')}) excluded —")
+            if gw or intang or stale_gi:
+                tb = ce - gw - intang
+                put("tangible_book", tb,
+                    f"{pref_txt} - goodwill {gw:,.0f} - intangibles {intang:,.0f}",
+                    ("TANGIBLE BOOK UNRELIABLE:" + stale_gi.rstrip("—") +
+                     " — may understate the deduction" if stale_gi else ""))
+                put("tangible_book_per_share", tb / sh, f"tangible_book {tb:,.0f} / shares {sh:,.0f}")
+                if stale_gi:
+                    card["flags"].append(
+                        "TANGIBLE BOOK UNRELIABLE:" + stale_gi.rstrip("—") +
+                        " — tangible_book may understate the goodwill/intangible deduction "
+                        "(fincard.py-141).")
+                if (gw + intang) > 0.75 * ce:
+                    card["flags"].append(
+                        f"BOOK VALUE MOSTLY INTANGIBLE: goodwill {gw:,.0f} + intangibles "
+                        f"{intang:,.0f} = {gw + intang:,.0f}, {(gw + intang) / ce * 100:.0f}% "
+                        f"of common equity {ce:,.0f} — tangible_book is "
+                        f"{'NEGATIVE ' if tb < 0 else ''}{tb:,.0f} (tangible_book_per_share "
+                        f"{tb / sh:,.2f} vs book_value_per_share {ce / sh:,.2f}); "
+                        f"price_over_book on total book may read cheap on a balance sheet "
+                        f"with little tangible support (fincard.py-141).")
         bb, dv = ttm_vals.get("buybacks"), ttm_vals.get("dividends_paid")
         if bb:
             put("buyback_yield_pct", bb / mc * 100, f"buybacks {bb:,.0f} / market_cap {mc:,.0f}")

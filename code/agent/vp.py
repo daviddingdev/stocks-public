@@ -32,6 +32,7 @@ CLI: vp.py sweep [--fast]      --fast skips dossier rebuilds (stage 7)
      vp.py brief               rebuild vp_brief.md from existing artifacts only
 """
 import datetime as dt
+import contextlib
 import json
 import os
 import pathlib
@@ -91,13 +92,36 @@ def run(label, cmd, timeout=1800):
         ok = p.returncode == 0
         tail = out[-1][:200] if out else ""
         err = "" if ok else ((p.stderr or "").strip().splitlines() or [""])[-1][:200]
+        # The LAST stdout line summarises a stage only if the stage prints a summary. For a
+        # stage that prints one row per item — `asof.py filings` — the last line is whichever
+        # row happened to sort last, and on a FAILING run that line can be a PASSING row: the
+        # sweep rendered '| filings | **FAILED** | ... | ok  MSGS card=... |' for three nights
+        # while hiding the row that actually failed (ETD, a superseded filing on an active
+        # candidate). On failure, carry the first line that is NOT a pass (ask vp.py-122).
+        fail_line = ""
+        if not ok:
+            for ln in out:
+                t = ln.strip()
+                if t and not t.lower().startswith(("ok", "pass", "[ok")):
+                    fail_line = t[:200]
+                    break
     except subprocess.TimeoutExpired:
-        ok, tail, err = False, "", f"timed out after {timeout}s"
+        ok, tail, err, fail_line = False, "", f"timed out after {timeout}s", ""
     except Exception as e:
-        ok, tail, err = False, "", f"{type(e).__name__}: {e}"[:200]
+        ok, tail, err, fail_line = False, "", f"{type(e).__name__}: {e}"[:200], ""
     dur = time.time() - t0
-    print(f"  [{'ok ' if ok else 'FAIL'}] {label:<10} {dur:6.1f}s  {tail or err}")
-    return {"stage": label, "ok": ok, "seconds": round(dur, 1), "out": tail, "err": err}
+    st = {"stage": label, "ok": ok, "seconds": round(dur, 1), "out": tail, "err": err,
+          "fail_line": fail_line}
+    print(f"  [{'ok ' if ok else 'FAIL'}] {label:<10} {dur:6.1f}s  {_stage_note(st)}")
+    return st
+
+
+def _stage_note(st):
+    """What a stage row should SAY. On a pass, its summary; on a failure, the evidence of
+    the failure — never a passing row that merely happened to print last."""
+    if st.get("ok"):
+        return st.get("out") or st.get("err") or ""
+    return st.get("fail_line") or st.get("err") or st.get("out") or ""
 
 
 # ---------------------------------------------------------------- the brief
@@ -179,19 +203,7 @@ def brief(stages=None):
 
     # --- what actually ran, so the PM can trust or distrust each section
     if stages:
-        L.append("## What I ran for you")
-        L.append("")
-        L.append("| stage | result | took | note |")
-        L.append("|---|---|---|---|")
-        for s in stages:
-            L.append(f"| {s['stage']} | {'ok' if s['ok'] else '**FAILED**'} | {s['seconds']}s | "
-                     f"{(s['out'] or s['err'])[:90].replace('|', '/')} |")
-        bad = [s["stage"] for s in stages if not s["ok"]]
-        L.append("")
-        L.append(f"**{len(bad)} stage(s) failed: {', '.join(bad)} — treat anything downstream of "
-                 f"them as UNPREPARED and do it yourself.**" if bad
-                 else "**All stages clean.** The desk below is fully prepped.")
-        L.append("")
+        L += _stage_table(stages)
 
     # --- feed integrity first: a stale section changes what silence means
     deg = feed.get("degraded") or []
@@ -444,7 +456,7 @@ def rotation_name():
     return best
 
 
-def analyst(timeout=2400):
+def analyst(timeout=2400, take_slot=True):
     """The overnight ANALYST (Sonnet): a documents-first re-underwrite of the rotation name so
     the PM judges an analyst's work instead of doing it (David, 2026-09-01 — the human split:
     the analyst re-derives, the PM decides). Instructions: prompts/analyst.md (PM-owned)."""
@@ -471,7 +483,11 @@ def analyst(timeout=2400):
     t0 = time.time()
     try:
         import claudeq
-        with claudeq.slot("vp analyst", "vp", "analyst"):
+        # claudeq.slot() is NOT re-entrant: when the QUEUE dispatches this stage it already
+        # holds the slot, and a child waiting on its own parent's hold would sit out the full
+        # 5,400s timeout. take_slot=False is that path, and only that path.
+        with (claudeq.slot("vp analyst", "vp", "analyst") if take_slot
+              else contextlib.nullcontext()):
             p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                                 "--strict-mcp-config", "--mcp-config", str(nomcp),
                                 "--model", runner.job_model("analyst")],
@@ -486,8 +502,49 @@ def analyst(timeout=2400):
     except Exception as e:
         ok2, tail, err = False, "", f"{type(e).__name__}: {e}"[:200]
     dur = time.time() - t0
-    print(f"  [{'ok ' if ok2 else 'FAIL'}] {'analyst':<10} {dur:6.1f}s  {tk}: {tail or err}")
-    return {"stage": "analyst", "ok": ok2, "seconds": round(dur, 1), "out": tail, "err": err}
+    refiled = ""
+    if not ok2 and take_slot:
+        # A limit death is NOT a result. The 2026-09-04 sweep lost the whole overnight
+        # re-underwrite to "You've hit your session limit · resets 8:50am (UTC)" and the PM
+        # got nothing that morning — while the queue was sitting there, empty, from 08:50Z
+        # until the 14:05Z trade session. Re-file it; claudeq starts it in the first window
+        # that fits, which is before the trade session (ask vp.py-127).
+        blob = f"{err} {tail}"
+        try:
+            import claudeq
+            if claudeq.limit_reset(blob):
+                r = claudeq.enqueue("vp", {"stage": "analyst"}, sub="analyst",
+                                    by="vp-sweep-limit-retry",
+                                    not_before=claudeq.limit_reset(blob).timestamp())
+                refiled = f" — RE-FILED to the Claude queue ({r.get('msg') or 'queued'})"
+        except Exception as e:
+            refiled = f" — re-file failed: {type(e).__name__}"
+    print(f"  [{'ok ' if ok2 else 'FAIL'}] {'analyst':<10} {dur:6.1f}s  {tk}: {tail or err}{refiled}")
+    return {"stage": "analyst", "ok": ok2, "seconds": round(dur, 1), "out": tail,
+            "err": (err + refiled)[:200], "fail_line": ""}
+
+
+def launch_analyst(now=False):
+    """File (or, when the queue dispatches it, start) a standalone analyst re-underwrite.
+
+    Detached and logged, the same shape as ops.launch(), so claudeq gets back a pid it can
+    hold the slot against. --no-slot because the queue is already holding it."""
+    if not now:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        return claudeq.enqueue("vp", {"stage": "analyst"}, sub="analyst", by="vp-analyst")
+    logp = ENGINE / "logs" / "vp_analyst.log"
+    logp.parent.mkdir(exist_ok=True)
+    log = open(logp, "w")
+    proc = subprocess.Popen(["python3", str(HERE / "vp.py"), "analyst", "--no-slot"],
+                            cwd=str(HERE), stdout=log, stderr=log, start_new_session=True)
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        claudeq.watcher(proc.pid)
+    except Exception:
+        pass
+    return {"ok": True, "msg": "vp analyst launched", "pid": proc.pid, "log": str(logp)}
 
 
 def _asof_header(title):
@@ -498,6 +555,65 @@ def _asof_header(title):
         return asof.header(title) + "\n"
     except Exception as e:
         return f"_(provenance header unavailable: {type(e).__name__})_\n\n"
+
+
+def _stage_table(stages):
+    L = ["## What I ran for you", "",
+         "| stage | result | took | note |", "|---|---|---|---|"]
+    for st in stages:
+        L.append(f"| {st['stage']} | {'ok' if st['ok'] else '**FAILED**'} | {st['seconds']}s | "
+                 f"{_stage_note(st)[:90].replace('|', '/')} |")
+    bad = [st["stage"] for st in stages if not st["ok"]]
+    L += ["",
+          (f"**{len(bad)} stage(s) failed: {', '.join(bad)} — treat anything downstream of "
+           f"them as UNPREPARED and do it yourself.**" if bad
+           else "**All stages clean.** The desk below is fully prepped."),
+          ""]
+    return L
+
+
+def _restate_stages(path, stages):
+    """Rewrite vp_brief.md's stage table in place, once every stage has a result.
+
+    brief() renders the table from the stages known WHEN IT RUNS, and it has to run before
+    the review so the review has something to read — so review, analyst, desk and drift
+    never appeared. It cannot simply be re-rendered by calling brief() again, because the
+    review APPENDS to the file brief() would overwrite. So only the table is replaced."""
+    try:
+        txt = pathlib.Path(path).read_text()
+    except Exception:
+        return False
+    start = txt.find("## What I ran for you")
+    if start < 0:
+        return False
+    nxt = txt.find("\n## ", start + 1)
+    if nxt < 0:
+        return False
+    new = txt[:start] + "\n".join(_stage_table(stages)) + txt[nxt:]
+    pathlib.Path(path).write_text(new)
+    return True
+
+
+def _alert_state_changed(bad):
+    """True when the SET of failing stages differs from the previous sweep's.
+
+    ~/CLAUDE.md mandates alert-on-state-change, and the comment beside this push has said
+    'on state, not on every run' since it was written — but there was no state comparison
+    in the code, so David's phone took a critical-tier page on all 14 sweeps that have run
+    since the drift stage existed, every one of them naming the same permanently-red stage.
+    A page that arrives every night is not a page (ask vp.py-121)."""
+    f = DATA / "vp_sweep_state.json"
+    now = sorted(bad)
+    try:
+        prev = json.loads(f.read_text()).get("bad")
+        prev = sorted(prev) if isinstance(prev, list) else None
+    except Exception:
+        prev = None
+    try:
+        f.write_text(json.dumps({"bad": now, "at": _now()}, indent=1))
+    except Exception:
+        pass
+    return prev is None or prev != now
 
 
 def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
@@ -521,7 +637,6 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
         for d in desk:
             if d["build"]:
                 stages.append(run(f"cand:{d['tk']}", ["python3", "dossier.py", "build", d["tk"]], 900))
-    stages.append(run("brief", ["python3", "diffbrief.py"], 300))
     # The reading pass. Unlike every stage above it, this one is BOUNDED BY TIME, not by a
     # work list — it reads until the window closes. That is the point: the model is free and
     # the night is long (David 2026-08-14: "can run for hours every night"). The queue is
@@ -533,22 +648,22 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     stages.append(run("bench:rank", ["python3", "bench.py", "rank"], 300))
     # Price the top leads so the Funnel and the brief carry numbers, not bare tickers.
     stages.append(run("bench:cards", ["python3", "bench.py", "cards", "--limit", "15"], 1800))
-    stages.append(run("bench:brief", ["python3", "bench.py", "brief"], 300))
-    # Last, and deliberately last: the two files the PM opens BEFORE anything else. The
-    # unknowns register has to run after the cards and the watchdog so it sees tonight's
-    # flags, and the roster brief has to run after everything so its freshness column
-    # describes the night that just happened rather than the one before it.
+    # ORDER IS LOAD-BEARING BELOW THIS LINE (2026-09-05, ask vp.py-121).
+    # Every stage above CHANGES state the desk documents quote — cards, the unknowns
+    # register, the quality queue, the bench roll. Every stage below WRITES a desk
+    # document. When a writer ran before a producer, the document it wrote was stale the
+    # moment the producer finished, and the `drift` stage at the end of the sweep reported
+    # it — correctly. That is why drift had FAILED on 14 of the 14 sweeps in which it has
+    # ever existed: the sweep was building its own drift. Producers first, writers second,
+    # drift last as the proof.
     stages.append(run("unknowns", ["python3", "unknowns.py", "scan"], 600))
+    stages.append(run("bench:brief", ["python3", "bench.py", "brief"], 300))
+    stages.append(run("brief", ["python3", "diffbrief.py"], 300))
     stages.append(run("roster", ["python3", "roster.py", "brief"], 300))
     # Freshness of every desk input, on the two clocks that matter — market time (stale in
     # minutes, and only while the market is open) and filing time (updates once a quarter,
     # current until the issuer files again). Non-fatal: it reports, the PM decides.
     stages.append(run("identity", ["python3", "sweepcheck.py", "identity"], 300))
-    stages.append(run("asof", ["python3", "asof.py", "check"], 300))
-    # Content drift: which desk documents describe a world that has since moved. File age
-    # cannot see this — on 2026-08-19 every input read "ok" while the brief described a
-    # six-hour-old world.
-    stages.append(run("drift", ["python3", "asof.py", "drift"], 300))
     stages.append(run("filings", ["python3", "asof.py", "filings"], 600))
     path, nfind = brief(stages)
     # The review reads the brief, so it must run after brief() writes it — and it appends
@@ -558,6 +673,22 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
         stages.append(analyst())
     # The packet (desk.py): one file the PM reads first, built from every brief above.
     stages.append(run("desk", ["python3", "desk.py", "build"], 300))
+    # Content drift: which desk documents describe a world that has since moved. File age
+    # cannot see this — on 2026-08-19 every input read "ok" while the brief described a
+    # six-hour-old world. LAST, so it audits the FINISHED desk: every document above has
+    # now been rewritten, so a drift row here means a real ordering or freshness defect
+    # rather than the sweep catching itself mid-construction (ask vp.py-121).
+    # `asof check` measures data/vp_brief.md, which brief() writes ABOVE — so while this
+    # stage ran before brief() it could only ever read the PREVIOUS sweep's file and
+    # reported the brief as a day stale at the instant it was written (ask asof.py-092,
+    # cause (a): self-reference). It belongs with drift, after the desk is finished.
+    stages.append(run("asof", ["python3", "asof.py", "check"], 300))
+    stages.append(run("drift", ["python3", "asof.py", "drift"], 300))
+    # The stage table inside vp_brief.md was rendered by brief() above and therefore stopped
+    # at 'filings' — review, analyst, desk and drift were invisible to every reader of the
+    # brief, which is how a usage-limit death of the analyst went unnoticed for a morning
+    # (ask vp.py-127). Restate it now that every stage has a result.
+    _restate_stages(path, stages)
     bad = [s["stage"] for s in stages if not s["ok"]]
     print(f"\nVP sweep done in {(time.time() - t0) / 60:.1f} min · "
           f"{len(stages) - len(bad)}/{len(stages)} stages ok · {nfind} open watchdog finding(s)")
@@ -567,7 +698,10 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     # brief sixteen hours later. A FAILED stage means the PM must do that work by hand,
     # which it can only do if it is told — so failures go to `alerts`, on state, not on
     # every run.
-    if bad:
+    if bad and not _alert_state_changed(bad):
+        print(f"  (alert suppressed: the same {len(bad)} stage(s) failed last sweep — "
+              f"alert-on-state-change, ~/CLAUDE.md)")
+    elif bad:
         # Name the cause. A limit death and the two nightly soft-fails (drift, filings) used to
         # share one headline; the PM's own retrospective (2026-09-04) had to dig the cause out
         # of vp_sweep.log line 414.
@@ -581,6 +715,8 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
                            capture_output=True, timeout=30)
         except Exception as e:
             print(f"  (alert push failed: {type(e).__name__})")
+    elif _alert_state_changed(bad):
+        print("  (all stages green — recovered since the last sweep)")
     return 1 if bad else 0
 
 
@@ -590,6 +726,9 @@ if __name__ == "__main__":
         m = int(sys.argv[sys.argv.index("--bench-minutes") + 1]) if "--bench-minutes" in sys.argv else 60
         sys.exit(sweep(fast="--fast" in sys.argv, bench_minutes=m,
                        no_review="--no-review" in sys.argv))
+    if a == ["analyst"]:
+        r = analyst(take_slot="--no-slot" not in sys.argv)
+        sys.exit(0 if r["ok"] else 1)
     if a == ["review"]:
         r = review()
         sys.exit(0 if r["ok"] else 1)
@@ -597,4 +736,4 @@ if __name__ == "__main__":
         p, n = brief()
         print(f"{p} ({n} open findings)")
         sys.exit(0)
-    sys.exit("usage: vp.py sweep [--fast] | vp.py brief")
+    sys.exit("usage: vp.py sweep [--fast] | vp.py brief | vp.py analyst [--no-slot]")

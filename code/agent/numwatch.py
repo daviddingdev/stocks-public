@@ -209,6 +209,17 @@ ERROR_WORDS = ("erroneous", "error", "incorrect", "mistaken", "wrong",
                "typo", "overstat", "understat", "misstat", "corrected", "correction",
                "defect")
 
+# A figure the memo attributes IN TEXT to a named, dated third-party document (a press
+# release, a wire story, a transcript) rather than a filing. numwatch's filing search
+# correctly finds nothing for these — that is not a defect, it is the documented
+# non-filing-source case the MANDATE explicitly allows, and until now numwatch reported
+# it identically to an actually-unsourced number (numwatch.py-138, 2026-09-05: TLS's
+# 2026-08-31 sell memo names the outlet, headline and date and writes "NEWS SOURCE, no
+# SEC filing exists" on the same bullet as $37,775,000 — still cried UNSOURCED). Checked
+# on low_ctx like ERROR_WORDS/MODEL_WORDS above; the PM's own phrasing is the marker.
+NEWS_WORDS = ("news source", "no sec filing exists", "no 8-k for this", "no 8-k filed",
+              "press release only", "disclosed by press release")
+
 # The PM's own arithmetic. "implied REO asset value", "my base case" — derived numbers that
 # are SUPPOSED to be absent from the filings; that is what makes them the PM's variant view
 # rather than a quote. They still must be re-derivable, which is the memo audit's job, not
@@ -298,6 +309,28 @@ def _is_punctuation_delta(context, literal):
     if _ARROW_RE.search(before[-6:]) or _ARROW_RE.search(after[:6]):
         return True
     return False
+
+
+# a number sitting directly on either side of an "=" is the printed result (or input) of
+# an arithmetic formula (numwatch.py-138, 2026-09-05): MANDATE category (b) lets the PM
+# show its work with a python snippet's inputs and formula, and a formula chain like
+# "annualized = $12,588,368 = $0.1684/sh; base-only = $5,245,153 = $0.0702/sh" puts the
+# descriptive word ("Capitalised at...") several numbers before the one this code is
+# tracing — outside the +/-80-char proximity window trace_number's caller passes in, so
+# a MODEL_WORDS keyword match never reaches it. The "=" sign itself is the signal; it
+# needs no keyword and no fixed distance.
+_EQUALS_BEFORE_RE = re.compile(r"=\s*\*{0,2}\$?\s*$")
+_EQUALS_AFTER_RE = re.compile(r"^\s*\*{0,2}\s*=")
+
+
+def _is_computed_result(context, literal):
+    """True if `literal` sits immediately against an "=" in `context` — the shape a
+    printed formula takes, either as the result ("= $X") or an input ("$X = ...")."""
+    i = context.find(literal)
+    if i < 0:
+        return False
+    before, after = context[:i], context[i + len(literal):]
+    return bool(_EQUALS_BEFORE_RE.search(before) or _EQUALS_AFTER_RE.search(after))
 
 
 def _rounding_interval(num_text):
@@ -570,11 +603,19 @@ def trace_number(a, label, card, filing_texts, context="", literal=""):
         return "forward", "forward-looking/guide — not verifiable against filings"
     if any(w in low_ctx for w in ERROR_WORDS):
         return "documented-error", "the label says this figure is WRONG — the PM recording a defect, not asserting a number"
+    if any(w in low_ctx for w in NEWS_WORDS):
+        return "news-sourced", ("the memo names a dated third-party source (press release/wire/"
+                                 "transcript) and states no SEC filing exists — EDGAR cannot "
+                                 "corroborate this by design, not a defect")
     if any(w in low_ctx for w in MODEL_WORDS):
         return "modelled", "the PM's own derivation — absent from filings BY DESIGN; the memo audit re-derives it, not this watchdog"
     if (any(w in low_ctx for w in DELTA_WORDS) or literal.strip().startswith(("+", "-"))
             or _is_punctuation_delta(context, literal)):
         return "modelled", "a computed delta between two filing figures — the PM's own derivation, re-derived by the memo audit, not this watchdog"
+    if _is_computed_result(context, literal):
+        return "computed", ("the result of an arithmetic formula printed in the memo with its "
+                             "inputs alongside — MANDATE category (b), re-derived by the memo "
+                             "audit, not this watchdog")
     fam_keys = None
     if not any(w in low for w in ("adj", "adjusted", "non-gaap", "gross bookings", "gbv")):
         # adjusted/KPI metrics are press-release numbers — GAAP card can't confirm
@@ -723,7 +764,7 @@ def sweep_prose(tk, texts):
             context = text[max(0, i - 80): i + 80] if i >= 0 else ""
             status, detail = trace_number(n["abs"], n["label"], card, filing_texts, context,
                                            literal=n["text"])
-            if status in ("in-filing", "documented-error", "modelled"):
+            if status in ("in-filing", "documented-error", "modelled", "news-sourced", "computed"):
                 seen_in_filing.append(f"[{status}] {n['text']} ({n['label']}) — {detail}")
                 continue
             if status == "mislabel":

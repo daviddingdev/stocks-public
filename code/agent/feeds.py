@@ -339,6 +339,18 @@ def _parse_form4_xml(xml_text):
             "price_note": wavg_notes[0][:200] if wavg_notes else None,
         })
         out["transactions"] = txns
+    else:
+        # feeds.py-140 (coo, 2026-09-05): a filing that parsed cleanly but has no
+        # non-derivative/derivative transactions (e.g. QVCG/Barclays 0000312069-26-058627,
+        # a 10% owner reporting only that it fell below the threshold) looked IDENTICAL in
+        # feed.json to one _parse_form4_xml couldn't read at all -- both left every
+        # transaction field absent, and a reader had no way to tell "nothing happened" from
+        # "the parser failed". <remarks> is where Section 16 filers explain a transaction-
+        # free Form 4 (a plan expiring, a 10% stake unwound without a pecuniary change); kept
+        # verbatim when present so the reason is the filer's own words, not a guess.
+        remarks_m = re.search(r"<remarks>\s*(.*?)\s*</remarks>", xml_text, re.S)
+        remarks = re.sub(r"\s+", " ", remarks_m.group(1)).strip() if remarks_m else ""
+        out["no_transactions_reason"] = remarks[:300] if remarks else "no non-derivative or derivative transactions in filing"
     return out
 
 
@@ -369,12 +381,14 @@ def _resolve_form4_transactions(filings, cap=30):
             if fetched >= cap:  # politeness: resolve the backlog across successive runs
                 continue
             fetched += 1
-            entry = {}
             try:
                 xml_text = requests.get(xml_url, headers=UA, timeout=30).text
                 entry = _parse_form4_xml(xml_text)
-            except Exception:
-                pass
+            except Exception as e:
+                # feeds.py-140: a genuine parse failure must not look like the
+                # "no transactions" case _parse_form4_xml records above -- both used to
+                # leave the row with zero transaction fields and nothing to tell them apart.
+                entry = {"parse_error": str(e)[:200]}
             time.sleep(0.15)
             cache[acc] = entry
             r.update(entry)
@@ -401,8 +415,8 @@ def form4_day_details(cik, acc_doc_pairs):
             xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/{doc.rsplit('/', 1)[-1]}"
             try:
                 entry = _parse_form4_xml(requests.get(xml_url, headers=UA, timeout=30).text)
-            except Exception:
-                entry = {}
+            except Exception as e:
+                entry = {"parse_error": str(e)[:200]}
             cache[acc_nodash] = entry
             dirty = True
             time.sleep(0.15)

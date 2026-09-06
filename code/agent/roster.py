@@ -173,7 +173,7 @@ ROLES = [
     {
         "id": "cannibal", "name": "cannibal — whole-market cannibal screen",
         "who": "pure code + one quote pass, watched by a local model · zero Claude tokens",
-        "cron": "cannibal.py run", "cadence_note": "daily since 2026-08-18 (David: \"why can't cannibal run daily?\")",
+        "cron": "cannibal.py run", "cadence_note": "WEEKLY, Sundays. Daily 2026-08-18 (David: \"why can't cannibal run daily?\"), back to weekly 2026-09-04 (David: buybacks move quarterly). CRON_REGISTRY.md is authoritative; this note said 'daily' for a day after the change and nearly cost a COO session a wrong crontab edit",
         "purpose": "XBRL frames over every filer: positive FCF, net cash, shrinking share count. "
                    "Feeds the scout funnel as leads, never as theses.",
         "reads": ["SEC XBRL frames API"],
