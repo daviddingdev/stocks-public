@@ -414,7 +414,25 @@ def work(minutes=60, model_key="fast", worker=None):
             verbatim = bool(quote) and _norm(quote) in _norm(chunk)
             if claimed:
                 hits += 1
-            survived = claimed and verbatim
+            # signals-148: a claimed+verbatim quote can still be a disclaimer sentence with
+            # no dollar figure in it (backlog_usd landed elsewhere in the JSON, unverified).
+            # amount_key names the schema field carrying the dollar figure; require its
+            # digits to actually appear somewhere in the chunk the model read, not just be
+            # asserted. min_filing_date rejects a survivor whose filing predates the
+            # channel's cutoff (bench.py-059 corpus mixes vintages; HOLOW's 2023-04-28 10-Q
+            # survived the old gate). Both are opt-in per question — absent, the check is a
+            # no-op, so questions with no dollar-figure or vintage requirement are unaffected.
+            amount_key = qn.get("amount_key")
+            amount_ok = True
+            if amount_key:
+                amt = _norm_amount(out.get(amount_key))
+                amount_ok = bool(amt) and amt in _norm_amount(chunk)
+            min_date = qn.get("min_filing_date")
+            date_ok = True
+            if min_date:
+                fdate = _filing_date(t["file"])
+                date_ok = bool(fdate) and fdate >= min_date
+            survived = claimed and verbatim and amount_ok and date_ok
             if survived:
                 kept += 1
             q = _load(); tt = q["tasks"][t["id"]]
@@ -447,6 +465,26 @@ def work(minutes=60, model_key="fast", worker=None):
 
 def _norm(s):
     return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+
+def _norm_amount(s):
+    """Strip the currency symbol and collapse whitespace so '$ 384,489' and '$384,489'
+    compare equal against the same treatment applied to the surrounding chunk. A pure
+    digit-collapse (comparing only 7,7 vs everything else in the chunk) was tried first
+    and rejected: on the channel-11 corpus it let ACNT's '$8.4 million' and SDRL's
+    '$2.4 billion' match on '84'/'24' turning up elsewhere in an unrelated number inside
+    a 24k-char chunk — exactly the two rows the PM's own manual check found absent from
+    the filing. Keeping the amount as a normalized PHRASE avoids that collision."""
+    return re.sub(r"\s+", " ", (s or "").replace("$", "").lower()).strip()
+
+
+_FILE_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+def _filing_date(file_path):
+    """bench.py-059 corpus mixes filing vintages; the date is the filename's leading
+    YYYY-MM-DD (see fill()'s naming), not anything the model is asked to read."""
+    m = _FILE_DATE_RE.match(Path(file_path).name)
+    return m.group(1) if m else None
 
 
 def status():

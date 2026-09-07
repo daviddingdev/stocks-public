@@ -325,7 +325,12 @@ def brief(stages=None):
     L.append("")
     L.append("Needs YOUR judgment (I am code and a local model — I do not decide):")
     L.append("- every open watchdog finding above: source it, fix it, or clear it with a reason")
-    L.append("- the rotating re-underwrite: oldest `last_reunderwrite` in thesis.json")
+    try:
+        _t = analyst_target()
+    except Exception:
+        _t = None
+    L.append("- tonight's analyst slot: " + (f"**{_t[0]}** — {_t[2]}" if _t
+             else "nothing qualified (no held-name event, empty candidate desk)"))
     L.append("- the funnel: which leads earn real underwriting, which get dropped with a note")
     L.append("- anything a flag or STALE marker touches — a flagged number is not a number yet")
     L.append("")
@@ -445,7 +450,8 @@ def review(timeout=1800):
 
 
 def rotation_name():
-    """The held name with the oldest documents-first re-underwrite (thesis.json), or None."""
+    """The held name with the oldest documents-first re-underwrite (thesis.json), or None.
+    Kept as the tie-break inside analyst_target(), NOT as the selector — see there."""
     th = _j(DATA / "thesis.json", {})
     best = None
     for tk in held_names():
@@ -454,6 +460,114 @@ def rotation_name():
         if best is None or key < best[1]:
             best = (tk, key)
     return best
+
+
+def held_events(tk, since):
+    """Why this held name would earn tonight's analyst slot, as a list of stated reasons.
+    Empty list = nothing moved, and re-underwriting it is re-affirmation.
+
+    The five triggers are the PM's (ask coo-149, STRATEGY v3 §4, 2026-09-06): the analyst's
+    two real catches — MBGL capex 2026-09-02, ARI ICD cover 2026-09-03 — both came from
+    documents already on file, never from the calendar reaching a name's turn. `since` is
+    the name's last_reunderwrite date (YYYY-MM-DD); '0000-00-00' means never, and a name
+    never re-underwritten always qualifies."""
+    if not since or since == "0000-00-00":
+        return ["never re-underwritten"]
+    why = []
+
+    # 1. a new SUBSTANTIVE filing since the last re-underwrite. Form 4 is deliberately
+    #    excluded here and handled only by the open-market tripwire below: on 2026-09-06
+    #    MBGL's entire "new filing" evidence was eight identical code-A RSU grants and one
+    #    code-F tax withholding — the exact non-event feeds.py-124 was written to collapse,
+    #    and it would have bought an Opus re-underwrite of a name where nothing happened.
+    feed = _j(DATA / "feed.json", {})
+    rows = [r for r in ((feed.get("filings") or {}).get(tk) or [])
+            if str(r.get("date") or "") > since]
+    subst = [r for r in rows if str(r.get("form")) != "4"]
+    if subst:
+        forms = sorted({str(r.get("form")) for r in subst})
+        why.append(f"{len(subst)} filing(s) since {since}: {', '.join(forms)}")
+
+    # 4. insider tripwire — an OPEN-MARKET Form 4 (code P/S) that is NOT a 10b5-1 plan
+    #    trade. Grants (code A) and tax withholding (code F) are excluded because they are
+    #    not decisions (feeds.py-124); a 10b5-1 sale is excluded because it is a decision
+    #    the insider made months earlier, which is the whole point of the repro at
+    #    journal/ops/2026-08-27_pm_form4_no_transaction_fields_repro.py — LYFT's 2026-09-03
+    #    filing is a code-S sale of 13,204 sh that its own footnote attributes to a plan,
+    #    and it would otherwise have bought the whole nightly analyst slot on its own.
+    om = [r for r in rows if str(r.get("form")) == "4"
+          and str(r.get("transaction_code") or "").upper() in ("P", "S")
+          and not r.get("rule_10b5_1")]
+    if om:
+        why.append("insider tripwire: " + ", ".join(
+            f"{r.get('filer') or '?'} {r.get('transaction_code')} {r.get('shares') or '?'}sh"
+            + (" (10b5-1)" if r.get("rule_10b5_1") else "")
+            for r in om[:3]))
+
+    # 2. a KPI breach on this name
+    try:
+        sys.path.insert(0, str(HERE))
+        import learn
+        br = [b for b in learn.kpi_breaches() if (b.get("symbol") or b.get("ticker")) == tk]
+        if br:
+            why.append(f"{len(br)} KPI breach(es)")
+    except Exception:
+        pass
+
+    # 3. a thesis-vs-price alert raised since the last re-underwrite
+    al = _j(DATA / "alerts.json", [])
+    tvp = [a for a in (al if isinstance(al, list) else [])
+           if a.get("symbol") == tk and a.get("kind") == "thesis-vs-price"
+           and str(a.get("ts") or "")[:10] > since]
+    if tvp:
+        why.append(f"thesis-vs-price alert {str(tvp[-1].get('ts'))[:10]}")
+
+    # 5. down 15% or more against cost
+    for pos in (_j(DATA / "portfolio.json", {}).get("positions") or []):
+        if pos.get("symbol") == tk and (pos.get("pnl_pct") is not None) and pos["pnl_pct"] <= -15:
+            why.append(f"{pos['pnl_pct']:.1f}% vs cost")
+    return why
+
+
+def analyst_target():
+    """WHO gets tonight's analyst slot, and the stated reason — EVENT-driven, not calendar.
+
+    A held name earns the nightly Opus/Sonnet slot only when `held_events()` finds something
+    that moved; among those that qualify, the one re-underwritten longest ago goes first, so
+    the rotation still exists — it just no longer runs on an empty calendar. When no held
+    name qualifies, the slot goes to the top of the CANDIDATE DESK (underwriting first, then
+    pm_reviewed by triage score — candidate_desk() already ranks it), which is the PM's point
+    in coo-149: a quiet book should spend its overnight analyst on the newest idea rather than
+    re-affirming a thesis no document has touched.
+
+    Returns (ticker, last_reunderwrite, reason) or None when there is nothing at all to read.
+    prompts/analyst.md already handles a candidate: it is told to re-underwrite ${SYMBOL} from
+    the documents, and 'never' is a legitimate ${LAST_REUNDERWRITE}."""
+    th = _j(DATA / "thesis.json", {})
+    qualified = []
+    for tk in held_names():
+        last = str((th.get(tk) or {}).get("last_reunderwrite") or "0000-00-00")
+        ev = held_events(tk, last)
+        if ev:
+            qualified.append((last, tk, "; ".join(ev)))
+    if qualified:
+        qualified.sort()
+        last, tk, why = qualified[0]
+        return (tk, last, f"held, event-driven — {why}")
+    try:
+        desk = candidate_desk(1)
+    except Exception as e:
+        desk = []
+        print(f"  [warn] analyst    candidate_desk failed ({type(e).__name__}: {e})")
+    if desk:
+        c = desk[0]
+        return (c["tk"], "never",
+                f"no held name had an event — candidate desk: {c.get('status', '?')}"
+                f"{', ' + c['why'] if c.get('why') else ''}")
+    rot = rotation_name()
+    if rot:
+        return (rot[0], rot[1], "fallback: no events and an empty candidate desk")
+    return None
 
 
 def analyst(timeout=2400, take_slot=True):
@@ -466,11 +580,12 @@ def analyst(timeout=2400, take_slot=True):
     if not ok:
         print(f"  [FAIL] analyst    auth: {msg}")
         return {"stage": "analyst", "ok": False, "seconds": 0, "out": "", "err": msg[:200]}
-    rot = rotation_name()
+    rot = analyst_target()
     if not rot:
-        print("  [skip] analyst    no held names")
-        return {"stage": "analyst", "ok": True, "seconds": 0, "out": "no held names", "err": ""}
-    tk, last = rot
+        print("  [skip] analyst    no held names and no candidates")
+        return {"stage": "analyst", "ok": True, "seconds": 0, "out": "nothing to read", "err": ""}
+    tk, last, why = rot
+    print(f"  [pick] analyst    {tk} — {why}")
     memos = sorted(JOURNAL.glob(f"*_{tk}_*.md"))
     try:
         import prompts

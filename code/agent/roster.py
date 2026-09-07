@@ -258,7 +258,15 @@ ROLES = [
         # false MISSED daily. Weekly on Friday: surface defects are real but rarely urgent,
         # and the hunt's Thursday run feeds it fresh repros.
         "model": "sonnet",
-        "cron": "ops.py build",
+        # ON DEMAND since 2026-09-04 — no crontab line, by decision, not by drift
+        # (CRON_REGISTRY.md line 42; PM on roster.py-145: both 14-day runs found 0 asks,
+        # 0 defects). `cron: None` is what makes that intentional rather than a finding:
+        # cron_drift() only reports a role that DECLARES a matcher and has no line, and
+        # ops.py `_finish()` puts a line-less role in ON_DEMAND, where verify() launches
+        # it the day an ask is addressed to build. Do not re-add a matcher without a
+        # crontab line — a declared-and-unlaunched role is the `ops.py hunt` failure.
+        "cron": None,
+        "cadence_note": "ON DEMAND (ops.py verify files it when asks are addressed to build)",
         "purpose": "Owns the SURFACES (owners.py: subsystem `surfaces`) — the dashboard and "
                    "every page on it. Works its ask queue: what a card claims must match "
                    "what the data says, on the phone first (mobile-web rules).",
@@ -832,16 +840,36 @@ def _age_str(age_min):
     return f"{age_min // 1440}d ago"
 
 
+def shared_writes():
+    """Artifacts more than one role writes. These CANNOT date a role: `data/asks.json` is
+    written by nine roles, so taking the newest of a role's writes reported the Build
+    Engineer, the COO, the bug hunt and the Numbers Engineer as all having produced work
+    "7m ago" on 2026-09-06 when their actual latest reports were 30h, 19h, 30h and 18h old
+    — a stale role and a live one rendering identically, which is the one thing this chart
+    exists to prevent (COO 2026-09-06; same failure class as ask roster.py-019)."""
+    seen, dup = set(), set()
+    for r in ROLES:
+        for w in r["writes"]:
+            (dup if w in seen else seen).add(w)
+    return dup
+
+
 def live():
     """The roster with each role's output freshness attached."""
+    shared = shared_writes()
     out = []
     for r in ROLES:
         outputs = []
         for w in r["writes"]:
             st = _stat(w)
-            outputs.append({"path": w, "state": st})
+            outputs.append({"path": w, "state": st, "shared": w in shared})
         newest = [o["state"]["age_min"] for o in outputs
-                  if o["state"] and o["state"].get("exists")]
+                  if o["state"] and o["state"].get("exists") and not o["shared"]]
+        if not newest:
+            # every output this role has is co-written — date it from those rather than
+            # go blind, but the chart must not claim more precision than that.
+            newest = [o["state"]["age_min"] for o in outputs
+                      if o["state"] and o["state"].get("exists")]
         live_cad = cron_cadence(r.get("cron"))
         note = r.get("cadence_note", "")
         cadence = " · ".join(x for x in (live_cad, note) if x) or "—"
