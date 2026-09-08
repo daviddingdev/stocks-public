@@ -49,13 +49,15 @@ def main():
             "materiality 0-10: 0-2 = noise/PR/listicles, 3-5 = routine, 6-8 = genuinely moves "
             "the thesis (earnings surprises, guidance, M&A, FDA, major contracts, insider "
             "clusters), 9-10 = drop-everything. Judge ONLY from the text given. Return JSON "
-            '{"scores":{"<id>":{"s":<int>,"why":"<max 12 words>"}}}\n\n' + listing,
-            num_predict=1200)
+            '{"scores":{"<id>":{"s":<int>,"why":"<max 12 words>","phrase":"<the words in the '
+            'headline or summary that drove the score, copied verbatim, max 10 words>"}}}\n\n' + listing,
+            num_predict=2000, job="relevance")
         got = v.get("scores", {}) if isinstance(v, dict) else {}
         for i in batch:
             e = got.get(i["id"], {})
             scores[i["id"]] = {"ticker": i["ticker"], "headline": i["headline"],
                                "datetime": i["datetime"], "url": i["url"],
+                               "phrase": str(e.get("phrase", ""))[:80],
                                "score": int(e.get("s", -1)) if str(e.get("s", "")).lstrip("-").isdigit() else -1,
                                "why": str(e.get("why", ""))[:90]}
     # keep the file bounded: drop entries older than 14 days

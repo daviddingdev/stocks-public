@@ -53,7 +53,8 @@ Rate this raw event's PLAUSIBILITY as a mechanism lead, 0-10:
 0-2 = noise (SPAC mechanics, routine institutional filing, micro-cap pump shapes,
 technical/catch-up filings); 3-4 = thin; 5-7 = worth pulling numbers; 8-10 = textbook setup.
 Judge ONLY from the event given. JSON {{"plausible": <int>, "why": "<max 20 words>",
-"channel": "<one channel name or none>"}}"""
+"channel": "<one channel name or none>",
+"trigger": "<the words in the EVENT's detail line that drove your score, copied verbatim, max 15 words — empty if nothing in the line supports a score above 2>"}}"""
 
 TRIAGE_PROMPT = f"""You are the junior sourcing analyst for a mechanism-driven value fund.
 Channels: {CHANNELS}.
@@ -364,9 +365,14 @@ def run(max_pre=25, max_triage=8):
     for it in todo[:max_pre]:
         v = ask_json(PRE_PROMPT + "\n\nEVENT: " + json.dumps(
             {k: it.get(k) for k in ("kind", "ticker", "issuer", "date", "detail")}),
-            num_predict=200)
+            num_predict=260, job="scout pre-triage")
+        # the trigger must be VERBATIM from the detail line — a score with no quotable trigger
+        # is the unauditable yes/no the 2026-09-07 audit flagged; code checks it, not the model
+        trig = str(v.get("trigger", ""))[:120] if isinstance(v, dict) else ""
+        trig_ok = bool(trig) and " ".join(trig.lower().split()) in " ".join(str(it.get("detail", "")).lower().split())
         it["pre"] = {"plausible": int(v.get("plausible", 0)) if str(v.get("plausible", "")).isdigit() else 0,
-                     "why": str(v.get("why", ""))[:90], "channel": str(v.get("channel", ""))[:40]} \
+                     "why": str(v.get("why", ""))[:90], "channel": str(v.get("channel", ""))[:40],
+                     "trigger": trig if trig_ok else "", "trigger_verified": trig_ok} \
             if isinstance(v, dict) else {"plausible": 0, "why": "triage failed"}
         # THE GATE WAS CIRCULAR (David, 2026-08-14: "why isn't it buying with so much cash").
         # Stage 1 is told to "judge ONLY from the event given" — and a 13D event line carries
@@ -433,7 +439,8 @@ def run(max_pre=25, max_triage=8):
             continue
         v = ask_json(TRIAGE_PROMPT + "\n\nEVENT: " + json.dumps(
             {k: it.get(k) for k in ("kind", "ticker", "issuer", "date", "detail")})
-            + "\n\nFINANCIAL CARD SUMMARY: " + (summary or "unavailable"), num_predict=600)
+            + "\n\nFINANCIAL CARD SUMMARY: " + (summary or "unavailable"),
+            num_predict=900, think=True, job="scout triage")
         if isinstance(v, dict) and str(v.get("score", "")).lstrip("-").isdigit():
             sketch = str(v.get("sketch", ""))[:500]
             bad = _unsupported_figures(sketch, it.get("detail", ""))

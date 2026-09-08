@@ -135,9 +135,31 @@ def job_model(role=None):
 
 _CHILDREN = {}   # pid -> Popen, so this process reaps what it spawned
 
+# Wall-clock cap per kind, ~1.7x claudeq's est_min (research 90/finish 25/update 15) so a
+# hung session dies instead of holding the queue slot — RDI ran 1,585 min against a 90-min
+# estimate and stopped the queue for 12 other jobs across 19h (2026-09-07).
+CAP_MIN = {"research": 150, "finish": 45, "update": 25}
+
 
 def pid_file(log_path):
     return Path(str(log_path) + ".pid")
+
+
+def _watchdog(pid, log_path, cap_min):
+    """Detached: kill the session's whole process group if it outlives cap_min, the vp.py
+    subprocess-timeout idiom adapted for runner.py's detached (start_new_session) spawns,
+    which nothing else is blocked on and so nothing else can time out."""
+    try:
+        subprocess.Popen(
+            ["bash", "-c",
+             f"sleep {int(cap_min * 60)}; "
+             f"if kill -0 {int(pid)} 2>/dev/null; then "
+             f"echo '[runner.py] TIMEOUT: killed after {cap_min}m wall-clock cap' >> {log_path}; "
+             f"kill -TERM -{int(pid)} 2>/dev/null; sleep 5; kill -KILL -{int(pid)} 2>/dev/null; "
+             f"fi"],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s=0):
@@ -179,6 +201,8 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
         claudeq.watcher(p.pid)
     except Exception:
         pass
+    if kind in CAP_MIN:
+        _watchdog(p.pid, log_path, CAP_MIN[kind])
     return {"ok": True, "pid": p.pid, "log": str(log_path)}
 
 
@@ -216,6 +240,8 @@ def run_state(log_path):
 # the background-task ceiling that killed PANW; clean_env now sets it to 0, and this
 # stays so any recurrence is reported instead of read as ordinary output.
 FATAL_MARKS = [
+    ("TIMEOUT: killed after", "Run hit its wall-clock cap and was killed to free the queue slot — "
+                              "re-file it (a hang, not a completed run)."),
     ("Background tasks still running", "Run stopped early: it hit the 600s background-task ceiling "
                                        "and terminated with deliverables missing."),
     ("Execution error", "Run failed: the CLI reported an execution error."),
@@ -265,7 +291,7 @@ def research_prompt(tk):
         f"Steps: (0) FIRST run `python3 ~/Stocks/_engine/research/evidence.py {tk}` — it builds "
         f"research/_evidence/ (XBRL fact series in facts.json, text-extracted key filings, sections.json "
         f"offsets, INDEX.md navigation map with local-model reading notes), THEN run "
-        f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` — it puts the agent book's existing work on the "
+        f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` (run it in the FOREGROUND and wait for it to exit; NEVER poll for it with `pgrep -f` on the ticker or the script name — that pattern matches this session's own command line, the wait never ends, and the queue froze 23h on 2026-09-06 exactly so) — it puts the agent book's existing work on the "
         f"desk as research/_evidence/SHELF.md + shelf/ (the XBRL fincard with formulas and the mechanical "
         f"reverse-DCF/DCF grid, dossier-verified contractual terms and deal filings, the Bench's verbatim-verified "
         f"narrative-vs-filing reads, insider cluster + Form 4 rows, 13D subjects, scout and cannibal hits). Create any missing "
@@ -331,7 +357,7 @@ def finish_prompt(tk):
         f"text-extracted filings) and the model files under financials/. Do NOT re-run evidence.py, do NOT "
         f"re-spawn pillar agents, do NOT re-run the refuter — a session doing that died on the usage limit "
         f"after two hours with nothing in analysis/. If research/_evidence/SHELF.md is missing, run ONLY "
-        f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` first. Then READ, in this order: SHELF.md, "
+        f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` (run it in the FOREGROUND and wait for it to exit; NEVER poll for it with `pgrep -f` on the ticker or the script name — that pattern matches this session's own command line, the wait never ends, and the queue froze 23h on 2026-09-06 exactly so) first. Then READ, in this order: SHELF.md, "
         f"shelf/fincard.json, research/adversarial-review.md, every research/*.md, financials/*. Where the "
         f"refuter OVERTURNED a claim, the synthesis must carry the overturned version, never the original. "
         f"Apply ~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry, "
@@ -348,7 +374,7 @@ def launch_finish(tk, now=False):
     if not now:
         import claudeq
         return claudeq.enqueue("finish", {"tk": tk}, by="runner")
-    return launch(finish_prompt(tk), research_log(tk))
+    return launch(finish_prompt(tk), research_log(tk), kind="finish")
 
 
 def launch_research(tk, now=False, full=False):
@@ -364,7 +390,7 @@ def launch_research(tk, now=False, full=False):
     if not now:
         import claudeq
         return claudeq.enqueue("research", {"tk": tk}, by="runner")
-    return launch(research_prompt(tk), research_log(tk))
+    return launch(research_prompt(tk), research_log(tk), kind="research")
 
 
 # ---------- focused research update (refresh, not re-teardown) ----------
@@ -394,7 +420,7 @@ def update_prompt(tk, folder, report_date):
         f"dating the revision and stating the old vs new rungs and why. Where lots are short-term for capital "
         f"gains (see /api/lots dates; >1yr = long-term), note it: tax tilts WHERE in a zone discretionary rungs "
         f"sit, but never vetoes risk-driven rungs (thesis-break or pre-binary de-risking).\n"
-        f"Run `python3 ~/Stocks/_engine/research/shelf.py {tk}` and read research/_evidence/SHELF.md — the "
+        f"Run `python3 ~/Stocks/_engine/research/shelf.py {tk}` (run it in the FOREGROUND and wait for it to exit; NEVER poll for it with `pgrep -f` on the ticker or the script name — that pattern matches this session's own command line, the wait never ends, and the queue froze 23h on 2026-09-06 exactly so) and read research/_evidence/SHELF.md — the "
         f"agent book's XBRL fincard (current price, TTM figures, mechanical reverse-DCF/DCF grid), verified "
         f"contractual terms, Bench reads, insider and 13D rows; quote its numbers with their tags instead of "
         f"re-deriving them.\n"
@@ -469,7 +495,7 @@ def launch_update(tk, now=False):
         prompt += (f"\nFINALLY — {tk} is a HELD position, so notify David that the refresh landed: "
                    f"~/maintenance/bin/notify.sh stocks 'Research updated: {tk}' "
                    f"'<one line: your section-4 action, e.g. HOLD — thesis intact, next catalyst <date>>'")
-    return launch(prompt, update_log(tk))
+    return launch(prompt, update_log(tk), kind="update")
 
 
 def launch_autorefresh():

@@ -23,7 +23,7 @@ The fix is here: a durable queue and stateless workers.
 
 CLI:
   bench.py fill [--limit N]        build read-tasks from the readable set
-  bench.py work [--minutes M] [--model fast|dense] [--worker NAME]
+  bench.py work [--minutes M] [--model fast|dense] [--worker NAME] [--think|--no-think]  (default: data/bench_mode.json)
   bench.py status                  queue counts + throughput
   bench.py rank                    -> data/bench.json, ranked by a coded specificity score
                                     (bench.py-030) — not model confidence, not multiples
@@ -65,6 +65,17 @@ ROLES = {"fast": "bulk", "dense": "dense"}
 KEEP_ALIVE = "60m"          # stay resident between tasks — no cold load per task
 LEASE_S = 900               # a task leased longer than this is presumed dead
 CHUNK = 24_000              # chars per model call (measured: 5.2s fast / 15.6s dense)
+MODE_FILE = DATA / "bench_mode.json"   # optional read-mode overrides: think, num_predict, chunk
+THINK_HEADROOM = 2500       # ollama counts thinking tokens against num_predict
+
+
+def mode():
+    """Read-mode overrides (data/bench_mode.json), so a night can run in THINK mode without a
+    code change and the next morning's bench_queue.json rows say which mode produced them.
+    Audit 2026-09-07: qwen3.8:27b is a thinking model and every call ran think:false."""
+    m = _j(MODE_FILE, None) or {}
+    return {"think": bool(m.get("think", False)), "num_predict": int(m.get("num_predict", 400)),
+            "chunk": int(m.get("chunk", CHUNK))}
 
 DEFAULT_QUESTION = {
     "channel": "11 — narrative-vs-contract gap",
@@ -109,16 +120,22 @@ def question():
 # ---------------------------------------------------------------- the model
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
-def ask_json(prompt, model, num_predict=400, timeout=1200):
+def ask_json(prompt, model, num_predict=400, timeout=1200, think=False):
     """One fresh-context call. qwen3.8 wraps output in ```json fences, so parse the
     outermost object rather than trusting the envelope.
 
     The slot is taken per call, not per run: an 800-read night must not lock the box's
     only GPU for five hours, and releasing between reads is what lets a higher-priority
     job (or David at a terminal) in without killing a generation mid-flight."""
-    body = json.dumps({"model": model, "think": False, "stream": False,
-                       "keep_alive": KEEP_ALIVE,
-                       "options": {"num_predict": num_predict, "temperature": 0.2},
+    # format:"json" (audit 2026-09-07): without it every unparseable row in bench.log was a
+    # TRUNCATED object — a real hit thrown away. num_ctx explicit from the registry: the
+    # server is sized at 256K today; an unrequested window is a default that can change.
+    opts = {"num_predict": num_predict + (THINK_HEADROOM if think else 0), "temperature": 0.2}
+    ctx = models.options(ROLES["fast"]).get("num_ctx")
+    if ctx:
+        opts["num_ctx"] = int(ctx)
+    body = json.dumps({"model": model, "think": bool(think), "stream": False,
+                       "keep_alive": KEEP_ALIVE, "format": "json", "options": opts,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(OLLAMA, body, {"Content-Type": "application/json"})
     t0 = time.time()
@@ -378,8 +395,11 @@ def _lease(q, worker):
     return None
 
 
-def work(minutes=60, model_key="fast", worker=None):
+def work(minutes=60, model_key="fast", worker=None, think=None):
     worker = worker or f"w{os.getpid()}"
+    md = mode()
+    if think is not None:
+        md["think"] = bool(think)
     # Pre-check here, not at import: `fill` and `rank` need no model and must still run
     # when ollama is down. A dead reader, though, should die before it leases a task.
     model = models.require(ROLES[model_key], job="bench work")
@@ -387,7 +407,8 @@ def work(minutes=60, model_key="fast", worker=None):
     deadline = time.time() + minutes * 60
     done = errs = hits = kept = 0
     t_start = time.time()
-    print(f"bench worker {worker} · {model} · until {minutes}m · question: {qn['channel']}")
+    print(f"bench worker {worker} · {model} · until {minutes}m · question: {qn['channel']} · "
+          f"mode: think={md['think']} num_predict={md['num_predict']} chunk={md['chunk']}")
     while time.time() < deadline:
         q = _load()
         t = _lease(q, worker)
@@ -397,11 +418,15 @@ def work(minutes=60, model_key="fast", worker=None):
         try:
             txt = Path(t["file"]).read_text(errors="ignore")
             off = t.get("offset", t.get("chunk", 0) * CHUNK)
-            chunk = txt[off:off + CHUNK]
-            prompt = (f"{qn['ask']}\n\nAnswer strictly as JSON:\n{qn['schema']}\n{qn['rule']}\n\n"
+            chunk = txt[off:off + md["chunk"]]
+            method = ("\nMETHOD: read the whole excerpt first. List to yourself every sentence that "
+                      "states the figure the question asks for, with its date; discard the ones the "
+                      "RULE rejects; then copy the one that survives CHARACTER-FOR-CHARACTER. A "
+                      "quote you did not see printed is a failure.\n") if md["think"] else ""
+            prompt = (f"{qn['ask']}\n\nAnswer strictly as JSON:\n{qn['schema']}\n{qn['rule']}{method}\n\n"
                       f"TICKER: {t['ticker']}\nDOCUMENT: {Path(t['file']).name}\n\n{chunk}")
             t0 = time.time()
-            out, raw = ask_json(prompt, model)
+            out, raw = ask_json(prompt, model, num_predict=md["num_predict"], think=md["think"])
             dt_s = round(time.time() - t0, 1)
             if out is None:
                 raise ValueError(f"unparseable: {(raw or '')[:80]}")
@@ -440,7 +465,8 @@ def work(minutes=60, model_key="fast", worker=None):
             # and outlives any single channel, so a task's own "done" record is the only
             # place that can later say it was channel 11's read, not channel 12's.
             tt.update(state="done", model=model, seconds=dt_s, at=_now(), channel=qn["channel"],
-                      result=out, claimed=claimed, verbatim=verbatim, survived=survived)
+                      result=out, claimed=claimed, verbatim=verbatim, survived=survived,
+                      think=md["think"], chunk=md["chunk"])
             _write(QUEUE, q)
             done += 1
             if survived:
@@ -884,7 +910,8 @@ if __name__ == "__main__":
     elif a == ["fill"]:
         fill(arg("--limit", 40, int))
     elif a == ["work"]:
-        work(arg("--minutes", 60, int), arg("--model", "fast"), arg("--worker"))
+        work(arg("--minutes", 60, int), arg("--model", "fast"), arg("--worker"),
+             think=(True if "--think" in sys.argv else (False if "--no-think" in sys.argv else None)))
     elif a == ["status"]:
         status()
     elif a == ["rank"]:

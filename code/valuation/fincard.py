@@ -337,6 +337,14 @@ INSTANT = {
                "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
                "PartnersCapital", "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
                "MembersEquity"],
+    # CASH CLAIM check (fincard.py-162): an accrued dividend now payable is a dated
+    # claim on cash the balance sheet hasn't paid out yet. CurrentAndNoncurrent first —
+    # ARI tags its combined common+preferred accrual this way (492,416,000 at
+    # 2026-06-30, the $3.75/sh common dividend "payable July 15, 2026 to stockholders
+    # of record as of June 30, 2026" plus preferred); the split current/noncurrent tags
+    # are the more common alternates for issuers that don't report a combined total.
+    "dividends_payable": ["DividendsPayableCurrentAndNoncurrent", "DividendsPayable",
+                          "DividendsPayableCurrent", "DividendsPayableAmount"],
 }
 # totals some issuers tag only ANNUALLY while tagging the current/noncurrent split
 # every quarter — the total then looks like a retired tag (SONO OperatingLease-
@@ -1003,6 +1011,31 @@ def _finnhub_mktcap(tk):
         return None
 
 
+def _finnhub_avg_volume(tk):
+    """Average daily SHARE volume (fincard.py-177): /quote has no volume field and
+    /stock/candle 403s on this key's tier (checked 2026-09-08 — premium-only). /stock/
+    metric IS on this tier and carries 3MonthAverageTradingVolume / 10DayAverageTrading-
+    Volume, both in MILLIONS of shares/day. 3-month preferred — the liquidity rule this
+    feeds (STRATEGY-PROPOSAL-v3 SECTION 1: a position <= 1% of ADV) wants a stable
+    trading-liquidity baseline, not a 10-day window a single news day can spike or
+    starve; 10-day used only when 3-month is absent (a recent IPO/spin-off with no
+    3-month history yet). Returns (shares_per_day, window_label) or (None, None)."""
+    try:
+        key = json.loads((ENGINE / "config" / "keys.json").read_text()).get("finnhub", "")
+        with urllib.request.urlopen(
+                f"https://finnhub.io/api/v1/stock/metric?symbol={tk}&metric=all&token={key}",
+                timeout=15) as r:
+            m = json.loads(r.read()).get("metric", {}) or {}
+        v3, v10 = m.get("3MonthAverageTradingVolume"), m.get("10DayAverageTradingVolume")
+        if v3:
+            return v3 * 1e6, "3-month"
+        if v10:
+            return v10 * 1e6, "10-day"
+        return None, None
+    except Exception:
+        return None, None
+
+
 # --------------------------------------------------------------------- flag triage
 # 2026-08-18. The unknowns register carried 161 NEEDS-KEY rows and 104 of them were STALE
 # flags with a MEDIAN of 1,734 days behind. Read by class rather than by count: a
@@ -1062,9 +1095,23 @@ AUX_ONLY_FLOWS = {"costs_and_expenses", "capex_software", "bank_net_interest_inc
 # which DO consume goodwill and intangibles. The self-check below caught this the same
 # night: `goodwill`/`intangibles` moved out of DISPLAY_ONLY so a stale tag flags loudly
 # again, same as debt_lt already does for net_cash.
+#
+# eps_diluted/shares_diluted_wavg moved out for the SAME reason (fincard.py-152, coo
+# 2026-09-06 / numbers 2026-09-08), found by the same mechanism this comment already
+# describes for goodwill: they ARE consumed, by the income-identity cross_check just
+# below (eps_diluted x shares_diluted_wavg ~= net_income). WMG's eps_diluted was
+# 5,546 days stale (last filed 2011-06-30, on a card built today with net_income TTM to
+# 2026-06-30) and, under DISPLAY_ONLY, recorded as `not_reported` — a label copied from
+# EPISODIC_FLOWS ("the company stopped doing the thing") that is WRONG for EPS: a
+# company posting 672,000,000 of TTM net income reports EPS every quarter, so a missing
+# current eps_diluted tag is a tag-resolution failure, not an issuer fact, and deserves
+# the same loud STALE flag a 3,013-day-old debt_current tag already gets. The silent
+# quarantine also deleted both from ttm_vals, which is why the income-identity check
+# below found nothing to compare and wrote no cross_check entry at all on six cards
+# (IQST, LBRDP, SEATW, SLNG, WMG, XRXDW) — see the "skipped: stale" branch added there.
 DISPLAY_ONLY = {
     "receivables", "inventory", "ppe_net", "operating_lease_liab",
-    "lt_investments", "rnd", "sga", "acquisitions", "eps_diluted", "shares_diluted_wavg",
+    "lt_investments", "rnd", "sga", "acquisitions",
 }
 
 UNIVERSAL = ("revenue", "net_income", "cfo", "cash", "equity", "total_assets")
@@ -1389,6 +1436,22 @@ MEZZANINE_EXCLUDE = {
     "RMR": {"RedeemableNoncontrollingInterestEquityCarryingAmount"},
 }
 
+# Per-ticker FLOW tag SKIP — same shape as MEZZANINE_EXCLUDE above, for a wrong-concept
+# pick rows_for's freshness tiebreak cannot see because both tags file the SAME period end.
+# XPOF's us-gaap:Revenues fact ($2,703,000 for Q2 2026, $4,865,000 H1) matches NONE of the
+# 10-Q's own revenue lines (Franchise 43,991 + Equipment 7,058 + Merchandise 542 + Franchise
+# marketing fund 8,733 + Other service 5,644 = Total revenue, net 65,968, all in thousands,
+# filed 2026-08-07) — it is some other, uncertain concept the filer also tagged Revenues
+# under a dimension companyfacts drops, leaving only this small non-dimensional remainder
+# visible. RevenueFromContractWithCustomerExcludingAssessedTax ($65,968,000) ties to the
+# filed "Total revenue, net" line to the dollar for both Q2 and H1 2026. Confirmed via
+# fincard-147 (numbers, 2026-09-08): pulled XPOF's companyfacts directly, both tags carry
+# the same 2026-06-30 period end so rows_for's recency tiebreak picks whichever is first in
+# FLOW["revenue"] — Revenues — regardless of which one is actually the total.
+FLOW_TAG_EXCLUDE = {
+    "XPOF": {"revenue": {"Revenues"}},
+}
+
 # Temporary equity an issuer discloses on the FACE of its own balance sheet but tags under
 # a namespace none of MEZZANINE_TAGS or the NCI-backout (StockholdersEquityIncludingPortion...
 # / PartnersCapitalIncludingPortion...) can see — same "companyfacts drops the extension
@@ -1629,8 +1692,11 @@ def build(tk, cik_override=None):
         2021; first-match served five-year-stale capex into FCF. Caught by fincheck
         2026-08-12)."""
         want_unit = FLOW_UNITS.get(name, "USD")
+        skip = FLOW_TAG_EXCLUDE.get(tk, {}).get(name, ())
         best, found = (None, [], ""), []
         for tag in tagmap[name]:
+            if tag in skip:
+                continue
             units = gaap.get(tag, {}).get("units", {})
             rows = units.get(want_unit) or (units.get("shares") if want_unit == "shares" else None) or []
             if not rows:
@@ -2091,8 +2157,28 @@ def build(tk, cik_override=None):
     # introduced (KEEL: eps_diluted and net_income already share the same 180d YTD
     # window, so annualizing eps and comparing to the un-annualized net_income falsely
     # doubled the implied figure; ratio 2.03x with the raw comparison at 1.0026x).
+    # SILENT CARDS (fincard.py-152, coo 2026-09-06 / numbers 2026-09-08): the check
+    # below used to run only `if ni and eps_d is not None and shd:` — when net_income
+    # was stated but eps_diluted or shares_diluted_wavg had been STALE-excluded from
+    # ttm_vals (deleted a few dozen lines above, in the same pass that used to mark
+    # them `not_reported` under DISPLAY_ONLY — fixed separately, see DISPLAY_ONLY
+    # above), that condition was False and NOTHING was written: no cross_check entry
+    # at all, not even a "skipped" one. IQST/LBRDP/SEATW/SLNG/WMG/XRXDW all stated
+    # net_income, eps_diluted AND shares_diluted_wavg as FIGURES on the card while
+    # cross_checks['income_identity'] was silently absent — indistinguishable from a
+    # card that never had the inputs to check in the first place. Every other missing-
+    # input shape here (period mismatch, fincard.py-092) already writes a "skipped"
+    # entry; this makes absence-of-input do the same, so an empty cross_checks always
+    # means "nothing to check", never "something was skipped without a trace".
     eps_d, shd = ttm_vals.get("eps_diluted"), ttm_vals.get("shares_diluted_wavg")
-    if ni and eps_d is not None and shd:
+    if ni is not None and "net_income" in F and (eps_d is None or shd is None):
+        _missing = [n for n, v in (("eps_diluted", eps_d), ("shares_diluted_wavg", shd)) if v is None]
+        card["cross_checks"]["income_identity"] = {
+            "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd, "ok": None,
+            "skipped": f"{' and '.join(_missing)} unavailable — STALE-excluded (see the "
+                f"figure's own STALE note) or never filed under a tag this card resolves. "
+                f"Identity not checked (fincard.py-152)."}
+    elif ni and eps_d is not None and shd:
         if not _same_period(F.get("eps_diluted"), F.get("net_income")):
             card["cross_checks"]["income_identity"] = {
                 "net_income": ni, "eps_diluted": eps_d, "shares_diluted_wavg": shd,
@@ -2125,8 +2211,8 @@ def build(tk, cik_override=None):
                     f"INCOME IDENTITY FAILS: eps_diluted {eps_d} x shares_diluted_wavg "
                     f"{shd:,.0f} = {implied_ni:,.0f}, a {ratio:.4g}x ratio to stated "
                     f"net_income {ni:,.0f} — {cause} (fincard.py-080/092). eps_diluted/"
-                    f"shares_diluted_wavg feed no derived value (DISPLAY_ONLY) but should not "
-                    f"be quoted at face value until resolved.")
+                    f"shares_diluted_wavg feed no OTHER derived value but should not be "
+                    f"quoted at face value until resolved.")
 
     # TAX-DRIVEN EARNINGS (fincard.py-085): a card can be internally CONSISTENT (eps x
     # shares ties to net_income) and still be externally MEANINGLESS — LYFT's FY2025
@@ -2143,8 +2229,47 @@ def build(tk, cik_override=None):
     # TTM 2025-07-01..2026-06-30 — a 1105% "gap" between two different 12/6-month
     # windows, not a real tax item). Only compare when both cover the same window.
     pretax = ttm_vals.get("pretax_income")
-    if ni is not None and pretax is not None and ni != 0 \
+
+    # NCI FIX (fincard.py-158, hunt 2026-09-06 / numbers 2026-09-08): the check below
+    # used to compare pretax_income (BEFORE noncontrolling interests are split out —
+    # its own tag name says so: IncomeLossFromContinuingOperations...Noncontrolling-
+    # Interest) against net_income/NetIncomeLoss (AFTER the NCI split, parent-only),
+    # and blamed any sign flip or big gap on tax. AMRC (Q2 2026 10-Q, six months ended
+    # 2026-06-30): pretax_income 2,477,000, tax BENEFIT 3,047,000 -> consolidated net
+    # income (ProfitLoss, still pre-NCI-split) 5,524,000, NCI takes 14,089,000 ->
+    # net_income (parent-only) -8,565,000. Comparing pretax_income straight to
+    # net_income called this a "sign flip" caused by tax; backwards — the tax benefit
+    # HELPED (2,477 -> 5,524), NCI is what flipped the sign. Fetched here independently
+    # (same _pick_flow/_ttm assembly the FLOW loop above uses) because rows_for
+    # collapses FLOW["net_income"]'s two tags to one and NetIncomeLoss wins the
+    # freshness tie, discarding ProfitLoss even when both are filed.
+    _pl_rows = gaap.get("ProfitLoss", {}).get("units", {}).get("USD", [])
+    _pl_q, _pl_a, _pl_ytd = _pick_flow(_pl_rows, derive=True)
+    _pl_val, _pl_period, _pl_end, _pl_start = _ttm(_pl_q, _pl_a, _pl_ytd, mode="sum")
+    _pl_fig = {"period_start": _pl_start, "period_end": _pl_end} if _pl_val is not None else None
+
+    if pretax is not None and _pl_val is not None and _same_period(_pl_fig, F.get("pretax_income")):
+        # TAX isolated at the CONSOLIDATED level — both legs are pre-NCI-split, so the
+        # only thing that can move between them is the tax line.
+        _tax_sign_flip = pretax != 0 and _pl_val != 0 and (_pl_val > 0) != (pretax > 0)
+        _tax_gap_pct = abs(_pl_val - pretax) / abs(_pl_val) * 100 if _pl_val else 0
+        if _tax_sign_flip or _tax_gap_pct > 50:
+            card["flags"].append(
+                f"TAX-DRIVEN EARNINGS: ProfitLoss (consolidated, pre-NCI-split) "
+                f"{_pl_val:,.0f} vs pretax_income {pretax:,.0f} "
+                f"({'sign flip' if _tax_sign_flip else f'{_tax_gap_pct:.0f}% gap'}) — a "
+                f"one-time tax item (e.g. a deferred-tax valuation-allowance release/"
+                f"charge), not operating performance, is driving consolidated earnings. "
+                f"pe, net_margin_pct, roe_pct and eps_diluted are TAX-DRIVEN, not "
+                f"earnings-driven — do not rank or screen on them without naming the "
+                f"tax item. fcf, ev_over_fcf and fcf_yield_pct are cash-derived and "
+                f"unaffected (fincard.py-085/158).")
+    elif ni is not None and pretax is not None and ni != 0 \
             and _same_period(F.get("net_income"), F.get("pretax_income")):
+        # FALLBACK — ProfitLoss absent or off-period (the common case: most issuers
+        # carry no noncontrolling interest and never file ProfitLoss separately from
+        # NetIncomeLoss). Original check, unchanged, so an issuer with no NCI story
+        # sees no regression from this fix.
         sign_flip = pretax != 0 and (ni > 0) != (pretax > 0)
         gap_pct = abs(ni - pretax) / abs(ni) * 100
         if sign_flip or gap_pct > 50:
@@ -2156,6 +2281,26 @@ def build(tk, cik_override=None):
                 f"roe_pct and eps_diluted are TAX-DRIVEN, not earnings-driven — do not rank "
                 f"or screen on them without naming the tax item. fcf, ev_over_fcf and "
                 f"fcf_yield_pct are cash-derived and unaffected (fincard.py-085).")
+
+    # NCI-DRIVEN EARNINGS (fincard.py-158): the SEPARATE wedge the fix above isolates —
+    # ProfitLoss (consolidated, pre-NCI-split) vs net_income/NetIncomeLoss (parent-only,
+    # post-NCI-split). AMRC: 5,524,000 vs -8,565,000, a sign flip entirely explained by
+    # the 14,089,000 NCI take, none of it tax. pe/net_margin_pct/roe_pct/eps_diluted are
+    # all computed off net_income and inherit this; fcf-derived values are unaffected.
+    if _pl_val is not None and ni is not None and ni != 0 \
+            and _same_period(_pl_fig, F.get("net_income")):
+        _nci_sign_flip = ni != 0 and _pl_val != 0 and (_pl_val > 0) != (ni > 0)
+        _nci_gap_pct = abs(_pl_val - ni) / abs(_pl_val) * 100 if _pl_val else 0
+        if _nci_sign_flip or _nci_gap_pct > 50:
+            card["flags"].append(
+                f"NCI-DRIVEN EARNINGS: net_income (parent-only) {ni:,.0f} vs ProfitLoss "
+                f"(consolidated, incl. NCI) {_pl_val:,.0f} "
+                f"({'sign flip' if _nci_sign_flip else f'{_nci_gap_pct:.0f}% gap'}) — "
+                f"noncontrolling interests, not tax or operating performance, are "
+                f"driving the parent-only net_income figure. pe, net_margin_pct, "
+                f"roe_pct and eps_diluted are computed off net_income and inherit this; "
+                f"fcf, ev_over_fcf and fcf_yield_pct are cash-derived and unaffected "
+                f"(fincard.py-158).")
 
     if opi is None and rev is not None and ttm_vals.get("costs_and_expenses") is not None:
         opi = rev - ttm_vals["costs_and_expenses"]
@@ -2350,6 +2495,23 @@ def build(tk, cik_override=None):
     px, sh = _price(tk), gv("shares_out")
     if px:
         card["price"] = {"value": px, "asof": now, "source": "finnhub quote"}
+
+        # ADV (fincard.py-177, build 2026-09-08): average daily DOLLAR volume, for
+        # STRATEGY-PROPOSAL-v3 SECTION 1's liquidity rule (position <= 1% of ADV) and
+        # the coded pre-teardown gate's G3, neither of which had a figure to read.
+        # avg_shares_per_day is Finnhub's own trailing average (see
+        # _finnhub_avg_volume), not a same-day print — multiplying by TODAY's live
+        # quote is an approximation (yesterday's shares at today's price), same
+        # convention market_cap already uses (current price x a shares_out figure that
+        # is itself dated).
+        _adv_shares, _adv_window = _finnhub_avg_volume(tk)
+        if _adv_shares:
+            D["adv_usd"] = {
+                "value": round(px * _adv_shares),
+                "formula": f"price {px} x avg_daily_volume {_adv_shares:,.0f} sh "
+                    f"({_adv_window} avg, Finnhub /stock/metric)",
+                "note": "trailing average share volume x TODAY's price — an "
+                    "approximation, not a same-day dollar figure"}
     # NON-PRIMARY SECURITY is now EVIDENCE-GATED, not assumed from ticker-list position
     # (fixed 2026-08-26, same-night regression): the original cut treated `_cik_tks[0]` as
     # "the" common ticker and suppressed market_cap/EV for every OTHER ticker at that CIK.
@@ -2424,6 +2586,44 @@ def build(tk, cik_override=None):
         if nc is not None:
             ev = mc - nc
             put("enterprise_value", ev, f"market_cap {mc:,.0f} - net_cash {nc:,.0f}")
+
+            # CASH CLAIM (fincard.py-162, COO 2026-09-06 / numbers 2026-09-08): EV above
+            # is a balance-sheet snapshot; a dated cash outflow the SAME filing already
+            # discloses (an accrued dividend now payable) is a known claim on that cash
+            # no existing check looks at. ARI: EV 14,047,200 (1.6% of market_cap
+            # 882,099,200 — the stock trades near its own stated net cash) with
+            # dividends_payable 492,416,000 (39.7% of cash 1,239,480,000, the $3.75/sh
+            # common dividend "payable July 15, 2026 to stockholders of record as of
+            # June 30, 2026") — pro-forma EV comes to 675,785,200, 31.6x FCF against the
+            # printed 0.66x. Every existing check passed (balance-sheet identity,
+            # staleness guard, income identity); none of them look at whether a cash
+            # figure feeding EV has a dated claim against it.
+            # GATED ON EV COMPRESSION (abs(ev) < 25% of market_cap), not on the
+            # dividends_payable/cash ratio alone: an unconditional cash-ratio flag tests
+            # noisy — NHI (149% of a routine lean REIT cash balance) and O (47%) both
+            # trip a bare ratio test while being ordinary REIT dividend cadence, the
+            # exact "meaningful but not a defect" class this ask's own broader non-debt-
+            # liabilities experiment already rejected (237 hits, tested 2026-09-06). What
+            # made ARI different is that its EV was ALREADY compressed to a sliver of
+            # market_cap before the claim was even considered — the shape where a cash-
+            # leg error swings the MULTIPLE, not just the balance-sheet ratio. NHI and O
+            # both carry net DEBT-scale EV (>> 25% of market_cap), so the same
+            # dividends_payable ratio does not move their multiples the way it does ARI's.
+            _dp = gv("dividends_payable")
+            if (_dp and cash > 0 and _dp / cash >= 0.10
+                    and mc > 0 and abs(ev) < 0.25 * mc):
+                _pro_forma_cash = cash - _dp
+                _pro_forma_ev = ev + _dp
+                card["flags"].append(
+                    f"CASH CLAIM: dividends_payable {_dp:,.0f}, {_dp / cash * 100:.0f}% "
+                    f"of reported cash {cash:,.0f} (asof {F['cash'].get('asof')}), on an "
+                    f"EV already compressed to {abs(ev) / mc * 100:.1f}% of market_cap — "
+                    f"pro-forma cash {_pro_forma_cash:,.0f}, pro-forma EV "
+                    f"{_pro_forma_ev:,.0f} once paid. enterprise_value/ev_over_fcf below "
+                    f"use REPORTED cash; re-derive with pro-forma EV before trusting the "
+                    f"multiple, and check for an ADDITIONAL claim (e.g. a redeemed "
+                    f"preferred) in the filing's subsequent-events note (fincard.py-162).")
+
             fcf = (D.get("fcf") or {}).get("value")
             if fcf and fcf > 0:
                 # fincard.py-045 (quality.py-043, 2026-08-25): EV is a POINT-IN-TIME stock;

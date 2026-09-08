@@ -64,6 +64,24 @@ FORM_COUNTS = {"10-K": 1, "10-Q": 2, "8-K": 4, "DEF 14A": 1, "DEFM14A": 1,
 EXHIBIT_FORMS = {"8-K", "10-12B", "10-12B/A"}
 EXHIBIT_TYPE_RE = re.compile(r"^EX-99(\.\d+)?$", re.I)
 
+# WALL-CLOCK BUDGET (dossier.py-153, coo 2026-09-06 / numbers 2026-09-08): vp.py wraps
+# the dossier stage in the SAME 900s hard subprocess kill that motivated
+# refresh_cards.py-137's BUDGET_S — the exhibit-fetch loop below is the unbounded part
+# (list_exhibits() is ONE more network round trip per filing, then ANOTHER fetch per
+# EX-99.x found), and on a night SEC is slow (the same "~30KB/s, 87-242s per card"
+# degradation refresh_cards.py-137 measured 2026-09-04/05) the sum blows past 900s with
+# NOTHING written — no terms.json, no stub, silent, on ARI specifically twice
+# (2026-09-04/05), the book's largest position. Budgeted to 650s, leaving ~250s of
+# margin under the external kill for the fixed-cost tail after this loop (companyfacts
+# fetch, fincard.build()'s OWN companyfacts fetch, extract_terms) — narrower than
+# refresh_cards.py's 300s margin because that margin only had to cover one ticker's
+# worst observed single call (242s); this margin has to cover THREE more network calls
+# plus local text processing. Once tripped, remaining PRIMARY filings and remaining
+# EXHIBIT fetches are both skipped (primary filings already fetched stay; nothing
+# already on disk is discarded) and every skip is recorded on its own row so a partial
+# dossier says exactly what it does and doesn't have, same as refresh_cards.py's stub.
+BUDGET_S = 650
+
 
 def list_exhibits(cik, acc):
     """EX-99.x exhibits in a filing's index page: [(type, document_filename), ...]."""
@@ -144,6 +162,7 @@ def resolve_cik(tk, override=None):
 
 # ---------------- build ----------------
 def build(tk, cik_override=None):
+    t0 = time.time()
     tk = tk.upper()
     cik, via = resolve_cik(tk, cik_override)
     d = NAMES / tk
@@ -159,7 +178,13 @@ def build(tk, cik_override=None):
             counts[form] += 1
             picked.append({"form": form, "date": date, "acc": acc, "doc": doc})
     extra = []
-    for f in picked:
+    budget_tripped = False
+    for i, f in enumerate(picked):
+        if time.time() - t0 > BUDGET_S:
+            budget_tripped = True
+            for rest in picked[i:]:
+                rest["skipped"] = f"BUDGET ({BUDGET_S}s) tripped before this filing was fetched (dossier.py-153)"
+            break
         form_clean = f["form"].replace(" ", "").replace("/", "")
         url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
         try:
@@ -174,6 +199,10 @@ def build(tk, cik_override=None):
         f["file"], f["chars"] = f"filings/{name}", len(txt)
 
         if f["form"] not in EXHIBIT_FORMS:
+            continue
+        if budget_tripped or time.time() - t0 > BUDGET_S:
+            budget_tripped = True
+            f["exhibits_skipped"] = f"BUDGET ({BUDGET_S}s) tripped before exhibits were enumerated (dossier.py-153)"
             continue
         for ex_type, ex_doc in list_exhibits(cik, f["acc"]):
             if ex_doc == f["doc"]:
@@ -192,6 +221,9 @@ def build(tk, cik_override=None):
             (d / "filings" / ex_name).write_text(ex_txt)
             ex["file"], ex["chars"] = f"filings/{ex_name}", len(ex_txt)
             extra.append(ex)
+            if time.time() - t0 > BUDGET_S:
+                budget_tripped = True
+                break
     picked.extend(extra)
 
     facts = {}
@@ -224,16 +256,44 @@ def build(tk, cik_override=None):
     except Exception as e:
         print(f"(fincard skipped: {str(e)[:80]})")
 
-    terms = extract_terms(d, title)
+    terms = extract_terms(d, title, deadline=t0 + BUDGET_S)
+    budget_tripped = budget_tripped or bool(terms.get("budget_skipped"))
+    if terms.get("budget_skipped"):
+        # MERGE, don't overwrite (dossier.py-153): extract_terms() only re-examines
+        # docs it had budget for — a budget-tripped run's "terms" list is a fresh look
+        # at 1-2 docs, not a full pass. Live-tested on ARI: two consecutive
+        # budget-tripped runs landed on DIFFERENT single docs (one on the 10-Q, 23
+        # terms; the next on an 8-K exhibit that failed to parse, 0 terms) — writing
+        # THAT list straight to terms.json would have ERASED the prior run's 23 terms
+        # the moment a night got unlucky, turning a coverage gap into active data
+        # loss. Keep the OLD entry for any doc this run never got to (budget_skipped,
+        # and still present in filings/); this run's terms — including an empty
+        # result — replace the old entry for whichever doc(s) it DID re-examine,
+        # since a fresh look supersedes a stale one either way.
+        try:
+            old = json.loads((d / "terms.json").read_text())
+        except Exception:
+            old = {}
+        skipped, on_disk = set(terms["budget_skipped"]), {p.name for p in (d / "filings").glob("*.txt")}
+        carried = [t for t in old.get("terms", []) if t.get("doc") in skipped and t.get("doc") in on_disk]
+        if carried:
+            terms["terms"] = carried + terms["terms"]
+            terms["carried_from_prior_run"] = sorted({t["doc"] for t in carried})
     (d / "terms.json").write_text(json.dumps(terms, indent=1))
     (d / "manifest.json").write_text(json.dumps(
         {"ticker": tk, "cik": cik, "resolved_via": via, "title": title,
          "built": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
          "filings": picked, "n_terms": len(terms.get("terms", [])),
-         "n_verified": sum(1 for t in terms.get("terms", []) if t.get("verified"))}, indent=1))
+         "n_verified": sum(1 for t in terms.get("terms", []) if t.get("verified")),
+         # BUDGET (dossier.py-153): visible on the manifest, not just buried per-filing
+         # skip notes — a partial dossier must say so where the VP brief/contract
+         # checks already look, not require grepping 14 filing rows to notice.
+         "budget_tripped": budget_tripped, "build_seconds": round(time.time() - t0)},
+        indent=1))
     print(f"dossier {tk}: {len([f for f in picked if f.get('file')])} filings · "
           f"{len(facts)} fact series · {len(terms.get('terms', []))} terms "
-          f"({sum(1 for t in terms.get('terms', []) if t.get('verified'))} quote-verified)")
+          f"({sum(1 for t in terms.get('terms', []) if t.get('verified'))} quote-verified)"
+          + (f" · BUDGET TRIPPED at {BUDGET_S}s (dossier.py-153) — partial" if budget_tripped else ""))
     return d
 
 
@@ -275,7 +335,7 @@ def fincheck(d, card):
         "If every debt line shows a dash or the balance sheet has none, debt_lt is NOT_SHOWN. "
         "JSON {\"cash\":\"<digits or NOT_SHOWN>\",\"cfo\":\"...\",\"capex\":"
         "\"...\",\"debt_lt\":\"...\",\"scale\":\"thousands|millions|units|unknown\"}\n\n"
-        + "\n\n[---]\n\n".join(wins), num_predict=400)
+        + "\n\n[---]\n\n".join(wins), num_predict=500, think=True, job="dossier fincheck")
     if not isinstance(v, dict):
         return
     out = {"checked_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -380,12 +440,34 @@ def keyword_windows(txt, keywords, width=1200, cap=4, total_cap=14000, per_group
     return out
 
 
-def extract_terms(d, title):
+def extract_terms(d, title, deadline=None):
     """Local model extracts security/contract terms from keyword-located passages.
-    Every extraction must carry a verbatim quote; code verifies the quote exists."""
+    Every extraction must carry a verbatim quote; code verifies the quote exists.
+
+    BUDGET (dossier.py-153): this is ONE ask_json call per filing on disk, each
+    think=True (extended reasoning — slower per call by design) and up to 36,000
+    chars of excerpt for a deal doc. Found live testing this fix (2026-09-08): this
+    loop, not the exhibit-fetch loop above, is ARI's real bottleneck — a single
+    'dossier terms' call held the GPU slot 90+ seconds with another Stocks job
+    (the Bench) already queued behind it, and ARI's filing set (14-18 filings, REIT
+    legal documents) means 14-18 such calls in sequence. `deadline` (an absolute
+    time.time(), the SAME budget build() already spends on fetching) is checked
+    before each call so a tight run stops calling the LLM rather than being killed
+    mid-call by vp.py's external 900s cap — partial terms, not zero."""
     out = {"extracted_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-           "model": f"{DEFAULT_MODEL} (local)", "terms": []}
-    for doc in sorted((d / "filings").glob("*.txt")):
+           "model": f"{DEFAULT_MODEL} (local)", "terms": [], "budget_skipped": []}
+    # NEWEST FIRST (dossier.py-153): filenames are "YYYY-MM-DD_FORM[...].txt", so a
+    # plain sorted() processes the OLDEST filing first — exactly backwards under a
+    # tight budget. Live-tested on ARI: budget allowed exactly 1 of 14 filings before
+    # tripping, and plain sort order would have spent that one call on a 2026-03-23
+    # DEFM14A while skipping the 2026-08-10 10-Q — the filing that carries the
+    # subsequent-events redemption/dividend terms this dossier most needs current
+    # (fincard.py-162, same night). A budget-constrained run should capture what's
+    # NEW, not what's alphabetically/chronologically first.
+    for doc in sorted((d / "filings").glob("*.txt"), reverse=True):
+        if deadline is not None and time.time() > deadline:
+            out["budget_skipped"].append(doc.name)
+            continue
         txt = doc.read_text(errors="replace")
         is_deal_doc = any(f in doc.name for f in DEAL_FORMS)
         if is_deal_doc:
@@ -418,7 +500,7 @@ def extract_terms(d, title):
             "precise clause with numbers/dates>\",\"quote\":\"<supporting sentence copied "
             "CHARACTER-FOR-CHARACTER from the excerpt, max 40 words>\"}]}. Only terms explicitly "
             "in the text — omit anything you cannot quote. Empty list if none.\n\n" + excerpt,
-            num_predict=1800 if is_deal_doc else 1400)
+            num_predict=3000 if is_deal_doc else 2200, think=True, job="dossier terms")
         ntxt = norm(txt)
         for t in (v.get("terms") or []) if isinstance(v, dict) else []:
             q = str(t.get("quote", ""))
@@ -553,7 +635,9 @@ def audit(memo_path, tk=None):
                 "\"SUPPORTED|CONTRADICTED|NOT_FOUND|OUT_OF_SCOPE\",\"doc\":\"<doc name>\",\"quote\":\"<the "
                 "decisive sentence copied CHARACTER-FOR-CHARACTER>\",\"why\":\"<max 15 words>\"}. "
                 "If the documents state different terms than the claim asserts, that is "
-                "CONTRADICTED, not NOT_FOUND.", num_predict=500)
+                "CONTRADICTED, not NOT_FOUND. Reason first: find every excerpt that bears on the "
+                "claim, decide what each one says, then choose the decisive sentence.",
+                num_predict=600, think=True, job="dossier adjudicate")
             if isinstance(v, dict) and v.get("verdict") in ("SUPPORTED", "CONTRADICTED", "NOT_FOUND", "OUT_OF_SCOPE"):
                 verdict = v
         q = str(verdict.get("quote", ""))

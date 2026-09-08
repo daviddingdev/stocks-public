@@ -49,7 +49,13 @@ FACT_MAP = {
     "shares": ["CommonStockSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingBasic"],
     "rnd": ["ResearchAndDevelopmentExpense"],
     "sga": ["SellingGeneralAndAdministrativeExpense"],
+    "nci": ["NetIncomeLossAttributableToNoncontrollingInterest"],
 }
+# per-concept history floor: a straight recency cap starves FY 10-K rows on names with
+# heavy 10-Q comparative restatements (AMRC's cap held 3 FYs where the teardown quoted 8,
+# hunt ask evidence.py-164) — reserve slots for FY 10-K rows separately from the rest.
+FY_KEEP = 12
+OTHER_KEEP = 16
 ITEM_RE = re.compile(r"(?im)^\s*(item\s+(?:1a?|2|3|5|7a?|8|9a?)\.?[^\n]{0,80})$")
 
 
@@ -146,21 +152,65 @@ def build(tk, skip_local=False):
                     for v in rows:
                         key = (v["end"], v.get("fp", ""))
                         seen[key] = {"end": v["end"], "val": v["val"], "fy": v.get("fy"),
-                                     "fp": v.get("fp"), "form": v.get("form")}
-                    facts_out[concept] = {"tag": tag, "series": sorted(seen.values(), key=lambda x: x["end"])[-24:]}
+                                     "fp": v.get("fp"), "form": v.get("form"), "filed": v.get("filed")}
+                    fy10k = sorted((r for r in seen.values() if r["fp"] == "FY" and r["form"] == "10-K"),
+                                   key=lambda x: x["end"])[-FY_KEEP:]
+                    other = sorted((r for r in seen.values() if not (r["fp"] == "FY" and r["form"] == "10-K")),
+                                   key=lambda x: x["end"])[-OTHER_KEEP:]
+                    facts_out[concept] = {"tag": tag, "series": sorted(fy10k + other, key=lambda x: x["end"])}
                     break
     except Exception as e:
         facts_out["_error"] = str(e)[:120]
+
+    # a filed 10-K with no XBRL rows for its own "filed" date is silently invisible: every
+    # concept's series just keeps showing the prior year's numbers with no warning (AMRC
+    # FY2025 10-K, hunt ask evidence.py-160). Cross-check the pack's own filing list against
+    # the distinct "filed" dates the companyfacts API actually returned.
+    tenk_filed = {row.get("filed") for d in facts_out.values() if isinstance(d, dict)
+                  for row in d.get("series", []) if row.get("form") == "10-K"}
+    xbrl_gaps = [f["date"] for f in picked if f["form"] == "10-K" and f["date"] not in tenk_filed]
+
+    # a capex tag that resolves to well under 1% of CFO is very likely the wrong series for
+    # an asset-owning issuer (PaymentsToAcquirePropertyPlantAndEquipment catching only office
+    # furniture while the real capital programme sits in a custom tag) — same AMRC ask.
+    warnings = []
+
+    def latest_fy(series):
+        fy_rows = [r for r in (series or []) if r.get("fp") == "FY"]
+        return fy_rows[-1] if fy_rows else None
+
+    capex_row = latest_fy(facts_out.get("capex", {}).get("series"))
+    cfo_row = latest_fy(facts_out.get("cfo", {}).get("series"))
+    if capex_row and cfo_row and cfo_row["val"]:
+        if abs(capex_row["val"]) < 0.01 * abs(cfo_row["val"]):
+            warnings.append(
+                f"capex ({facts_out['capex']['tag']}) FY{capex_row['end'][:4]} = "
+                f"{capex_row['val']:,} is under 1% of FY{cfo_row['end'][:4]} CFO "
+                f"({cfo_row['val']:,}) — likely the wrong series for an asset-owning issuer; "
+                f"check the filing text for a custom capex/capital-investment line before "
+                f"trusting this number.")
+    if xbrl_gaps:
+        facts_out["_xbrl_gaps"] = xbrl_gaps
+    if warnings:
+        facts_out["_warnings"] = warnings
     (ev / "facts.json").write_text(json.dumps(facts_out, indent=1))
     (ev / "sections.json").write_text(json.dumps(sections, indent=1))
 
     # --- code-built INDEX skeleton (local-model notes appended by navindex.py) ---
     idx = [f"# Evidence pack — {title} ({tk}) · built {dt.date.today().isoformat()}",
            "", "_Navigation map for research agents: read from here first; anything can still be",
-           "pulled raw from EDGAR — this pack narrows the search, it never limits it._", "",
-           "## Financial series (facts.json)",
-           ", ".join(k for k in facts_out if not k.startswith("_")) or "(XBRL fetch failed)",
-           "", "## Filings in the pack"]
+           "pulled raw from EDGAR — this pack narrows the search, it never limits it._", ""]
+    if xbrl_gaps:
+        idx.append(f"**GAP: 10-K filed {', '.join(xbrl_gaps)} has NO rows in facts.json — every "
+                   f"series above silently serves the PRIOR year for that period. Read the filing "
+                   f"text directly for the missing year's figures.**")
+        idx.append("")
+    for w in warnings:
+        idx.append(f"**WARNING: {w}**")
+        idx.append("")
+    idx += ["## Financial series (facts.json)",
+            ", ".join(k for k in facts_out if not k.startswith("_")) or "(XBRL fetch failed)",
+            "", "## Filings in the pack"]
     for f in picked:
         if f.get("file"):
             secs = sections.get(Path(f["file"]).name, [])
@@ -168,7 +218,8 @@ def build(tk, skip_local=False):
                        f"{len(secs)} located items)")
     (ev / "INDEX.md").write_text("\n".join(idx) + "\n")
     manifest = {"ticker": tk, "cik": cik, "title": title, "built": dt.datetime.now().isoformat(timespec="seconds"),
-                "filings": picked, "facts_concepts": [k for k in facts_out if not k.startswith("_")]}
+                "filings": picked, "facts_concepts": [k for k in facts_out if not k.startswith("_")],
+                "xbrl_gaps": xbrl_gaps, "warnings": warnings}
     (ev / "manifest.json").write_text(json.dumps(manifest, indent=1))
     print(f"evidence pack: {ev} · {len([f for f in picked if f.get('file')])} filings · "
           f"{len(manifest['facts_concepts'])} fact series")

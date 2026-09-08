@@ -82,12 +82,24 @@ def strategy_prompt(today=None):
     this is, and the prior drafts it must read first."""
     import prompts
     today = today or dt.date.today().isoformat()
-    day = STRATEGY_ARC.index(today) + 1 if today in STRATEGY_ARC else len(STRATEGY_ARC)
+    # Outside the September arc this is the MONTHLY reflective session (ARCHITECTURE adopted
+    # 2026-09-07: first Saturday of the month, 04:00Z, one session) — the prompt's MONTHLY MODE.
+    day = str(STRATEGY_ARC.index(today) + 1) if today in STRATEGY_ARC else "MONTHLY"
     sdir = JOURNAL / "strategy"
     sdir.mkdir(parents=True, exist_ok=True)
     prior = sorted(p.name for p in sdir.glob("*.md"))
     prior_txt = "\n".join(f"  - {sdir / n}" for n in prior) or "  (none yet — this is the first session of the arc)"
-    return prompts.render("pm_strategy", ARC=" / ".join(STRATEGY_ARC), DAY=str(day), DATE=today, PRIOR=prior_txt)
+    # ask loop.py-139 (David 2026-09-08, decision A): the same reflection block trade_prompt
+    # renders — a strategy session is the one rewriting STRATEGY.md and must see its lessons.
+    try:
+        import reflect
+        block = reflect.render("frontier", record=True)
+    except Exception as e:
+        block = (f"_reflect.py could not render your reflections ({type(e).__name__}: {e}). You are "
+                 "running WITHOUT last session's lessons — say so in your session log and open an "
+                 "ask against _engine/agent/reflect.py._")
+    return prompts.render("pm_strategy", ARC=" / ".join(STRATEGY_ARC), DAY=day, DATE=today,
+                          PRIOR=prior_txt, REFLECTIONS=block)
 
 
 def launch(mode, attempt=1, model_idx=0, now=False):

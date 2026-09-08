@@ -36,18 +36,12 @@ items. Be concrete (name numbers, parties, section names). No preamble, no closi
 
 
 def ask(text):
-    body = json.dumps({"model": MODEL, "think": False, "stream": False,
-                       "messages": [{"role": "system", "content": PROMPT},
-                                    {"role": "user", "content": text}],
-                       "options": {"num_predict": 300, "temperature": 0.2}}).encode()
-    req = urllib.request.Request(OLLAMA, data=body, headers={"Content-Type": "application/json"})
-    t0 = time.time()
-    with gpu.slot(job="navindex", model=MODEL):
-        with urllib.request.urlopen(req, timeout=300) as r:
-            d = json.loads(r.read())
-    gpu.record_usage(job="navindex", model=MODEL, prompt_tokens=d.get("prompt_eval_count"),
-                     output_tokens=d.get("eval_count"), seconds=time.time() - t0)
-    return d["message"]["content"].strip()
+    """Through the shared wrapper (audit 2026-09-07): this was the one caller with its own
+    HTTP client and no keep_alive — 17.8 s/call, the slowest Stocks job, on cold reloads —
+    and its 300-token cap cut 13% of the five-bullet notes mid-bullet."""
+    import localllm
+    return localllm.ask(text, system=PROMPT, num_predict=700, timeout=300, job="navindex",
+                        model=MODEL)
 
 
 def annotate(ev_dir):
