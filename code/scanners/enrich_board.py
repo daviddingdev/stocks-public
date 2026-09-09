@@ -83,7 +83,7 @@ def main():
     board.sort(key=lambda x: (int(x["n_buyers"]), x["cap"] and -x["cap"]), reverse=True)
 
     stamp = dt.date.today().strftime("%Y-%m-%d")
-    out = BOARDS / f"board_{stamp}.md"
+    out = BOARDS / f"board_enrich_{stamp}.md"
     with out.open("w") as f:
         f.write(f"# Candidate board — {stamp}\n\n")
         f.write(f"Source: {src.name} · filtered to ${args.min_cap/1e6:.0f}M–${args.max_cap/1e9:.0f}B, "

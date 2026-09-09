@@ -16,7 +16,9 @@ a rule trips; then it escalates in one of two ways:
             before any order, per MANDATE.md.
 
 Rules — HELD NAMES ONLY (David, 2026-07-30: no watchlist noise; every alert names the
-book it hits and quantifies impact). Thresholds in config/triggers.json; dedupe in
+book it hits and quantifies impact), with ONE deliberate exception: rule 9's buy_below
+watch also covers researched-but-unheld Follow names, since "held" doesn't mean anything
+for a name with no position yet. Thresholds in config/triggers.json; dedupe in
 data/trigger_state.json:
   1. Held name moves >= threshold (BROKERA: price_move_pct_holdings; agent: agent_action_move_pct,
      which also triggers an ACTION decision session) -> ALERT with book + $/% impact
@@ -461,6 +463,31 @@ def run():
         fired += alert(state, c, f"kpi:{tk}:{b['kpi']}", "kpi breach", tk,
                        f"{tk} {b['kpi']} {vs} vs expect {b['expect']} — {b['why']}",
                        action=(tk in ag_pos and not fresh), book=book)
+
+    # --- 9: buy_below price alert from every researched name's lenses.json (added
+    # 2026-09-08, pm-167) — STRATEGY-PROPOSAL-v3 §7 stage 6 turns a verdict >=25% from
+    # price into a Follow with a price alert; nothing watched buy_below at all before
+    # this (grep buy_below triggers.py -> nothing), so KT sat 2.8% above its level for
+    # two sessions unseen. Deliberately NOT held-names-only (rule 1's docstring policy,
+    # and alert()'s): a Follow name has no position for "held" to mean anything about,
+    # and a Buy-below name trading back near its own level is exactly the re-buy signal
+    # this exists to catch, held or not. Alert only — no ACTION, no launch; the PM/David
+    # still decides. Dedupe is per name per day via alert()'s own date gate on the key.
+    for lf in sorted((ENGINE.parent).glob("*/analysis/lenses.json")):
+        ov = (_j(lf, {}) or {}).get("overall") or {}
+        verdict, buy_below = ov.get("verdict"), ov.get("buy_below")
+        if verdict not in ("Buy below", "Follow") or not buy_below:
+            continue
+        tk = lf.parent.parent.name.rsplit("-", 1)[-1].upper()
+        q = feeds.fh_get("quote", symbol=tk) or {}
+        price = q.get("c")
+        if not price or price > buy_below * 1.02:
+            continue
+        ctx, book = impact(tk, price, q.get("pc") or price)
+        fired += alert(state, c, f"buybelow:{tk}", "buy-below alert", tk,
+                       f"{tk} ${price:,.2f} is within 2% of (or below) your buy_below "
+                       f"${buy_below:,.2f} ({verdict}, lenses.json as of {ov.get('as_of', '?')})"
+                       + (f" — {ctx}" if ctx else " — not currently held"), book=book)
 
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "

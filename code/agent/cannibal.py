@@ -39,6 +39,8 @@ DATA = HERE / "data"
 ENGINE = HERE.parent
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # SEC contact identity, config-driven
+sys.path.insert(0, str(HERE))
+from feeds import funnel_record  # noqa: E402  — scout.py-172 funnel counts
 OUT = DATA / "cannibal.json"
 
 MIN_CAP, MAX_CAP = 100e6, 10e9
@@ -331,6 +333,8 @@ def run(max_quotes=300):
         "extreme_shrink": extreme[:15]}
     doc["monitor"] = monitor(doc, new_entrants)
     OUT.write_text(json.dumps(doc, indent=1))
+    funnel_record("cannibal:scan", len(cfo), len(survivors))
+    funnel_record("cannibal:hits", len(survivors), len(hits))
     print(f"{now} cannibal: {len(hits)} hits · +{len(new_entrants)} new · -{len(dropped)} dropped · "
           f"top: {[(h['ticker'], h['fcf_yield_pct'], h['share_shrink_pct']) for h in top[:6]]}")
     if doc["monitor"].get("verdict"):

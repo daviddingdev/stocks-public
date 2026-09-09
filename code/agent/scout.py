@@ -12,7 +12,12 @@ SOURCING doctrine's questions, Opus judges only the ranked top of the funnel.
                             forever (no re-triaging the same 13D five times —
                             the board_memory lesson applied to sourcing).
   Stage 1  PRE-TRIAGE (local, event-only): plausibility 0-10. Junk dies free.
-  Stage 2  ENRICH (code):   plausibility >=5 -> fincard built (codified numbers).
+  Stage 2  ENRICH (code):   plausibility >=4 (or >=3 with a resolved ticker) -> fincard
+                            built (codified numbers). Loosened from >=5 after the ETD
+                            case (2026-08-14): the one lead the PM promoted by reading
+                            the 13D itself, going around a funnel that had scored it 4
+                            and buried it — see the gate comment in run() for the full
+                            record; this docstring used to still say >=5 (scout.py-172).
   Stage 3  TRIAGE (local, event + numbers): mechanism-fit 0-10 against the
                             doctrine's channels + a 4-sentence sketch + what the
                             variant perception would have to be + red flags.
@@ -38,6 +43,8 @@ sys.path.insert(0, os.path.expanduser("~/maintenance/bin"))
 from localllm import ask_json  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # noqa: E402  — SEC contact identity, config-driven
+sys.path.insert(0, str(HERE))
+from feeds import funnel_record  # noqa: E402  — scout.py-172 funnel counts
 
 CAND = DATA / "candidates.json"
 
@@ -163,50 +170,49 @@ def _events():
                    "detail": f"N-14 fund reorganization/merger registration: {r.get('company', '?')} "
                              f"— check for CEF/mutual-fund-into-ETF conversion language",
                    "url": r.get("url")})
-    for g in (feed.get("managers") or {}).get("managers", []):
-        for n in (g.get("new") or []):
-            if n.get("putCall"):
-                continue
-            ev.append({"id": f"13f:{g['cik']}:{n.get('cusip')}:{g.get('period')}",
-                       # Same disease as the 13D id bug, other channel: the ticker was hardcoded
-                       # None and only resolved at ENRICH time — which a ticker-less row can
-                       # never reach, because the gate scores it 3 for "lacks issuer". Resolve
-                       # at collection, where it costs one dict lookup and unblocks the row.
-                       "kind": "13F-new-stake", "ticker": _ticker_from_issuer(n.get("issuer")),
-                       "date": g.get("filed"),
-                       "issuer": n.get("issuer"),
-                       "detail": f"{g['name']} NEW {n.get('issuer')} — {n.get('pct_port')}% of "
-                                 f"their book (Q ended {g.get('period')}; 45d stale)"})
+    # scout.py-172 (funnel audit 2026-09-07): STRATEGY-PROPOSAL-v3 §1 "Deleted as a
+    # source": 13F flow (a 13F names a buyer, never a seller) and insider clusters as a
+    # mechanism ON THEIR OWN (a cluster is a CONFIRMER on a name that already has a
+    # seller from another channel, never the seller itself). Both used to mint their own
+    # scout.py candidate rows with no marker distinguishing them from an admissible
+    # channel, spending pre-triage calls and VP desk slots on a source the strategy has
+    # explicitly ruled out. Stopped minting rather than stamping admissible:false (the
+    # ask's other option) — there's no other reader of that field yet, and a live
+    # candidate.json row that can never leave "new" is the exact kind of dead weight
+    # the ORIGINAL scout.py memory-of-rejection design (see the module docstring) exists
+    # to avoid creating in the first place. Existing rows of these kinds (any PM verdict
+    # already on file) are untouched — only new minting stops.
     can = _j(DATA / "cannibal.json", {})
-    for h in can.get("top", []):
-        # Keyed by TICKER, not ticker+date (scout.py-056): the screen re-hits the same
-        # names every run it survives on, and a dated id minted a fresh row per sighting —
-        # 120 rows for 25 tickers, with a PM verdict (dropped/pm_reviewed) on one day's row
-        # invisible to tomorrow's. The merge loop below carries date/detail/runs_on_screen
-        # forward on the SAME row and never touches status/pm_note, so a verdict sticks
-        # until a human reopens it — "never re-derive a candidate you already passed on
-        # without new facts" (SOURCING.md) is now something the funnel can actually do.
-        ev.append({"id": f"can:{h['ticker']}",
-                   "kind": "cannibal-screen", "ticker": h["ticker"], "date": str(can.get("ran_at", ""))[:10],
-                   "runs_on_screen": h.get("runs_on_screen") or h.get("weeks_on_screen") or 1,
-                   "detail": (f"Cannibal screen: FCF yield {h['fcf_yield_pct']}%, shares "
-                              f"-{h['share_shrink_pct']}% y/y, net cash ${h['net_cash'] / 1e6:,.0f}M, "
-                              f"cap ${h['market_cap'] / 1e6:,.0f}M, {h.get('runs_on_screen') or h.get('weeks_on_screen') or 1} run(s) on screen"
-                              + (f" · {h['fcf_note']}" if h.get("fcf_note") else "")
-                              + " — a screen hit is a QUESTION: why is it cheap, who is the wrong-price seller?")})
-    cutoff = (dt.date.today() - dt.timedelta(days=2)).isoformat()
-    pf_held = {p.get("symbol") for p in _j(DATA / "portfolio.json", {}).get("positions", [])}
-    for tk, fils in (feed.get("filings") or {}).items():
-        c = sum(1 for f in fils or [] if f.get("form") == "4" and f.get("date", "") >= cutoff)
-        if c >= 3 and tk not in pf_held:
-            # Keyed by TICKER, not ticker+cutoff (scout.py-081, same class of bug as -056):
-            # cutoff is recomputed every run, so a cluster that stays inside the rolling
-            # 2-day window minted a fresh row every day — TRIP/MSGS each carried two rows
-            # for one cluster, one of them carrying a stale/reviewed verdict invisible to
-            # the other. The merge loop below carries date/detail forward on the SAME row.
-            ev.append({"id": f"f4x:{tk}", "kind": "insider-cluster", "ticker": tk,
-                       "date": cutoff, "detail": f"{c} Form 4s on {tk} within 2 days "
-                       "(buys or routine vesting? — check the filings)"})
+    # scout.py-172 item 3: 'top' (15) was the only bucket ingested; cannibal.py's own
+    # all_hits (21, superset of top) and extreme_shrink (screened OUT of the ranked list
+    # for an implausibly large shrink %, but still a real hit worth a human look) never
+    # became candidates at all. Union all three, ticker-deduped by bucket priority
+    # (top > all_hits > extreme_shrink — top is already the algorithmically-ranked
+    # subset), and carry which bucket produced the row so triage/the PM can see it wasn't
+    # a top-15 name.
+    seen_tk = set()
+    for bucket in ("top", "all_hits", "extreme_shrink"):
+        for h in can.get(bucket, []):
+            tk = h.get("ticker")
+            if not tk or tk in seen_tk:
+                continue
+            seen_tk.add(tk)
+            # Keyed by TICKER, not ticker+date (scout.py-056): the screen re-hits the same
+            # names every run it survives on, and a dated id minted a fresh row per sighting —
+            # 120 rows for 25 tickers, with a PM verdict (dropped/pm_reviewed) on one day's row
+            # invisible to tomorrow's. The merge loop below carries date/detail/runs_on_screen
+            # forward on the SAME row and never touches status/pm_note, so a verdict sticks
+            # until a human reopens it — "never re-derive a candidate you already passed on
+            # without new facts" (SOURCING.md) is now something the funnel can actually do.
+            ev.append({"id": f"can:{tk}",
+                       "kind": "cannibal-screen", "ticker": tk, "date": str(can.get("ran_at", ""))[:10],
+                       "bucket": bucket,
+                       "runs_on_screen": h.get("runs_on_screen") or h.get("weeks_on_screen") or 1,
+                       "detail": (f"Cannibal screen [{bucket}]: FCF yield {h['fcf_yield_pct']}%, shares "
+                                  f"-{h['share_shrink_pct']}% y/y, net cash ${h['net_cash'] / 1e6:,.0f}M, "
+                                  f"cap ${h['market_cap'] / 1e6:,.0f}M, {h.get('runs_on_screen') or h.get('weeks_on_screen') or 1} run(s) on screen"
+                                  + (f" · {h['fcf_note']}" if h.get("fcf_note") else "")
+                                  + " — a screen hit is a QUESTION: why is it cheap, who is the wrong-price seller?")})
     return ev
 
 
@@ -348,15 +354,14 @@ def run(max_pre=25, max_triage=8):
             # should move it off that status.
             cur["date"], cur["detail"] = e["date"], e["detail"]
             cur["runs_on_screen"] = e.get("runs_on_screen")
+            cur["bucket"] = e.get("bucket")   # scout.py-172: a ticker can move buckets run to run
             cur["last_seen"] = now
-        if cur and e.get("kind") == "insider-cluster":
-            # scout.py-081: same shape as -056 above, for the Form 4 cluster channel — the
-            # id no longer carries the rolling cutoff, so a cluster that persists across
-            # runs refreshes date/detail on the SAME row instead of minting a new one.
-            cur["date"], cur["detail"] = e["date"], e["detail"]
-            cur["last_seen"] = now
+        # scout.py-172: the insider-cluster merge branch that used to live here (scout.py-081)
+        # is dead now that _events() no longer mints that kind (STRATEGY-PROPOSAL-v3 §1)  —
+        # any existing "insider-cluster" row just stops refreshing, which is correct: it was
+        # demoted to a confirmer, not deleted from candidates.json.
     new = [e for e in evs if e["id"] not in items]
-    n_pre = n_tri = 0
+    n_pre = n_tri = n_triaged_ok = 0
     for e in new:
         items[e["id"]] = {**e, "status": "new", "first_seen": now, "last_seen": now}
     # Stage 1: pre-triage newest-first, capped per run
@@ -387,7 +392,7 @@ def run(max_pre=25, max_triage=8):
         # earns its numbers. This changes what the PM SEES, never what it may buy — a triage
         # score is a LEAD, and the full evidence gate downstream is unchanged.
         pl = it["pre"]["plausible"]
-        it["status"] = "enriching" if (pl >= 5 or pl >= 4 or (pl >= 3 and it.get("ticker"))) else "pre_triaged"
+        it["status"] = "enriching" if (pl >= 4 or (pl >= 3 and it.get("ticker"))) else "pre_triaged"  # scout.py-172: pl>=5 was redundant with pl>=4
         n_pre += 1
     # Re-check the standing backlog against the CURRENT gate. Scores are already stored,
     # so this costs no model call — and without it a gate change only ever applies to
@@ -399,7 +404,8 @@ def run(max_pre=25, max_triage=8):
                 it["status"] = "enriching"
 
     # Stage 2+3: enrich + full triage for the plausible, capped per run
-    for it in [i for i in items.values() if i["status"] == "enriching"][:max_triage]:
+    enrich_backlog = [i for i in items.values() if i["status"] == "enriching"]
+    for it in enrich_backlog[:max_triage]:
         tk = it.get("ticker")
         if not tk and it.get("issuer"):
             tk = _ticker_from_issuer(it["issuer"])
@@ -451,12 +457,20 @@ def run(max_pre=25, max_triage=8):
             if bad:
                 it["triage"]["unsupported_figures"] = bad   # scout.py-029: not in coded detail
             it["status"] = "triaged"
+            n_triaged_ok += 1
         else:
             it["status"] = "triage_failed"
         n_tri += 1
     q["items"] = items
     q["scanned_at"] = now
     CAND.write_text(json.dumps(q, indent=1))
+    # scout.py-172: backlog-vs-processed per stage, so a growing "in" with a flat "out"
+    # (the queue falling behind max_pre/max_triage's per-run cap) is visible instead of
+    # looking identical to "nothing new arrived."
+    funnel_record("scout:new", len(evs), len(new))
+    funnel_record("scout:pre-triaged", len(todo), n_pre)
+    funnel_record("scout:enriched", len(enrich_backlog), n_tri)
+    funnel_record("scout:triaged", n_tri, n_triaged_ok)
     # A row can reach status=triaged without a "triage" dict if a PM session hand-edits
     # status back onto a row that never ran the code triage stage (e.g. reopening a
     # pre_triaged/pm_reviewed candidate) — this crashed every run for a full market day

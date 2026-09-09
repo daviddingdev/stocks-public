@@ -751,6 +751,7 @@ def hold_row(tk, meta):
 
 def home_inner():
     pos = read_positions(); wl = watchlist(); acct = read_account()
+    acct_ok = bool(acct)  # account.json missing/unreadable renders as {} — don't let $0 masquerade as a real balance
     cash = acct.get("cash", 0); mmf = acct.get("money_market", 0); yld = acct.get("mmf_yield", 0.043)
     held = [tk for tk, m in pos.items() if (m.get("shares") or 0) > 0]
     watch = [t for t in dict.fromkeys(list(wl) + list(pos.keys())) if t not in held]  # names you track but don't own
@@ -801,14 +802,14 @@ def home_inner():
     acct_w = ("<div class=widget><div class=whead><span class=wtitle>Account</span>"
               f"<span class=wcount>as of {html.escape(str(acct.get('as_of','')))}</span></div><div class='wbody pad'>"
               "<div class=arow><span>Stocks &amp; ETFs</span><span id=ac-stocks class=amono>—</span></div>"
-              f"<div class=arow><span>Cash</span><span class=amono>${cash:,.0f}</span></div>"
-              f"<div class=arow><span>Money market{mmf_sub}</span><span class=amono>${mmf:,.0f}</span></div>"
+              f"<div class=arow><span>Cash</span><span class=amono>{f'${cash:,.0f}' if acct_ok else '—'}</span></div>"
+              f"<div class=arow><span>Money market{mmf_sub}</span><span class=amono>{f'${mmf:,.0f}' if acct_ok else '—'}</span></div>"
               + (f"<div class=arow><span title='{html.escape(note_lbl)}'>Structured note <span class=hint>2/2028</span></span>"
                  f"<span class=amono>${note_v:,.0f}</span></div>" if note_v else "")
               + f"<div class='arow total'><span>Total account</span><span id=ac-total class=amono>—</span></div>"
-              f"<div class=arow><span>Est. income · {yld*100:.1f}%</span><span class=amono>~${inc:,.0f}/yr</span></div>"
+              f"<div class=arow><span>Est. income · {yld*100:.1f}%</span><span class=amono>{f'~${inc:,.0f}/yr' if acct_ok else '—'}</span></div>"
               f"<div class=arow><span>Dry powder <span class=hint>cash + money market</span></span>"
-              f"<span class=amono>${cash + mmf:,.0f}</span></div></div></div>")
+              f"<span class=amono>{f'${cash + mmf:,.0f}' if acct_ok else '—'}</span></div></div></div>")
     pfranges = "".join(f"<button class='rbtn{' on' if r == '3M' else ''}' data-pfrange='{r}'>{lbl}</button>"
                        for r, lbl in [("1W", "1W"), ("1M", "1M"), ("3M", "3M"), ("6M", "6M"),
                                       ("YTD", "YTD"), ("ALL", "All")])

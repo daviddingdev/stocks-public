@@ -42,6 +42,20 @@ CONF = ENGINE / "config"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # SEC contact identity, config-driven
 
+FUNNEL_LOG = DATA / "funnel_counts.jsonl"
+
+def funnel_record(stage, n_in, n_out, **extra):
+    """scout.py-172 (funnel audit 2026-09-07): the funnel had no memory of its own
+    counts, so STRATEGY-PROPOSAL-v3 §7's quota (>=10 leads -> >=5 shelves -> >=3 gate
+    passes -> >=2 cards -> 1-2 teardowns) was unmeasurable — a week that missed it looked
+    identical to a week that hit it. One append-only row per stage per run: what went IN,
+    what came OUT, when. `extra` carries anything stage-specific worth keeping (e.g. a
+    per-channel breakdown) without forcing every stage into the same two numbers."""
+    row = {"stage": stage, "in": n_in, "out": n_out,
+           "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **extra}
+    with FUNNEL_LOG.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
 
 def universe():
     """Agent universe = its own watchlist + its own positions. INDEPENDENCE
@@ -785,11 +799,31 @@ def special_situations(days=10):
             fetched += 1
             time.sleep(0.15)
         d -= dt.timedelta(days=1)
+    # scout.py-172: the [:60] cap below drops any channel that collected more than 60
+    # rows over the window with NO count of what it dropped — a channel running hot
+    # (a busy 13D week, a cluster of index deletions) silently lost the tail with
+    # nothing to show for it. Record before/after per channel.
+    pre_cap = {k: len(v) for k, v in out.items()}
     for k in out:
         out[k] = sorted(out[k], key=lambda x: x["date"], reverse=True)[:60]
+    funnel_record("feeds:radar", sum(pre_cap.values()), sum(len(v) for v in out.values()),
+                  by_channel={k: {"in": pre_cap[k], "out": len(out[k])} for k in out})
+    # The 20/10/20 resolver caps (politeness: one run resolves at most N NEW accessions)
+    # mostly leave a row unresolved rather than dropping it (13D/spins keep every row,
+    # just without a subject/parent ticker until a later run's cache catches up) — EXCEPT
+    # reg_effective, whose resolver also FILTERS to the S-3/S-1 family, so an unresolved
+    # row (cap exceeded, nothing cached yet) is invisible this run, not just unlabeled.
+    # Record before/after each resolver so a persistently-growing unresolved backlog is
+    # visible instead of looking identical to "nothing to resolve."
+    n_13d_in = len(out["sc13d"])
     out["sc13d"] = _resolve_13d_subjects(out["sc13d"])
+    funnel_record("feeds:resolve_13d", n_13d_in, sum(1 for r in out["sc13d"] if r.get("subject")))
+    n_spins_in = len(out["spins"])
     out["spins"] = _resolve_spin_parents(out["spins"])
+    funnel_record("feeds:resolve_spins", n_spins_in, sum(1 for r in out["spins"] if r.get("ticker")))
+    n_reg_in = len(out["reg_effective"])
     out["reg_effective"] = _resolve_reg_effectiveness(out["reg_effective"])
+    funnel_record("feeds:resolve_reg_effective", n_reg_in, len(out["reg_effective"]))
     return out
 
 

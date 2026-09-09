@@ -149,7 +149,7 @@ def main():
         c = cik_from_path(p)
         if c:
             by_cik.setdefault(c, []).append(p)
-    cand_paths = [p for c, ps in by_cik.items() if len(ps) >= args.min_buyers for p in ps]
+    cand_paths = sorted({p for c, ps in by_cik.items() if len(ps) >= args.min_buyers for p in ps})
     if args.limit:
         cand_paths = cand_paths[:args.limit]
     print(f"[insider_cluster] {len(all_paths)} form-4s / {len(by_cik)} issuers; "
@@ -162,7 +162,8 @@ def main():
     n_buys = 0
     def fetch_parse(p):
         r = get(SEC + "/Archives/" + p)
-        return list(parse_purchases(r.text)) if r else []
+        accession = Path(p).stem
+        return [dict(buy, accession=accession) for buy in parse_purchases(r.text)] if r else []
     with ThreadPoolExecutor(max_workers=6) as ex:
         for buys in ex.map(fetch_parse, cand_paths):
             n_forms += 1
@@ -170,9 +171,14 @@ def main():
                 key = buy["cik"]
                 if not key:
                     continue
-                n_buys += 1
                 a = agg.setdefault(key, {"owners": set(), "value": 0.0,
-                                         "symbol": buy["symbol"], "name": buy["issuer"]})
+                                         "symbol": buy["symbol"], "name": buy["issuer"],
+                                         "seen": set()})
+                seen_key = (buy["accession"], buy["owner"], buy["value"])
+                if seen_key in a["seen"]:
+                    continue
+                a["seen"].add(seen_key)
+                n_buys += 1
                 if buy["owner"]:
                     a["owners"].add(buy["owner"])
                 a["value"] += buy["value"]

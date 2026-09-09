@@ -55,6 +55,8 @@ BENCH_BRIEF = DATA / "bench_brief.md"
 sys.path.insert(0, os.path.expanduser("~/maintenance/bin"))
 import models  # noqa: E402  — Mission Control's local-model registry
 import gpu     # noqa: E402  — Mission Control's GPU queue (priority: Stocks first)
+sys.path.insert(0, str(HERE))
+from feeds import funnel_record  # noqa: E402  — scout.py-172 funnel counts
 
 OLLAMA = models.chat_url()
 # --model fast|dense stays the CLI contract (cron passes it); the tags behind it live in
@@ -236,6 +238,7 @@ def universe(min_rev=50e6, max_rev=20e9):
     _write(UNIVERSE, {"built": _now(), "band": [min_rev, max_rev], "count": len(out),
                       "_doc": "Whole-market readable set. The book gets no privileged place here.",
                       "names": out})
+    funnel_record("bench:universe", len(rev), len(out))
     print(f"universe: {len(out)} companies with ${min_rev/1e6:.0f}M-${max_rev/1e9:.0f}B revenue")
     return out
 
@@ -279,6 +282,7 @@ def fetch(limit=120, forms=("10-K", "10-Q")):
             print(f"  skip {tk}: {str(e)[:70]}")
             time.sleep(0.3)
     have = sum(1 for x in CORPUS.iterdir() if x.is_dir()) if CORPUS.exists() else 0
+    funnel_record("bench:fetch", len(todo), got)
     print(f"fetched {got} companies · corpus now {have} of {len(uni)} universe names")
     return got
 
@@ -325,12 +329,23 @@ def _targets(path, max_windows=4):
     return hits
 
 
+def _chan_id(channel_str):
+    """bench.py-176: the stable leading token of a channel string (e.g. '11' from
+    '11 — narrative-vs-contract gap'), immune to a whitespace/wording edit to the
+    description after the id. rank()/_channel_stats() used to compare the FULL channel
+    string verbatim against bench_question.json's current value, so any edit to the
+    description text — not just a real channel switch — zeroed bench.json and orphaned
+    every task stamped under the old wording (16,147 of them, permanently: rank()'s
+    filter is exact-match and a task's stamped channel never gets rewritten). Comparing
+    on this leading-token id instead means only an actual id change opens a new
+    namespace; a copyedit to the description does not."""
+    m = re.match(r"^\s*(\S+)", channel_str or "")
+    return m.group(1) if m else (channel_str or "?")
+
+
 def _qkey(qn):
-    """A stable short id for the active question, used to scope task ids (bench.py-072).
-    Channel strings follow 'N — description' by convention; fall back to the full string
-    for anything that doesn't (still stable, just longer)."""
-    m = re.match(r"^\s*(\S+)", qn.get("channel") or "")
-    return m.group(1) if m else (qn.get("channel") or "?")
+    """A stable short id for the active question, used to scope task ids (bench.py-072)."""
+    return _chan_id(qn.get("channel"))
 
 
 def fill(limit=40):
@@ -373,9 +388,11 @@ def fill(limit=40):
             added += 1
             if added >= limit:
                 _write(QUEUE, q)
+                funnel_record("bench:fill", len(cands), added)
                 print(f"queued {added} targeted read-tasks · skipped {skipped} non-substantive filings")
                 return added
     _write(QUEUE, q)
+    funnel_record("bench:fill", len(cands), added)
     print(f"queued {added} targeted read-tasks · skipped {skipped} non-substantive filings")
     return added
 
@@ -482,6 +499,9 @@ def work(minutes=60, model_key="fast", worker=None, think=None):
             print(f"  err {t['id'][:40]}: {str(e)[:90]}")
     el = (time.time() - t_start) / 60
     rate = done / el if el else 0
+    funnel_record("bench:read", done + errs, done)
+    funnel_record("bench:claimed", done, hits)
+    funnel_record("bench:survived", hits, kept)
     print(f"\nworker {worker}: {done} read · {errs} err · {hits} claimed · {kept} SURVIVED "
           f"verbatim check · {el:.1f}m · {rate:.1f} reads/min")
     if hits:
@@ -633,10 +653,13 @@ def rank():
     on the PM's desk right now — matching _channel_stats()'s existing per-channel filter."""
     q = _load()
     cur_channel = question()["channel"]
+    cur_key = _chan_id(cur_channel)
     by = {}
+    n_matched = 0
     for t in q["tasks"].values():
-        if t.get("state") != "done" or not t.get("survived") or t.get("channel") != cur_channel:
+        if t.get("state") != "done" or not t.get("survived") or _chan_id(t.get("channel")) != cur_key:
             continue
+        n_matched += 1
         r = t["result"]
         row = by.setdefault(t["ticker"], {"ticker": t["ticker"], "evidence": [], "best": 0})
         quote = r.get("contradicting_disclosure")
@@ -657,6 +680,7 @@ def rank():
                            "a multiple — see bench.py-030. A row is a LEAD; the full evidence "
                            "gate is unchanged before any order. Each evidence item carries the "
                            "channel and UTC time it was extracted (bench.py-058)."})
+    funnel_record("bench:ranked", n_matched, len(out))
     print(f"bench.json: {len(out)} names with verbatim-verified evidence")
     for r in out[:10]:
         print(f"  {r['best']}/10 {r['ticker']:<6} {len(r['evidence'])} quote(s) · "
@@ -667,9 +691,12 @@ def rank():
 def _channel_stats(channel):
     """bench.py-058: claimed/survived totals for every task DONE under this exact channel,
     across the whole durable queue — the brief's "what did THIS question actually produce"
-    line. A task written before channel-stamping shipped has channel=None and never matches."""
+    line. A task written before channel-stamping shipped has channel=None and never matches.
+    bench.py-176: matches on _chan_id (the leading token), not the full string, so a
+    wording edit to the channel description doesn't orphan every task stamped before it."""
     q = _load()
-    done = [t for t in q["tasks"].values() if t.get("state") == "done" and t.get("channel") == channel]
+    key = _chan_id(channel)
+    done = [t for t in q["tasks"].values() if t.get("state") == "done" and _chan_id(t.get("channel")) == key]
     claimed = sum(1 for t in done if t.get("claimed"))
     survived = sum(1 for t in done if t.get("survived"))
     return {"read": len(done), "claimed": claimed, "survived": survived}
@@ -755,6 +782,7 @@ def cards(limit=15):
         if len(todo) >= limit:
             break
     if not todo:
+        funnel_record("bench:cards", 0, 0)
         print("bench cards: every top lead already has a card")
         return []
     built, failed, skipped = [], [], []
@@ -768,11 +796,22 @@ def cards(limit=15):
             p = subprocess.run([str(ENGINE / ".venv/bin/python"), str(ENGINE / "valuation/fincard.py"),
                                 tk, "--out", str(NAMES / tk / "fincard.json")],
                                capture_output=True, text=True, timeout=180)
-            (built if p.returncode == 0 else failed).append(tk)
-        except Exception:
-            failed.append(tk)
+            if p.returncode == 0:
+                built.append(tk)
+            else:
+                # bench.py-156: a bare ticker list told the reader nothing was wrong
+                # without saying what — the last non-empty stderr line (fincard.py's
+                # SystemExit/exception text) or, failing that, the exit code.
+                lines = [ln.strip() for ln in p.stderr.splitlines() if ln.strip()]
+                reason = lines[-1][:150] if lines else f"exit {p.returncode}, no stderr"
+                failed.append((tk, reason))
+        except subprocess.TimeoutExpired:
+            failed.append((tk, "timed out after 180s"))
+        except Exception as e:
+            failed.append((tk, f"{type(e).__name__}: {str(e)[:150]}"))
+    funnel_record("bench:cards", len(todo), len(built))
     print(f"bench cards: {len(built)} built, {len(failed)} failed"
-          + (f" ({', '.join(failed)})" if failed else "")
+          + (f" ({'; '.join(f'{tk}: {reason}' for tk, reason in failed)})" if failed else "")
           + (f", {len(skipped)} skipped as depositary-listing aliases ({', '.join(skipped)})"
              if skipped else ""))
     return built
@@ -810,6 +849,60 @@ def _fincard_line(tk):
             f"mkt cap {_fmt_m(mcap)}")
 
 
+_DOLLAR_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(billion|million|thousand)?\b", re.I)
+
+def _backlog_dollar(quote):
+    """bench.py-181/found building the 09-08 new-names table: the FIRST dollar figure
+    inside a quote, converted to plain dollars — not the largest. A 10-K/10-Q backlog
+    sentence that states more than one period ("as of DATE1 and DATE2, was $A and $B")
+    always lists the CURRENT period first, so the first figure is the current one and a
+    later figure is a prior-period comparison. Picking the largest instead is wrong in
+    both directions found live: ICFI's 'backlog was $3,405.0M, $3,786.3M, and $3,777.8M
+    at Dec 31 2025, 2024, and 2023' has 2024's figure as the largest, not 2025's current
+    one; HOLOW's 'as of Mar 31 2023 and Dec 31 2022... is $0 and $384,489' has the PRIOR
+    period's $384,489 as the largest, against a current figure of $0 — 'largest' turned
+    a near-zero backlog into the #1-ranked lead in the whole table. An explicit unit word
+    is trusted; a bare figure under $10M with no unit is a filing-table convention (the
+    table header says 'in thousands', the cell doesn't repeat it) — assumed as thousands
+    and flagged, since treating it as literal dollars would read a real backlog like
+    GHM's $532,637(thousand) as $532,637. Returns (dollars, assumed) or None if the quote
+    carries no dollar figure at all."""
+    m = _DOLLAR_RE.search(quote or "")
+    if not m:
+        return None
+    raw = float(m.group(1).replace(",", ""))
+    unit = (m.group(2) or "").lower()
+    if unit == "billion":
+        return raw * 1e9, False
+    if unit == "million":
+        return raw * 1e6, False
+    if unit == "thousand":
+        return raw * 1e3, False
+    if raw < 10_000_000:
+        return raw * 1e3, True
+    return raw, False
+
+
+def _backlog_to_cap(r):
+    """bench.py-181, night 4 of channel 11: every one of 46 names printed 6/10 — the coded
+    specificity score saturated and stopped separating anything (bench.py-030 again). The
+    backlog dollar figure over market cap does separate them (CNDT 4.31x, PRIM 1.50x, CVU
+    1.46x per STRATEGY-PROPOSAL-v3 §1's examples). Returns (dollars, assumed, ratio) where
+    ratio is None if there's no fincard market_cap to divide by — the caller prints 'no cap'
+    rather than dropping the name, since a missing cap is a data gap, not disqualifying."""
+    best = None
+    for e in r.get("evidence") or []:
+        got = _backlog_dollar(e.get("quote"))
+        if got and (best is None or got[0] > best[0]):
+            best = got
+    if best is None:
+        return None
+    dollars, assumed = best
+    mcap = ((_j(NAMES / r["ticker"].upper() / "fincard.json", {}).get("derived") or {})
+            .get("market_cap") or {}).get("value")
+    return (dollars, assumed, mcap, dollars / mcap if mcap else None)
+
+
 def brief(top=25):
     """bench_brief.md — the overnight read, written up for the PM's desk.
 
@@ -843,10 +936,25 @@ def brief(top=25):
         pass
 
     fresh = [r for r in rows if r["ticker"].upper() not in held
-             and r["ticker"].upper() not in seen]
+             and r["ticker"].upper() not in seen
+             and r["ticker"].upper() not in uni]  # bench.py-176: uni was computed, never applied
     qn = b.get("question") or {}
     cur_channel = qn.get("channel")
     stats = _channel_stats(cur_channel)
+    # bench.py-181: channel 11's coded specificity score saturated (every name 6/10) and
+    # stopped separating anything; backlog-dollar / market-cap does. Scoped to channel 11
+    # only — the ratio is meaningless for the other channels' questions.
+    btc = {}
+    if _chan_id(cur_channel) == "11":
+        btc = {r["ticker"].upper(): _backlog_to_cap(r) for r in fresh}
+        def _btc_key(r):
+            got = btc.get(r["ticker"].upper())
+            if not got:
+                return (2, 0.0)          # no $ figure in evidence at all
+            if got[3] is None:
+                return (1, 0.0)          # $ figure found, but no fincard cap to divide by
+            return (0, -got[3])          # ranked by ratio, largest first
+        fresh.sort(key=_btc_key)
     forms = _corpus_forms()
     forms_line = ", ".join(f"{n} {f}" for f, n in forms.items()) or "corpus not built yet"
     # bench.py-058/-072: what THIS channel actually produced, first line, unmissable — a run
@@ -871,30 +979,49 @@ def brief(top=25):
          f"(set by {qn.get('set_by', '?')}{' on ' + qn['set_at'] if qn.get('set_at') else ''})", "",
          f"**{len(rows)} names carry evidence from THIS channel · {len(fresh)} are new to you** "
          f"({len(held & {r['ticker'].upper() for r in rows})} already held, "
-         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel).",
+         f"{len(seen.keys() & {r['ticker'].upper() for r in rows})} already triaged in the funnel, "
+         f"{len(uni & {r['ticker'].upper() for r in rows} - held - seen.keys())} already on your "
+         f"watchlist).",
          ""]
     if not rows:
         L += ["_No evidence rows — either the queue was empty or every read failed the verbatim",
               "check. Check `_engine/logs/bench.log` before treating this as a quiet market._"]
-    L += ["## New to you — ranked by evidence", ""]
+    L += [f"## New to you — ranked by {'backlog/cap' if btc else 'evidence'}", ""]
     for r in fresh[:top]:
         e = (r.get("evidence") or [{}])[0]
         L += [f"### {r['ticker']} — {r.get('best', '?')}/10 · {len(r.get('evidence', []))} quote(s)",
               f"- **The story it contradicts:** {e.get('narrative') or '—'}",
               f"- **Why it matters:** {e.get('why') or '—'}",
               f"- **Verbatim, from `{e.get('doc') or '?'}`:** > {(e.get('quote') or '—')[:600]}"]
+        if btc:
+            got = btc.get(r["ticker"].upper())
+            if not got:
+                L.append("- **Backlog/cap:** no $ figure in the quoted evidence")
+            else:
+                dollars, assumed, mcap, ratio = got
+                amt = f"${dollars/1e6:,.1f}M" + (" (assumed $K table)" if assumed else "")
+                L.append(f"- **Backlog/cap:** {amt} / {_fmt_m(mcap)} cap = "
+                          + (f"**{ratio:.2f}x**" if ratio is not None else "no cap"))
         fc = _fincard_line(r["ticker"].upper())
         if fc:
             L.append(fc)
         L.append("")
     if len(fresh) > top:
         L.append(f"_…and {len(fresh) - top} more in `data/bench.json`._\n")
-    already = [r for r in rows if r["ticker"].upper() in held or r["ticker"].upper() in seen]
+    def _status(tk):
+        if tk in held:
+            return "held"
+        if tk in seen:
+            return seen[tk]
+        return "watched"  # bench.py-176: on universe.txt but not held/triaged
+    already = [r for r in rows if r["ticker"].upper() in held or r["ticker"].upper() in seen
+               or r["ticker"].upper() in uni]
     if already:
-        L += ["## Already on your book or already triaged", "",
-              ", ".join(f"**{r['ticker']}** ({'held' if r['ticker'].upper() in held else seen.get(r['ticker'].upper())})"
+        L += ["## Already on your book, triaged, or watched", "",
+              ", ".join(f"**{r['ticker']}** ({_status(r['ticker'].upper())})"
                         for r in already[:40]), ""]
     BENCH_BRIEF.write_text("\n".join(L) + _stamp())
+    funnel_record("bench:new-to-PM", len(rows), len(fresh))
     print(f"bench_brief.md: {len(rows)} names, {len(fresh)} new to the PM")
     return BENCH_BRIEF
 

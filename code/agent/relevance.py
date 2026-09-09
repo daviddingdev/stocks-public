@@ -11,6 +11,8 @@ import hashlib, json, os, subprocess, sys, time
 HOME = os.path.expanduser("~")
 sys.path.insert(0, f"{HOME}/maintenance/bin")
 from localllm import ask_json, DEFAULT_MODEL
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from feeds import funnel_record  # noqa: E402  — scout.py-172 funnel counts
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 FEED = os.path.join(BASE, "data", "feed.json")
@@ -104,6 +106,9 @@ def main():
 
     hot = sorted((v for v in scores.values() if v["score"] >= 7),
                  key=lambda x: -x["score"])[:5]
+    # scout.py-172: offered = fresh items eligible this run, kept = what survives the
+    # 14-day/universe prune and is actually usable downstream.
+    funnel_record("relevance", len(items), len(scores))
     print(f"{time.strftime('%F %T')} scored {len(todo)} new / {len(scores)} total "
           f"(offered {len(items)}, {already_scored} already scored, {filtered} filtered); "
           f"alerted {len(hot_new)} hot; brief has {len(ranked)} items; "
