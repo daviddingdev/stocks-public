@@ -65,8 +65,11 @@ def universe():
     f = HERE / "universe.txt"
     if not f.exists():
         return []
-    base = [l.strip().upper() for l in f.read_text().splitlines()
-            if l.strip() and not l.startswith("#")]
+    # feeds.py-188: strip an inline '#' comment before treating the rest of the line
+    # as a ticker — a line like "CNDT  # note..." used to fail isalpha() as a whole
+    # and silently drop CNDT rather than just the note.
+    base = [l.split("#", 1)[0].strip().upper() for l in f.read_text().splitlines()]
+    base = [l for l in base if l]
     try:
         base += [p2["symbol"].upper() for p2 in
                  json.loads((DATA / "portfolio.json").read_text()).get("positions", []) if p2.get("symbol")]
@@ -264,6 +267,79 @@ def _f4_owner_role(owner_block):
     return ""
 
 
+# feeds.py-193 (hunt, 2026-09-10, ask journal/ops-155). The SUMMARY fields promoted onto a
+# Form 4 row used to be computed inline inside _parse_form4_xml, which meant they could only
+# ever be computed at PARSE time -- and form4_transactions.json is keyed by accession and
+# cached FOREVER (a Form 4 is a point-in-time report). Every fix to this derivation therefore
+# applied only to accessions first seen after the fix, and silently skipped the whole existing
+# corpus: on 2026-09-10 that was 12 of 142 entries with no `transaction_date` at all (pre-077),
+# 9 of them also promoting a `shares_after` that is not the filing's largest remaining balance
+# (pre-073), and 12 whose transactions[] carry no `ownership_nature` (pre-076). Nothing
+# reported it; a proof script exiting 1 for 13 days was the only signal.
+#
+# So the derivation lives here, is pure (transactions[] in, summary out, no network), and is
+# stamped with F4_SUMMARY_SCHEMA. _resolve_form4_transactions re-derives any cached entry
+# below the current stamp, so the NEXT fix to this function repairs the corpus by itself.
+F4_SUMMARY_SCHEMA = 1
+
+
+def _summarize_form4(txns):
+    """Promote the whole filing's transactions[] to the summary fields diffbrief.py renders.
+    Pure and offline: everything below is derived from txns alone.
+
+    Every field is read with .get(): transactions[] parsed before feeds.py-076/077 carry
+    only {kind, transaction_code, shares, price, shares_after, rule_10b5_1,
+    rule_10b5_1_note} -- no `date`, no `ownership_nature`, no `price_note`. A re-derivation
+    over the cached corpus has to survive that shape, and t["date"] raised KeyError on 12 of
+    142 entries. Absent fields summarise to None, which is honest: the trade date was never
+    captured for those filings and cannot be invented from what was."""
+    summary = {}
+    # Summary fields are what diffbrief.py renders -- they must reflect the WHOLE filing,
+    # not transactions[0] (feeds.py-073, the ARI case: two non-derivative sales, 835 sh
+    # out of a spouse's IRA to zero plus 125 sh direct, previously promoted as a single
+    # 835-sh sale to zero). Group by code so a mixed filing (e.g. an S alongside a G gift)
+    # aggregates within its own kind rather than blending unrelated transaction types.
+    by_code = {}
+    for t in txns:
+        by_code.setdefault(t.get("transaction_code"), []).append(t)
+    primary_code, primary_group = max(by_code.items(),
+                                      key=lambda kv: sum(x.get("shares") or 0 for x in kv[1]))
+    total_shares = sum(t.get("shares") or 0 for t in primary_group)
+    priced = [t for t in primary_group if t.get("price")]
+    wshares = sum(t.get("shares") or 0 for t in priced)
+    price = (sum((t.get("price") or 0) * (t.get("shares") or 0) for t in priced) / wshares
+             if wshares else (priced[0].get("price") if priced else None))
+    dates = [t.get("date") for t in txns if t.get("date")]
+    wavg_notes = [t.get("price_note") for t in primary_group if t.get("price_note")]
+    plan_notes = [t.get("rule_10b5_1_note") for t in primary_group if t.get("rule_10b5_1_note")]
+    summary.update({
+        "transaction_code": primary_code,
+        "shares": total_shares,
+        "price": price,
+        # largest remaining balance across ALL transactions on the filing, not just the
+        # primary-code group -- the filing's own "how much does this insider still hold"
+        # answer, regardless of which account/code produced it.
+        "shares_after": max((t["shares_after"] for t in txns
+                             if t.get("shares_after") is not None), default=None),
+        # feeds.py-077/diffbrief.py-077 (coo, 2026-08-29): NOT "date" -- the filing row
+        # this dict gets r.update()'d onto (edgar_filings' `row["date"]`) already means the
+        # EDGAR index/FILED date. A same-named key here clobbered it with the <transaction
+        # Date> (the TRADE date), collapsing two distinct dates into one with no way to
+        # recover the other, and silently flipped the meaning of "date" for every consumer
+        # (diffbrief.py's 14-day lookback, "Filings dated X or later", the since-last-
+        # session filter) with no code change on their end. Kept under its own key, same
+        # convention as transaction_code/price_is_weighted_avg.
+        "transaction_date": max(dates) if dates else None,
+        "rule_10b5_1": any(t.get("rule_10b5_1") for t in primary_group),
+        "rule_10b5_1_note": plan_notes[0][:200] if plan_notes else None,
+        "price_is_weighted_avg": len(priced) > 1 or any(t.get("price_is_weighted_avg")
+                                                        for t in primary_group),
+        "price_note": wavg_notes[0][:200] if wavg_notes else None,
+    })
+    summary["transactions"] = txns
+    return summary
+
+
 def _parse_form4_xml(xml_text):
     """Extract the fields BOOK.md's insider tripwires actually test (filer, transaction
     code, shares, price, post-transaction share count, Rule 10b5-1 status) from a Form 4's
@@ -312,47 +388,7 @@ def _parse_form4_xml(xml_text):
                         "price_is_weighted_avg": bool(wavg_texts),
                         "price_note": wavg_texts[0][:200] if wavg_texts else None})
     if txns:
-        # Summary fields are what diffbrief.py renders -- they must reflect the WHOLE filing,
-        # not transactions[0] (feeds.py-073, the ARI case: two non-derivative sales, 835 sh
-        # out of a spouse's IRA to zero plus 125 sh direct, previously promoted as a single
-        # 835-sh sale to zero). Group by code so a mixed filing (e.g. an S alongside a G gift)
-        # aggregates within its own kind rather than blending unrelated transaction types.
-        by_code = {}
-        for t in txns:
-            by_code.setdefault(t["transaction_code"], []).append(t)
-        primary_code, primary_group = max(by_code.items(), key=lambda kv: sum(x["shares"] or 0 for x in kv[1]))
-        total_shares = sum(t["shares"] or 0 for t in primary_group)
-        priced = [t for t in primary_group if t["price"]]
-        wshares = sum(t["shares"] or 0 for t in priced)
-        price = (sum((t["price"] or 0) * (t["shares"] or 0) for t in priced) / wshares
-                 if wshares else (priced[0]["price"] if priced else None))
-        dates = [t["date"] for t in txns if t["date"]]
-        wavg_notes = [t["price_note"] for t in primary_group if t["price_note"]]
-        plan_notes = [t["rule_10b5_1_note"] for t in primary_group if t["rule_10b5_1_note"]]
-        out.update({
-            "transaction_code": primary_code,
-            "shares": total_shares,
-            "price": price,
-            # largest remaining balance across ALL transactions on the filing, not just the
-            # primary-code group -- the filing's own "how much does this insider still hold"
-            # answer, regardless of which account/code produced it.
-            "shares_after": max((t["shares_after"] for t in txns if t["shares_after"] is not None),
-                                 default=None),
-            # feeds.py-077/diffbrief.py-077 (coo, 2026-08-29): NOT "date" -- the filing row
-            # this dict gets r.update()'d onto (edgar_filings' `row["date"]`) already means the
-            # EDGAR index/FILED date. A same-named key here clobbered it with the <transaction
-            # Date> (the TRADE date), collapsing two distinct dates into one with no way to
-            # recover the other, and silently flipped the meaning of "date" for every consumer
-            # (diffbrief.py's 14-day lookback, "Filings dated X or later", the since-last-
-            # session filter) with no code change on their end. Kept under its own key, same
-            # convention as transaction_code/price_is_weighted_avg.
-            "transaction_date": max(dates) if dates else None,
-            "rule_10b5_1": any(t["rule_10b5_1"] for t in primary_group),
-            "rule_10b5_1_note": plan_notes[0][:200] if plan_notes else None,
-            "price_is_weighted_avg": len(priced) > 1 or any(t["price_is_weighted_avg"] for t in primary_group),
-            "price_note": wavg_notes[0][:200] if wavg_notes else None,
-        })
-        out["transactions"] = txns
+        out.update(_summarize_form4(txns))
     else:
         # feeds.py-140 (coo, 2026-09-05): a filing that parsed cleanly but has no
         # non-derivative/derivative transactions (e.g. QVCG/Barclays 0000312069-26-058627,
@@ -368,6 +404,39 @@ def _parse_form4_xml(xml_text):
     return out
 
 
+def _resummarize_cache(cache):
+    """Re-derive the summary of every cached entry written before the current
+    F4_SUMMARY_SCHEMA, in place. Returns the list of repaired accessions.
+
+    THE DEFECT THIS EXISTS FOR (hunt, 2026-09-10, ask journal/ops-155):
+    form4_transactions.json is keyed by accession and cached forever, so a fix to the
+    summary derivation only ever reached filings first seen AFTER the fix. Measured on
+    2026-09-10, before this ran: of 142 entries, 9 promoted a `shares_after` that was not
+    the filing's largest remaining balance (the feeds.py-073 defect, fixed 2026-08-28 and
+    still live in the cache 13 days later) and 12 had no `transaction_date` (feeds.py-077).
+    The residue had been read as unreachable because those accessions had aged out of
+    feed.json's window -- but reach is not repairability: the summary is a pure function of
+    transactions[], so 9 of the 9 were fixable offline with no EDGAR fetch at all.
+
+    Re-derivation is offline and idempotent: verified against the live corpus, all 123
+    entries already at the current schema re-derive byte-identically. What it CANNOT repair
+    is a field the parser never captured -- pre-076/077 transactions[] have no `date`, so
+    `transaction_date` stays None for those and the stamp records why."""
+    repaired = []
+    for acc, rec in cache.items():
+        if not isinstance(rec, dict) or rec.get("_summary_schema") == F4_SUMMARY_SCHEMA:
+            continue
+        txns = rec.get("transactions")
+        if txns:
+            before = {k: rec.get(k) for k in ("transaction_code", "shares", "price",
+                                              "shares_after", "transaction_date")}
+            rec.update(_summarize_form4(txns))
+            if any(rec.get(k) != v for k, v in before.items()):
+                repaired.append(acc)
+        rec["_summary_schema"] = F4_SUMMARY_SCHEMA
+    return repaired
+
+
 def _resolve_form4_transactions(filings, cap=30):
     """Form 4 rows land in feed.json shaped like every other filing -- but BOOK.md's
     insider tripwires test transaction fields that only live inside the filing's own
@@ -380,6 +449,7 @@ def _resolve_form4_transactions(filings, cap=30):
         cache = json.loads(cache_f.read_text())
     except Exception:
         cache = {}
+    _resummarize_cache(cache)
     fetched = 0
     for rows in filings.values():
         for r in rows:
@@ -404,6 +474,7 @@ def _resolve_form4_transactions(filings, cap=30):
                 # leave the row with zero transaction fields and nothing to tell them apart.
                 entry = {"parse_error": str(e)[:200]}
             time.sleep(0.15)
+            entry["_summary_schema"] = F4_SUMMARY_SCHEMA
             cache[acc] = entry
             r.update(entry)
     cache_f.write_text(json.dumps(cache, indent=1))
@@ -420,7 +491,9 @@ def form4_day_details(cik, acc_doc_pairs):
         cache = json.loads(cache_f.read_text())
     except Exception:
         cache = {}
-    dirty = False
+    # Same self-healing pass as _resolve_form4_transactions: this reader shares the cache
+    # file, so an entry repaired on one path must not be handed back stale on the other.
+    dirty = bool(_resummarize_cache(cache))
     out = []
     for acc, doc in acc_doc_pairs:
         acc_nodash = acc.replace("-", "")
@@ -431,6 +504,7 @@ def form4_day_details(cik, acc_doc_pairs):
                 entry = _parse_form4_xml(requests.get(xml_url, headers=UA, timeout=30).text)
             except Exception as e:
                 entry = {"parse_error": str(e)[:200]}
+            entry["_summary_schema"] = F4_SUMMARY_SCHEMA
             cache[acc_nodash] = entry
             dirty = True
             time.sleep(0.15)

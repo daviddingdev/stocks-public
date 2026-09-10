@@ -154,6 +154,28 @@ def held_symbols():
     return brokera, agent
 
 
+def move_context(tk):
+    """triggers.py-192: the first minutes of triaging a price-move alert are spent by
+    hand establishing whether the move is name-specific or sector-wide, and whether a
+    new document exists. Fold that into the alert itself: same-day move of tk's nearest
+    peer(s) (data/peers.json, PM-owned — a tk with no entry just gets the index) + SPY,
+    and the two newest feed headlines. Best-effort: any missing piece is omitted, never
+    fatal to the alert."""
+    parts = []
+    peers = (_j(DATA / "peers.json", {}) or {}).get(tk) or []
+    for sym in peers + ["SPY"]:
+        q = feeds.fh_get("quote", symbol=sym) or {}
+        p, pv = q.get("c"), q.get("pc")
+        if p and pv:
+            parts.append(f"{sym} {(p - pv) / pv * 100:+.1f}%")
+    headlines = [n.get("headline") for n in (_j(DATA / "feed.json", {}).get("news") or {}).get(tk, [])[:2]
+                 if n.get("headline")]
+    ctx = " | ".join(parts)
+    if headlines:
+        ctx += ("; " if ctx else "") + "news: " + " / ".join(headlines)
+    return ctx
+
+
 def push(topic, title, msg):
     """Routed through Mission Control's notify.sh so box-wide tiering sees it
     (PROJECT_STANDARDS §1). `topic` is kept for signature compatibility and is the
@@ -248,8 +270,11 @@ def run():
         thr = c["agent_action_move_pct"] if is_agent else c["price_move_pct_holdings"]
         if abs(pct) >= thr:
             ctx, book = impact(tk, price, prev)
-            fired += alert(state, c, f"move:{tk}", "price move", tk,
-                           f"{tk} {pct:+.1f}% (${price:,.2f}) — {ctx}",
+            mv = move_context(tk)
+            msg = f"{tk} {pct:+.1f}% (${price:,.2f}) — {ctx}"
+            if mv:
+                msg += f" — {mv}"
+            fired += alert(state, c, f"move:{tk}", "price move", tk, msg,
                            action=is_agent, book=book)
 
     # --- 1b: named price levels (sell/entry plans) — config "price_levels" ---
@@ -301,15 +326,18 @@ def run():
             # the whole day into one line instead.
             entries = feeds.form4_day_details(cik, form4_today)
             buckets = feeds.classify_form4_entries(entries)
-            n, k, m = len(form4_today), len(buckets["open_market"]), len(buckets["grants"])
+            # `g`, not `m`: `m` is the ticker->CIK map the enclosing loop reads next
+            # (2026-09-09 20:55Z: AMZN's Form 4 rebound it to an int and the next held
+            # name crashed on m.get — stages 2b/3 skipped, Sentinel paged David).
+            n, k, g = len(form4_today), len(buckets["open_market"]), len(buckets["grants"])
             q = feeds.fh_get("quote", symbol=tk) or {}
             ctx, book = impact(tk, q.get("c") or 0, q.get("pc") or q.get("c") or 0)
             if k:
                 verb = "net bought" if buckets["net_dollars"] >= 0 else "net sold"
                 detail = f"{k} open-market (${abs(buckets['net_dollars']):,.0f} {verb})" + \
-                    (f", {m} grants" if m else "")
+                    (f", {g} grants" if g else "")
             else:
-                detail = f"all {m} grants/tax" if m == n else f"{m} grants/tax, {n - m} other"
+                detail = f"all {g} grants/tax" if g == n else f"{g} grants/tax, {n - g} other"
             fired += alert(state, c, f"filing4:{tk}:{today_s}", "filing", tk,
                            f"{tk} filed {n} Form 4{'s' if n > 1 else ''} today: {detail}"
                            f" — holding: {ctx}",

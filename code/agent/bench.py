@@ -890,17 +890,17 @@ def _backlog_to_cap(r):
     1.46x per STRATEGY-PROPOSAL-v3 §1's examples). Returns (dollars, assumed, ratio) where
     ratio is None if there's no fincard market_cap to divide by — the caller prints 'no cap'
     rather than dropping the name, since a missing cap is a data gap, not disqualifying."""
-    best = None
+    best = best_ev = None
     for e in r.get("evidence") or []:
         got = _backlog_dollar(e.get("quote"))
         if got and (best is None or got[0] > best[0]):
-            best = got
+            best, best_ev = got, e
     if best is None:
         return None
     dollars, assumed = best
     mcap = ((_j(NAMES / r["ticker"].upper() / "fincard.json", {}).get("derived") or {})
             .get("market_cap") or {}).get("value")
-    return (dollars, assumed, mcap, dollars / mcap if mcap else None)
+    return (dollars, assumed, mcap, dollars / mcap if mcap else None, best_ev)
 
 
 def brief(top=25):
@@ -988,17 +988,23 @@ def brief(top=25):
               "check. Check `_engine/logs/bench.log` before treating this as a quiet market._"]
     L += [f"## New to you — ranked by {'backlog/cap' if btc else 'evidence'}", ""]
     for r in fresh[:top]:
-        e = (r.get("evidence") or [{}])[0]
+        got = btc.get(r["ticker"].upper()) if btc else None
+        # signals-192: the displayed quote used to be evidence[0] unconditionally, while the
+        # backlog/cap ratio below it was computed from whichever evidence carried the LARGEST
+        # dollar figure (_backlog_to_cap) -- on a multi-quote row (e.g. ULBI: a $706 warranty-
+        # deferred-revenue quote at evidence[0] next to a $117.5M backlog quote at evidence[1])
+        # the brief showed the small, low-score quote right above a ratio computed from the
+        # other one entirely. Show the SAME evidence the ratio came from whenever there is one.
+        e = (got[4] if got else None) or (r.get("evidence") or [{}])[0]
         L += [f"### {r['ticker']} — {r.get('best', '?')}/10 · {len(r.get('evidence', []))} quote(s)",
               f"- **The story it contradicts:** {e.get('narrative') or '—'}",
               f"- **Why it matters:** {e.get('why') or '—'}",
               f"- **Verbatim, from `{e.get('doc') or '?'}`:** > {(e.get('quote') or '—')[:600]}"]
         if btc:
-            got = btc.get(r["ticker"].upper())
             if not got:
                 L.append("- **Backlog/cap:** no $ figure in the quoted evidence")
             else:
-                dollars, assumed, mcap, ratio = got
+                dollars, assumed, mcap, ratio, _ = got
                 amt = f"${dollars/1e6:,.1f}M" + (" (assumed $K table)" if assumed else "")
                 L.append(f"- **Backlog/cap:** {amt} / {_fmt_m(mcap)} cap = "
                           + (f"**{ratio:.2f}x**" if ratio is not None else "no cap"))
