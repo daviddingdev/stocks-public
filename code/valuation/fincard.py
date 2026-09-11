@@ -457,6 +457,29 @@ CAPEX_SOFTWARE_NONCASH_OR_INCLUDED = {
 # fabricated figure would hide. Re-key after each new filing; a manual TTM goes
 # stale silently where an XBRL one would not.
 MANUAL = {
+    "CNDT": {
+        # CNDT's XBRL debt_lt resolves to FinanceLeaseLiability (46,000,000 at 2026-06-30) —
+        # the finance-lease leg ONLY, flagged LOWER BOUND on the card — because the issuer
+        # tags its revolver, its 2029 senior notes and the total under concepts outside the
+        # INSTANT["debt_lt"] list. The printed Note 7 table carries the whole stack; the
+        # card's net_cash 161,000,000 was therefore net DEBT 490,000,000 with the wrong sign
+        # (PM, session 2026-09-09T1405, re-keyed here 2026-09-10 so the Sat 2026-09-12 gated
+        # teardown inherits the printed figure, not the lease leg). Same MANUAL contract as
+        # the FLOW entries: verbatim quote, document named, re-key on the Q3 10-Q.
+        "debt_lt": {
+            "value": 697_000_000,
+            "period": "instant 2026-06-30",
+            "period_end": "2026-06-30",
+            "formula": "Principal debt balance 722 - issuance costs/discounts 4 - current maturities 21 = 697 ($M): "
+                       "revolver 144 + senior notes due 2029 520 + finance leases 46 + other 12 = 722",
+            "quote": "Total Long-term Debt $ 697 $ 665",
+            "doc": "10-Q filed 2026-08-10, Note 7 - Debt ('Revolving credit facility $ 144 $ 109 / Senior notes "
+                   "due 2029 520 520 / Finance lease obligations 46 49 / Other 12 13 / Principal debt balance 722 691 / "
+                   "Debt issuance costs and unamortized discounts ( 4 ) ( 4 ) / Less: current maturities ( 21 ) ( 22 ) / "
+                   "Total Long-term Debt $ 697 $ 665'); current portion 21 is read by XBRL (LongTermDebtCurrent)",
+            "entered": "2026-09-10",
+        },
+    },
     "LYFT": {
         # LYFT tags no cash-capex concept (companyfacts has none of the FLOW["capex"]
         # tags; CapitalizedComputerSoftwareAdditions = 0). The line is printed in

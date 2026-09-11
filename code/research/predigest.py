@@ -9,6 +9,7 @@ Usage:  python3 predigest.py TICKER [--max 5]
 Output: _engine/research/predigest/<TICKER>_<date>.md
 """
 import json, os, re, sys, time, urllib.request
+from pathlib import Path
 
 HOME = os.path.expanduser("~")
 sys.path.insert(0, f"{HOME}/maintenance/bin")
@@ -16,6 +17,7 @@ from localllm import ask, DEFAULT_MODEL
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 FEED = os.path.join(BASE, "..", "agent", "data", "feed.json")
+NAMES = os.path.join(BASE, "..", "agent", "names")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # SEC contact identity, config-driven
 
@@ -28,19 +30,38 @@ def fetch_text(url):
     return re.sub(r"\s+", " ", txt).strip()
 
 
+def shelf_filings(ticker, mx):
+    """Fallback when feed.json has no filings: the ticker's own names/<TK>/filings/
+    shelf, already text-stripped by dossier.py. Newest first, by filename date."""
+    d = Path(NAMES) / ticker / "filings"
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("*.txt"), reverse=True)[:mx]
+
+
 def main():
     ticker = sys.argv[1].upper()
     mx = int(sys.argv[sys.argv.index("--max") + 1]) if "--max" in sys.argv else 5
     filings = (json.load(open(FEED)).get("filings") or {}).get(ticker, [])[:mx]
+    local = not filings
+    if local:
+        filings = shelf_filings(ticker, mx)
     if not filings:
-        print(f"no filings for {ticker} in feed.json")
+        print(f"no filings for {ticker} in feed.json or names/{ticker}/filings")
         return
     parts = []
     for f in filings:
-        label = f"{f.get('form', '?')} filed {f.get('date', '?')}"
+        if local:
+            date, _, form = f.stem.partition("_")
+            label = f"{form or '?'} filed {date}"
+            src = str(f)
+        else:
+            label = f"{f.get('form', '?')} filed {f.get('date', '?')}"
+            src = f.get("url", "")
         try:
-            txt = fetch_text(f["url"])[:24000]
-            time.sleep(0.5)   # SEC politeness
+            txt = f.read_text(errors="replace")[:24000] if local else fetch_text(f["url"])[:24000]
+            if not local:
+                time.sleep(0.5)   # SEC politeness
             s = ask(
                 f"Summarize this SEC filing ({label}) for {ticker} in 3-6 bullet points. "
                 "Only substance: numbers, changes, named parties, risks. If it's a routine "
@@ -48,7 +69,7 @@ def main():
                 num_predict=350)
         except Exception as e:
             s = f"(fetch/summarize failed: {e})"
-        parts.append(f"## {label}\n{f.get('url','')}\n\n{s}\n")
+        parts.append(f"## {label}\n{src}\n\n{s}\n")
         print(f"done: {label}")
     outdir = os.path.join(BASE, "predigest")
     os.makedirs(outdir, exist_ok=True)

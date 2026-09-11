@@ -149,17 +149,34 @@ def earnings_calendar(tickers, days=21):
 
 
 # ---------- EDGAR ----------
+def _load_cik_cache(cache):
+    # feeds.py-193b (signals, 2026-09-11): cik_map() is called from feeds/scout/bench/vp/
+    # triggers, several of them concurrently around the same cron minute, and the plain
+    # write_text() below used to truncate-then-write -- a reader landing mid-write got a
+    # truncated JSON fragment. On 2026-09-09 that crashed triggers.py market-hours (`m =
+    # cik_map(); m.get(tk)` raised AttributeError: 'int' object has no attribute 'get'),
+    # skipping every rule for that 5-min tick. A malformed cache is now treated the same
+    # as a missing one -- refetch rather than hand a non-dict to every caller.
+    try:
+        v = json.loads(cache.read_text())
+    except Exception:
+        return None
+    return v if isinstance(v, dict) else None
+
+
 def cik_map():
     """ticker -> zero-padded CIK, cached a week."""
     cache = DATA / "cik_map.json"
     if cache.exists() and time.time() - cache.stat().st_mtime < 7 * 86400:
-        return json.loads(cache.read_text())
+        cached = _load_cik_cache(cache)
+        if cached is not None:
+            return cached
     try:
         r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=UA, timeout=30)
         m = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in r.json().values()}
     except Exception:
-        return json.loads(cache.read_text()) if cache.exists() else {}
-    cache.write_text(json.dumps(m))
+        return _load_cik_cache(cache) or {}
+    _write_json(cache, m)
     return m
 
 
@@ -280,7 +297,7 @@ def _f4_owner_role(owner_block):
 # So the derivation lives here, is pure (transactions[] in, summary out, no network), and is
 # stamped with F4_SUMMARY_SCHEMA. _resolve_form4_transactions re-derives any cached entry
 # below the current stamp, so the NEXT fix to this function repairs the corpus by itself.
-F4_SUMMARY_SCHEMA = 1
+F4_SUMMARY_SCHEMA = 2
 
 
 def _summarize_form4(txns):
@@ -312,15 +329,30 @@ def _summarize_form4(txns):
     dates = [t.get("date") for t in txns if t.get("date")]
     wavg_notes = [t.get("price_note") for t in primary_group if t.get("price_note")]
     plan_notes = [t.get("rule_10b5_1_note") for t in primary_group if t.get("rule_10b5_1_note")]
+    # feeds.py-193 (hunt -> signals, ask signals-193, 2026-09-11): shares_after is NOT
+    # max() across every transaction on the filing (feeds.py-073) -- that conflates
+    # separate ownership accounts (an insider's smaller account overstates nothing, but
+    # picks the WRONG account as "the" holding), returns a mid-sequence balance instead
+    # of the closing one on a multi-transaction single account, and can promote a
+    # DERIVATIVE count (options/RSUs, Table II) as a common-share count. The filing lists
+    # Table I rows in document order, so the closing balance per account is that
+    # account's LAST non-derivative transaction; summed across accounts gives the whole
+    # common holding. This still satisfies the ARI case max() was introduced for
+    # (feeds.py-073: 0 in the spouse's IRA + 162,417 direct = 162,417). Derivative
+    # securities remaining is a different quantity and gets its own field rather than
+    # being blended into a common-share count.
+    nd = [t for t in txns if t.get("kind") == "non-derivative" and t.get("shares_after") is not None]
+    dv = [t for t in txns if t.get("kind") == "derivative" and t.get("shares_after") is not None]
+    nd_accounts = {}
+    for t in nd:
+        nd_accounts.setdefault((t.get("ownership_nature"), t.get("ownership_nature_note")), []).append(t)
     summary.update({
         "transaction_code": primary_code,
         "shares": total_shares,
         "price": price,
-        # largest remaining balance across ALL transactions on the filing, not just the
-        # primary-code group -- the filing's own "how much does this insider still hold"
-        # answer, regardless of which account/code produced it.
-        "shares_after": max((t["shares_after"] for t in txns
-                             if t.get("shares_after") is not None), default=None),
+        "shares_after": (sum(g[-1]["shares_after"] for g in nd_accounts.values())
+                         if nd_accounts else None),
+        "derivative_shares_after": dv[-1]["shares_after"] if dv else None,
         # feeds.py-077/diffbrief.py-077 (coo, 2026-08-29): NOT "date" -- the filing row
         # this dict gets r.update()'d onto (edgar_filings' `row["date"]`) already means the
         # EDGAR index/FILED date. A same-named key here clobbered it with the <transaction
