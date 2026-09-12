@@ -822,6 +822,31 @@ def run():
         (NAMES / tk / "numcheck.json").write_text(json.dumps(
             {"ran_at": now, "findings": finds, "evidence": evidence}, indent=1))
         print(f"{tk}: {len(finds)} finding(s)" + (f" — {finds[0][:90]}" if finds else ""))
+
+    # EXITED NAMES (numwatch.py-196): the loop above only sweeps `held`, so a numcheck.json
+    # written the day before an exit sits on disk with stale findings forever — nothing
+    # ever re-visits a name once it leaves the book (VP review 2026-09-10: LBRDP carried
+    # two 27-day-stale UNSOURCED rows against a sell memo for a position exited three weeks
+    # earlier). Stamp them once: move the findings a live sweep already made into
+    # `exited_findings` (kept for audit — the finding was real, just no longer actionable)
+    # and clear `findings`, so unknowns.md / the VP brief / quality.py's queue — all of
+    # which just read numcheck.json's `findings` list — stop counting a memo nobody will
+    # ever re-source. Idempotent: a name already stamped has an empty `findings` and is
+    # skipped on every subsequent run.
+    exited = {k: v for k, v in _j(DATA / "thesis.json", {}).get("_exited", {}).items()}
+    for tk, info in exited.items():
+        p = NAMES / tk / "numcheck.json"
+        d = _j(p, None)
+        if not d or not d.get("findings"):
+            continue
+        exited_on = info.get("exited") if isinstance(info, dict) else True
+        d["exited_findings"] = d.pop("findings")
+        d["findings"] = []
+        d["exited"] = exited_on
+        p.write_text(json.dumps(d, indent=1))
+        print(f"{tk}: exited {exited_on} — moved {len(d['exited_findings'])} finding(s) "
+              f"to exited_findings (position no longer held)")
+
     (DATA / "numwatch.json").write_text(json.dumps(report, indent=1))
     # _INFO rows explain numbers that turned out to be fine; counting them as findings makes
     # a night of real progress read as no progress, which is how a metric stops being read.

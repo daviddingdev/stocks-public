@@ -67,14 +67,58 @@ def _json(name, default):
 def load_key(name):
     return _json("keys.json", {}).get(name, "")
 
+# ---------- books (2026-09-11) ----------
+# One dashboard, several books. The BROKERA book keeps the legacy paths (config/*.json);
+# every other book lives in config/<slug>/ (see _engine/books.py). The CURRENT book is
+# request-scoped: `?book=<slug>` on any API call, or the page route (/dip). The page JS
+# appends book= to every /api/ fetch while a non-BROKERA book is on screen, so the loaders
+# written for the BROKERA home (pfhistory, transactions, lots, lifetime, external…) serve
+# any book without knowing it. Cache keys carry the slug for the same reason.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import books as _books  # noqa: E402
+
+def _book():
+    from flask import g, has_request_context
+    if not has_request_context():
+        return "brokera"
+    b = getattr(g, "book", None)
+    if b is None:
+        b = (request.args.get("book") or "").strip().lower()
+        if not b:
+            b = "dip" if request.path == "/dip" else "brokera"
+        if b not in _books.slugs():
+            b = "brokera"
+        g.book = b
+    return b
+
+def _bjson(name, default):
+    f = _books.book_dir(_book()) / name
+    try:
+        return json.loads(f.read_text()) if f.exists() else default
+    except Exception:
+        return default
+
 def read_positions():
-    return _json("positions.json", {})
+    return _bjson("positions.json", {})
 
 def read_account():
-    return _json("account.json", {})
+    return _bjson("account.json", {})
 
 def read_external():
-    return _json("external.json", [])
+    """Off-feed holdings that belong in the book's allocation: the BROKERA book's
+    external.json, or a book's hand-marked private.json (name/value/category/…)."""
+    ext = _bjson("external.json", None)
+    return ext if ext is not None else _bjson("private.json", [])
+
+def _book_aid(st):
+    """The AggregatorA account behind the current book's activity feed. A book with
+    several accounts reads the first (neither book has more than one, 2026-09-11);
+    a book with none falls back to the user's first account, the pre-registry rule."""
+    ids = (_books.load().get(_book()) or {}).get("accounts") or []
+    if ids:
+        return ids[0]
+    u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
+    return st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
 
 def watchlist():
     f = CONF / "watchlist.txt"
@@ -288,6 +332,8 @@ def sidebar():
          "<div class=ngrp style='padding:0 10px'>Books</div>",
          f"<a class='leaf navtop' data-home href='/'>{I_HOME}<span>J.P. Morgan</span></a>",
          f"<a class='leaf navtop' data-route='/brokera' href='/brokera'>{I_DOC}<span>David brief</span></a>",
+         # /dip — the DIP Venture book: Waffle private stake + cash for strategic holds (module: dip_page.py)
+         dip_page.sidebar_link(I_HOME),
          f"<a class='leaf navtop' data-route='/advised' href='/advised'>{I_SPARK}<span>Justin's book</span></a>",
          # 2026-08-13 (David): single flat link — the /agent page's five panes now carry
          # Mandate/journal/sessions/memos themselves; the sidebar subtree was redundant.
@@ -667,6 +713,8 @@ def pfseg():
     get a back-bar to /agent instead (that book has its own segs)."""
     from flask import request as _rq
     path, active = _rq.path, None
+    if path == "/dip":   # DIP Venture: one seg for now — which other tabs it keeps is David's call (2026-09-11)
+        return "<div class=pfnav><a class='pfseg on' data-route='/dip' href='/dip'>Book</a></div>"
     if path in {p for p, _ in PF_SEGS}:
         active = path
     back = ""
@@ -750,6 +798,13 @@ def hold_row(tk, meta):
             f"<td class='num wt'>·</td><td>{verdict}</td><td class=c-wide>{doc}</td></tr>")
 
 def home_inner():
+    """The book page. Written for the BROKERA book; since 2026-09-11 it renders whichever
+    book _book() names (David: "I want dip to have the same home page as jp morgan").
+    Book-specific bits are marked `bk ==` / `is_jpm` — everything else is the same
+    grammar, because the capital in every human-traded book asks the same questions."""
+    bk = _book(); is_jpm = bk == "brokera"
+    blabel = _books.load()[bk]["label"]
+    bhome = "/" if is_jpm else f"/{bk}"
     pos = read_positions(); wl = watchlist(); acct = read_account()
     acct_ok = bool(acct)  # account.json missing/unreadable renders as {} — don't let $0 masquerade as a real balance
     cash = acct.get("cash", 0); mmf = acct.get("money_market", 0); yld = acct.get("mmf_yield", 0.043)
@@ -757,11 +812,13 @@ def home_inner():
     watch = [t for t in dict.fromkeys(list(wl) + list(pos.keys())) if t not in held]  # names you track but don't own
 
     asof = str(acct.get("as_of", "")) or "never"
-    head = ("<div class=pagehead><div><h1>Portfolio</h1>"
+    head = (f"<div class=pagehead><div><h1>{'Portfolio' if is_jpm else html.escape(blabel)}</h1>"
             f"<p class=muted>Live quotes · brokerage synced <b>{html.escape(asof)}</b> <span id=syncnote class=hint></span></p></div>"
             "<div class=headactions>"
-            "<form class=addbar onsubmit='return doAdd(event)'><input id=addtk placeholder='Add ticker…' autocomplete=off spellcheck=false><button type=submit>Add</button></form>"
-            f"<button class=connectbtn onclick='syncBrokerage()'>{I_REFRESH}<span>Sync J.P. Morgan</span></button></div></div>")
+            + ("<form class=addbar onsubmit='return doAdd(event)'><input id=addtk placeholder='Add ticker…' autocomplete=off spellcheck=false><button type=submit>Add</button></form>" if is_jpm else "")
+            + f"<button class=connectbtn onclick='syncBrokerage()'>{I_REFRESH}<span>Sync {html.escape(blabel)}</span></button></div></div>"
+            # book context for the page JS: every /api/ fetch carries book=<slug> while this is on screen
+            + f"<span id=bookctx data-book='{bk}' data-home='{bhome}' hidden></span>")
     kpi = ("<div class=kpirow>"
            "<div class='kpi hero'><div class=kk>Account value</div><div class=kv id=kv-val>—</div></div>"
            "<div class=kpi><div class=kk>Today</div><div class=kv id=kv-day>—</div></div>"
@@ -770,7 +827,10 @@ def home_inner():
            "<div class=kpi><div class=kk>Cash available</div><div class=kv id=kv-cash>—</div></div></div>")
     note_v = acct.get("structured_note", 0)
     note_lbl = acct.get("structured_note_label", "Structured note")
-    acctdata = f"<span id=acct data-cash='{cash}' data-mmf='{mmf}' data-note='{note_v}' data-yield='{yld}' hidden></span>"
+    priv = read_external(); priv_v = sum(float(x.get("value") or 0) for x in priv) if not is_jpm else 0.0
+    # data-private: hand-marked private stakes count toward a book's value (DIP: Waffle).
+    # The BROKERA book keeps its external.json OUT of account value, as it always has (0 here).
+    acctdata = f"<span id=acct data-cash='{cash}' data-mmf='{mmf}' data-note='{note_v}' data-private='{priv_v}' data-yield='{yld}' hidden></span>"
 
     if held:
         rows = "".join(hold_row(t, pos.get(t, {})) for t in held)
@@ -782,7 +842,11 @@ def home_inner():
                   f"<tbody>{rows}</tbody></table></div></div>")
     else:
         hold_w = ("<div class=widget><div class=whead><span class=wtitle>Holdings</span></div>"
-                  "<div class=pfempty2>No holdings tracked yet — use Sync J.P. Morgan (top right).</div></div>")
+                  + ("<div class=pfempty2>No holdings tracked yet — use Sync J.P. Morgan (top right).</div></div>" if is_jpm else
+                     "<div class=pfempty2>No public positions yet — the cash is the position until a name earns it.</div></div>"))
+    if not is_jpm:
+        hold_w += dip_page.private_widget(priv)   # the book's hand-marked private stakes (Waffle)
+        hold_w = dip_page.connect_widget(bk) + hold_w
 
     wrows = "".join(pos_row(t, pos.get(t, {}), False) for t in watch)
     watch_w = (f"<div class=widget><div class=whead><span class=wtitle>Watchlist</span><span class=wcount>{len(watch)}</span></div><div class=wbody>"
@@ -806,6 +870,7 @@ def home_inner():
               f"<div class=arow><span>Money market{mmf_sub}</span><span class=amono>{f'${mmf:,.0f}' if acct_ok else '—'}</span></div>"
               + (f"<div class=arow><span title='{html.escape(note_lbl)}'>Structured note <span class=hint>2/2028</span></span>"
                  f"<span class=amono>${note_v:,.0f}</span></div>" if note_v else "")
+              + (f"<div class=arow><span>Private holdings <span class=hint>marked by hand</span></span><span class=amono>${priv_v:,.0f}</span></div>" if priv_v else "")
               + f"<div class='arow total'><span>Total account</span><span id=ac-total class=amono>—</span></div>"
               f"<div class=arow><span>Est. income · {yld*100:.1f}%</span><span class=amono>{f'~${inc:,.0f}/yr' if acct_ok else '—'}</span></div>"
               f"<div class=arow><span>Dry powder <span class=hint>cash + money market</span></span>"
@@ -840,7 +905,8 @@ def home_inner():
     except Exception:
         _al = []
     pal_raw = [a for a in _al if "BROKERA" in (a.get("book") or "")
-               or not ("Agent" in (a.get("book") or "") or a.get("symbol") == "AGENT")]
+               or not ("Agent" in (a.get("book") or "") or a.get("symbol") == "AGENT")] if is_jpm else []
+    # (the trigger engine reads the BROKERA book only — a DIP book with no public names has nothing to alert on yet)
     _seen = {}
     for a in sorted(pal_raw, key=lambda x: str(x.get("ts", ""))):
         _seen[(a.get("symbol"), a.get("kind"))] = a  # latest per (symbol, kind)
@@ -1453,6 +1519,105 @@ def _pos_value(p):
 
 _LAST_SYNC = [0.0]
 
+def _sync_accounts(st, qp, accts, bdir, watch):
+    """Pull one BOOK's accounts into <bdir>/account.json + positions.json. Split out of
+    st_sync 2026-09-11 when the DIP Venture account joined the same AggregatorA user:
+    accounts are routed by _engine/books.py, never summed blindly. `watch` — only the
+    BROKERA book feeds names into watchlist.txt (David's universe); other books keep their
+    holdings to their own page."""
+    def _jread(name, default):
+        try:
+            return json.loads((bdir / name).read_text())
+        except Exception:
+            return default
+    holdings = {}; total_value = cash = stock_val = note_live = mmf_held = 0.0; note_mark = None
+    mmf_names = []
+    for acc in accts:
+        aid = acc.get("id")
+        total_value += float(((acc.get("balance") or {}).get("total") or {}).get("amount") or 0)
+        try:
+            for b in st.account_information.get_user_account_balance(query_params=qp, path_params={"accountId": aid}).body:
+                cash += float(b.get("cash") or 0)
+        except Exception:
+            pass
+        poss = st.account_information.get_user_account_positions(query_params=qp, path_params={"accountId": aid}).body
+        for p in poss:
+            s = p.get("symbol") or {}; sy = s.get("symbol") or {}
+            tk = (sy.get("symbol") if isinstance(sy, dict) else sy)
+            if _pos_kind(p) == "bnd":  # structured note: own Account row, never a quotable holding
+                note_live += _pos_value(p); note_mark = float(p.get("price") or 0) or note_mark
+                continue
+            if _is_cash_equiv(p):  # money-market fund: cash, not equity — Account row, not a holding
+                mmf_held += _pos_value(p)
+                if tk:
+                    mmf_names.append(tk.upper())
+                continue
+            stock_val += _pos_value(p)
+            if not tk:
+                continue
+            tk = tk.upper()
+            desc = (sy.get("description") if isinstance(sy, dict) else "") or ""
+            h = holdings.setdefault(tk, {"shares": 0.0, "cost_basis": 0.0, "name": desc})
+            h["shares"] += float(p.get("units") or 0)
+            h["cost_basis"] = float(p.get("average_purchase_price") or 0)
+    acct = _jread("account.json", {})
+    # the note is worth whatever the broker marks it at when itemized; else fall back to the manual mark
+    note_v = round(note_live, 2) if note_live else acct.get("structured_note", 0)
+    # money market = the itemized stable-NAV funds PLUS whatever the broker total holds
+    # that no position explains (an un-itemized sweep). Keeping them separate matters:
+    # the itemized part is a fact, the residual is a plug, and the widget says which.
+    resid = round(total_value - cash - stock_val - note_v - mmf_held, 2)
+    # A big negative residual means our valuation disagrees with the broker — keep the
+    # last good number rather than poison the value chart.
+    warn = ""
+    tol = max(100.0, 0.01 * total_value)
+    if resid < -tol:
+        warn = f"positions exceed broker total by ${-resid:,.0f} — money market left at last good value"
+        mmf = acct.get("money_market", 0); resid = 0.0
+    else:
+        if resid < 0:
+            resid = 0.0  # rounding / stale-mark noise
+        mmf = round(mmf_held + resid, 2)
+    acct["mmf_holdings"] = sorted(set(mmf_names))
+    acct["mmf_residual"] = resid
+    from zoneinfo import ZoneInfo
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    acct.update({"total_value": round(total_value, 2), "cash": round(cash, 2), "money_market": mmf,
+                 "currency": "USD", "as_of": now_et.strftime("%b %-d, %-I:%M %p ET"),
+                 "as_of_epoch": round(time.time()),
+                 "accounts": [{"id": a.get("id"), "number": str(a.get("number") or "")[-4:], "name": a.get("name")} for a in accts]})
+    if note_live:
+        acct["structured_note"] = note_v
+        base = re.split(r"\s*·\s*marked\b", acct.get("structured_note_label", ""))[0]
+        acct["structured_note_label"] = (base or "Structured note") + (
+            f" · marked {note_mark:.2f} live {now_et.strftime('%b %-d')}" if note_mark else "")
+    acct.setdefault("mmf_yield", 0.043)
+    (bdir / "account.json").write_text(json.dumps(acct, indent=2))
+    cur = _jread("positions.json", {})
+    for tk in acct["mmf_holdings"]:
+        cur.pop(tk, None)  # a money-market fund booked as a holding by an older sync
+    for tk, h in holdings.items():
+        m = cur.get(tk, {})
+        m.update({"shares": round(h["shares"], 4), "cost_basis": round(h["cost_basis"], 4), "status": "Held"})
+        if not m.get("name"):
+            m["name"] = h["name"]
+        cur[tk] = m
+    (bdir / "positions.json").write_text(json.dumps(cur, indent=2))
+    if watch:
+        wl = set(watchlist())
+        if set(acct["mmf_holdings"]) & wl:
+            wf = CONF / "watchlist.txt"
+            wf.write_text("".join(l for l in wf.read_text().splitlines(keepends=True)
+                                  if l.strip().upper() not in acct["mmf_holdings"]))
+            wl -= set(acct["mmf_holdings"])
+        new = [t for t in holdings if t not in wl]
+        if new:
+            wf = CONF / "watchlist.txt"; txt = wf.read_text() if wf.exists() else ""
+            if txt and not txt.endswith("\n"):
+                txt += "\n"
+            wf.write_text(txt + "\n".join(new) + "\n")
+    return {"synced": sorted(holdings.keys()), "warn": warn}
+
 @app.route("/api/aggregatora/sync")
 def st_sync():
     st = _st()
@@ -1468,91 +1633,35 @@ def st_sync():
             return jsonify({"msg": "No AggregatorA user provisioned — connect a brokerage in AggregatorA first."})
         qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
         accts = st.account_information.list_user_accounts(query_params=qp).body
-        holdings = {}; total_value = cash = stock_val = note_live = mmf_held = 0.0; note_mark = None
-        mmf_names = []
-        for acc in accts:
-            aid = acc.get("id")
-            total_value += float(((acc.get("balance") or {}).get("total") or {}).get("amount") or 0)
-            try:
-                for b in st.account_information.get_user_account_balance(query_params=qp, path_params={"accountId": aid}).body:
-                    cash += float(b.get("cash") or 0)
-            except Exception:
-                pass
-            poss = st.account_information.get_user_account_positions(query_params=qp, path_params={"accountId": aid}).body
-            for p in poss:
-                s = p.get("symbol") or {}; sy = s.get("symbol") or {}
-                tk = (sy.get("symbol") if isinstance(sy, dict) else sy)
-                if _pos_kind(p) == "bnd":  # structured note: own Account row, never a quotable holding
-                    note_live += _pos_value(p); note_mark = float(p.get("price") or 0) or note_mark
-                    continue
-                if _is_cash_equiv(p):  # money-market fund: cash, not equity — Account row, not a holding
-                    mmf_held += _pos_value(p)
-                    if tk:
-                        mmf_names.append(tk.upper())
-                    continue
-                stock_val += _pos_value(p)
-                if not tk:
-                    continue
-                tk = tk.upper()
-                desc = (sy.get("description") if isinstance(sy, dict) else "") or ""
-                h = holdings.setdefault(tk, {"shares": 0.0, "cost_basis": 0.0, "name": desc})
-                h["shares"] += float(p.get("units") or 0)
-                h["cost_basis"] = float(p.get("average_purchase_price") or 0)
-        acct = read_account()
-        # the note is worth whatever the broker marks it at when itemized; else fall back to the manual mark
-        note_v = round(note_live, 2) if note_live else acct.get("structured_note", 0)
-        # money market = the itemized stable-NAV funds PLUS whatever the broker total holds
-        # that no position explains (an un-itemized sweep). Keeping them separate matters:
-        # the itemized part is a fact, the residual is a plug, and the widget says which.
-        resid = round(total_value - cash - stock_val - note_v - mmf_held, 2)
-        # A big negative residual means our valuation disagrees with the broker — keep the
-        # last good number rather than poison the value chart.
-        warn = ""
-        tol = max(100.0, 0.01 * total_value)
-        if resid < -tol:
-            warn = f"positions exceed broker total by ${-resid:,.0f} — money market left at last good value"
-            mmf = acct.get("money_market", 0); resid = 0.0
-        else:
-            if resid < 0:
-                resid = 0.0  # rounding / stale-mark noise
-            mmf = round(mmf_held + resid, 2)
-        acct["mmf_holdings"] = sorted(set(mmf_names))
-        acct["mmf_residual"] = resid
-        from zoneinfo import ZoneInfo
-        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
-        acct.update({"total_value": round(total_value, 2), "cash": round(cash, 2), "money_market": mmf,
-                     "currency": "USD", "as_of": now_et.strftime("%b %-d, %-I:%M %p ET"),
-                     "as_of_epoch": round(time.time())})
-        if note_live:
-            acct["structured_note"] = note_v
-            base = re.split(r"\s*·\s*marked\b", acct.get("structured_note_label", ""))[0]
-            acct["structured_note_label"] = (base or "Structured note") + (
-                f" · marked {note_mark:.2f} live {now_et.strftime('%b %-d')}" if note_mark else "")
-        acct.setdefault("mmf_yield", 0.043)
-        (CONF / "account.json").write_text(json.dumps(acct, indent=2))
-        cur = read_positions()
-        for tk in acct["mmf_holdings"]:
-            cur.pop(tk, None)  # a money-market fund booked as a holding by an older sync
-        for tk, h in holdings.items():
-            m = cur.get(tk, {})
-            m.update({"shares": round(h["shares"], 4), "cost_basis": round(h["cost_basis"], 4), "status": "Held"})
-            if not m.get("name"):
-                m["name"] = h["name"]
-            cur[tk] = m
-        (CONF / "positions.json").write_text(json.dumps(cur, indent=2))
-        wl = set(watchlist())
-        if set(acct["mmf_holdings"]) & wl:
-            wf = CONF / "watchlist.txt"
-            wf.write_text("".join(l for l in wf.read_text().splitlines(keepends=True)
-                                  if l.strip().upper() not in acct["mmf_holdings"]))
-            wl -= set(acct["mmf_holdings"])
-        new = [t for t in holdings if t not in wl]
-        if new:
-            wf = CONF / "watchlist.txt"; txt = wf.read_text() if wf.exists() else ""
-            if txt and not txt.endswith("\n"):
-                txt += "\n"
-            wf.write_text(txt + "\n".join(new) + "\n")
-        return jsonify({"ok": True, "synced": sorted(holdings.keys()), **({"warn": warn} if warn else {})})
+        # 2026-09-11: route every account to its BOOK (config/books.json) — the DIP Venture
+        # account lives under the same AggregatorA user as the BROKERA book and must never be
+        # summed into it. An unclaimed account is reported, not guessed at (one exception:
+        # a pending `books.py connect <book>` claims the single new account it produced).
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1])); import books as _books
+        bk = _books.load()
+        by_book, unassigned = _books.route(accts, bk)
+        warns = []
+        if unassigned:
+            acc, slug = _books.settle_pending(unassigned, bk)
+            if acc:
+                bk = _books.load(); by_book, unassigned = _books.route(accts, bk)
+                warns.append(f"account …{str(acc.get('number') or '')[-4:]} routed to {bk[slug]['label']}")
+        synced = {}
+        for slug, group in by_book.items():
+            if not group:
+                continue
+            r = _sync_accounts(st, qp, group, _books.book_dir(slug, bk), watch=(slug == "brokera"))
+            synced[slug] = r["synced"]
+            if r["warn"]:
+                warns.append(f"{bk[slug]['label']}: {r['warn']}")
+        una = [{"id": a.get("id"), "number": str(a.get("number") or "")[-4:], "name": a.get("name"),
+                "total": ((a.get("balance") or {}).get("total") or {}).get("amount")} for a in unassigned]
+        if una:
+            warns.append("unassigned account(s) " + ", ".join("…" + a["number"] for a in una)
+                         + " — python3 _engine/books.py assign <id> <book>")
+        warn = "; ".join(warns)
+        return jsonify({"ok": True, "synced": synced.get("brokera", []), "books": synced, "unassigned": una,
+                        **({"warn": warn} if warn else {})})
     except Exception as e:
         return jsonify({"msg": "Sync error: " + str(getattr(e, "body", e))[:160]})
 
@@ -1591,9 +1700,14 @@ def digest():
 
 def tracked_tickers():
     """Every name the operation follows: owned, watched, or with a research folder."""
-    pos = read_positions()
-    return sorted({t for t, m in pos.items() if (m.get("shares") or 0) > 0}
-                  | set(watchlist()) | {ticker_of(c) for c in companies()})
+    held = set()
+    for slug in _books.slugs():   # every book's held names, not just the one on screen
+        try:
+            pos = json.loads((_books.book_dir(slug) / "positions.json").read_text())
+        except Exception:
+            pos = {}
+        held |= {t for t, m in pos.items() if (m.get("shares") or 0) > 0}
+    return sorted(held | set(watchlist()) | {ticker_of(c) for c in companies()})
 
 @app.route("/api/sidebar")
 def api_sidebar():
@@ -1669,10 +1783,10 @@ def _st_activities(st):
     same rows."""
     def fetch():
         u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-        aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
+        aid = _book_aid(st)
         act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
         return act if isinstance(act, list) else act.get("data", [])
-    return cached("st_activities", 600, fetch)
+    return cached(f"st_activities:{_book()}", 600, fetch)
 
 @app.route("/api/transactions")
 def api_tx():
@@ -1698,7 +1812,7 @@ def api_tx():
             return out[:60]
         except Exception:
             return []
-    return jsonify(cached("tx", 600, fetch))
+    return jsonify(cached(f"tx:{_book()}", 600, fetch))
 
 def _pf_flows(rows):
     """External cash flows by date, from account activities: deposits/withdrawals,
@@ -1855,10 +1969,7 @@ def api_lifetime():
         return jsonify({})
     def fetch():
         try:
-            u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-            aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
-            act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
-            rows = act if isinstance(act, list) else act.get("data", [])
+            rows = _st_activities(st)
             seen, flows, earliest, detail = set(), 0.0, None, []
             for a in sorted(rows, key=lambda x: str(x.get("trade_date") or x.get("settlement_date") or "")):
                 d = str(a.get("trade_date") or a.get("settlement_date") or "")[:10]
@@ -1881,7 +1992,7 @@ def api_lifetime():
                     "prior": prior, "since": earliest, "flows": detail}
         except Exception:
             return {}
-    return jsonify(cached("lifetime", 3600, fetch))
+    return jsonify(cached(f"lifetime:{_book()}", 3600, fetch))
 
 @app.route("/api/pfhistory")
 def api_pfhist():
@@ -1889,10 +2000,7 @@ def api_pfhist():
     def fetch():
         if st:
             try:
-                u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-                aid = st.account_information.list_user_accounts(query_params=qp).body[0]["id"]
-                act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
-                rows = act if isinstance(act, list) else act.get("data", [])
+                rows = _st_activities(st)
                 # The broker's own balance-history series is unusable here: it flips the money-market
                 # fund in and out on alternating days (a ±$278k square wave — 366 of 393 day-over-day
                 # moves exceed $200k) and prints negative on 175 of 393 days. Rebuild the account
@@ -1901,9 +2009,21 @@ def api_pfhist():
                 acct = read_account()
                 ce_tks, mmf_bal = _cash_equiv(rows)
                 hs = _equity_series(rows, skip=ce_tks)
-                if not hs:
-                    raise ValueError("no equity series")
                 cash_bal = _cash_ledger(rows)
+                if not hs:
+                    # A book with no equity trades yet (DIP Venture, funded 2026-09-10 and
+                    # all cash): the chart is the cash + sweep ledger on weekdays from the
+                    # first flow to today, equity value zero. Without this the page showed
+                    # an empty chart for a $1.3M account.
+                    first = min(list(cash_bal) + list(mmf_bal) + [dt.date.today().isoformat()])
+                    d0 = dt.date.fromisoformat(first[:10]); today = dt.date.today()
+                    hs = {}
+                    while d0 <= today:
+                        if d0.weekday() < 5:
+                            hs[d0.isoformat()] = {"hv": 0.0, "hpl": 0.0}
+                        d0 += dt.timedelta(days=1)
+                    if not hs:
+                        raise ValueError("no series")
                 note_bal = _note_series(rows)  # face value; carried at the broker's live mark
                 face = note_bal[max(note_bal)] if note_bal else 0.0
                 nscale = (float(acct.get("structured_note") or 0) / face) if face else 1.0
@@ -1938,8 +2058,8 @@ def api_pfhist():
                 return pts
             except Exception:
                 pass
-        return _json("pf_history.json", [])  # snapshot fallback (grows on each sync)
-    return jsonify(cached("pfhist", 1800, fetch))
+        return _bjson("pf_history.json", [])  # snapshot fallback (grows on each sync)
+    return jsonify(cached(f"pfhist:{_book()}", 1800, fetch))
 
 @app.route("/api/research")
 def api_research():
@@ -2178,7 +2298,7 @@ def api_lots():
             return sorted(best.values(), key=lambda x: x["date"])
         except Exception:
             return []
-    return jsonify(cached(f"lots:{tk}", 600, fetch))
+    return jsonify(cached(f"lots:{_book()}:{tk}", 600, fetch))
 
 @app.route("/api/calendar")
 def api_calendar():
@@ -2803,6 +2923,8 @@ function fillPositions(){
  var rows=Array.prototype.slice.call(document.querySelectorAll('.posrow[data-tk]'));
  var side=Array.prototype.slice.call(document.querySelectorAll('[data-sidechg]:not([data-done])'));
  var mkt=Array.prototype.slice.call(document.querySelectorAll('.mbody[data-ticker]'));
+ /* a book with no public rows yet (DIP Venture, all cash) still has an account to total and an allocation to draw */
+ if(ac&&!rows.length)computeAccount([],{},cash,mmf);
  if(!rows.length&&!side.length&&!mkt.length)return;
  var tks=rows.map(function(r){return r.dataset.tk})
    .concat(side.map(function(e){return e.dataset.sidechg}))
@@ -2822,12 +2944,12 @@ function fillPositions(){
  });
 }
 function computeAccount(rows,quotes,cash,mmf){
- var ac=document.getElementById('acct'),note=ac?parseFloat(ac.dataset.note)||0:0;
+ var ac=document.getElementById('acct'),note=ac?parseFloat(ac.dataset.note)||0:0,priv=ac?parseFloat(ac.dataset.private)||0:0;
  var stocks=0,dayp=0,pnl=0,cost=0;
  rows.forEach(function(row){var sh=parseFloat(row.dataset.shares)||0,d=quotes[row.dataset.tk];
   if(sh>0&&d&&d.price){var mv=sh*d.price,cb=sh*(parseFloat(row.dataset.cost)||0);
    stocks+=mv;cost+=cb;pnl+=mv-cb;dayp+=sh*(d.prev?(d.price-d.prev):0);}});
- var acctVal=stocks+cash+mmf+note;
+ var acctVal=stocks+cash+mmf+note+priv;
  rows.forEach(function(row){var sh=parseFloat(row.dataset.shares)||0,d=quotes[row.dataset.tk];
   var mv=row.querySelector('.mval'),pl=row.querySelector('.pnl'),wt=row.querySelector('.wt');
   if(sh>0&&d&&d.price){var v=sh*d.price,cb=sh*(parseFloat(row.dataset.cost)||0),g=v-cb,gp=cb?g/cb*100:0,up=g>=0;
@@ -2843,13 +2965,15 @@ function computeAccount(rows,quotes,cash,mmf){
  setk('kv-cash',money(cash));
  var s=document.getElementById('ac-stocks');if(s)s.textContent=money(stocks);
  var t=document.getElementById('ac-total');if(t)t.textContent=money(acctVal);
- _acctVal=acctVal;updateLifetime();
+ _acctVal=acctVal;_privVal=priv;updateLifetime();
  renderAlloc(stocks,cash,mmf,note);
 }
-var _netdep=null,_lifesince='',_acctVal=null;
+var _netdep=null,_lifesince='',_acctVal=null,_privVal=0;
 function updateLifetime(){
  if(_netdep==null||_acctVal==null)return;
- var pl=_acctVal-_netdep,pct=_netdep?pl/_netdep*100:0;
+ /* private stakes (DIP: Waffle) sit in book value at a hand mark but are NOT P&L (David 2026-09-11):
+    they were bought outside the brokerage feed, so neither the deposit nor the mark belongs here */
+ var pl=(_acctVal-_privVal)-_netdep,pct=_netdep?pl/_netdep*100:0;
  setk('kv-life',signed(pl)+' ('+(pl>=0?'+':'−')+Math.abs(pct).toFixed(1)+'%)',pl>=0?'up':'down');
  var s=document.getElementById('kv-lifesub');
  if(s)s.textContent='vs '+money(_netdep)+' net deposited since '+(_lifesince||'').slice(0,7);}
@@ -2872,8 +2996,16 @@ function renderAlloc(stocks,cash,mmf,note){var cv=document.getElementById('alloc
   if(lg)lg.innerHTML=segs.map(function(s,i){return '<div class=alli><span class=alldot style="background:'+ALLOC_COLORS[i%ALLOC_COLORS.length]+'"></span><span class=alll>'+esc(s.l)+'</span><span class=allv>'+(s.v/tot*100).toFixed(0)+'%</span></div>';}).join('');
  }).catch(function(){});
 }
-function syncBrokerage(){toast('Syncing J.P. Morgan…');fetch('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
- if(d.ok){toast(d.warn?('⚠ '+d.warn):(d.synced?('Synced '+d.synced.join(', ')):(d.msg||'Synced')));nav('/',false);}else{toast(d.msg||'sync failed');}}).catch(function(){toast('sync error');});}
+/* ---- book context (2026-09-11): the page says which book is on screen (#bookctx, set by
+   home_inner); while it is not the BROKERA book every /api/ fetch carries book=<slug>, so the
+   loaders below serve any book unchanged. Re-read on every nav, before enhance() fires. */
+var BOOK='brokera',BOOK_HOME='/';
+function readBook(){var b=document.getElementById('bookctx');BOOK=b?(b.dataset.book||'brokera'):'brokera';BOOK_HOME=b?(b.dataset.home||'/'):'/';}
+(function(){var _f=window.fetch;window.fetch=function(u,o){
+ if(typeof u==='string'&&u.indexOf('/api/')===0&&BOOK!=='brokera'&&u.indexOf('book=')<0)u+=(u.indexOf('?')>=0?'&':'?')+'book='+encodeURIComponent(BOOK);
+ return _f.call(window,u,o);};})();
+function syncBrokerage(){toast('Syncing '+(BOOK==='brokera'?'J.P. Morgan':BOOK.toUpperCase())+'…');fetch('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
+ if(d.ok){var got=(d.books&&d.books[BOOK])||d.synced;toast(d.warn?('⚠ '+d.warn):((got&&got.length)?('Synced '+got.join(', ')):(d.msg||'Synced')));nav(BOOK_HOME,false);}else{toast(d.msg||'sync failed');}}).catch(function(){toast('sync error');});}
 /* auto-sync: when the dashboard is opened and the brokerage snapshot is >15 min old,
    sync once per tab in the background and refresh the numbers when done */
 function autoSync(){
@@ -3429,7 +3561,7 @@ function nav(route,push){
   return x.text;}).then(function(h){if(h==null)return;
   /* inline, so it beats the stylesheet — keep it in step with #main{animation} */
   var m=document.getElementById('main');m.innerHTML=h;m.style.animation='none';void m.offsetWidth;m.style.animation='fade .07s linear';
-  setActive(route);
+  readBook();setActive(route);
   if(push)history.pushState({route:route},'',route);
   var nv=document.getElementById('nav');if(nv)nv.checked=false;window.scrollTo(0,0);setTitle();enhance();
  });
@@ -3532,7 +3664,7 @@ function setActive(route){
  while(d){d.open=true;d.classList.add('hasactive');d=d.parentElement?d.parentElement.closest('details'):null;}
  if(el.scrollIntoView)el.scrollIntoView({block:'nearest'});}
 setActive(decodeURIComponent(location.pathname)+location.search);
-enhance();
+readBook();enhance();
 autoSync();
 """
 
@@ -3548,6 +3680,9 @@ jpm_page.register(app, wrap)
 
 import advised_page  # /advised — David's window on Justin's book (own module)
 advised_page.register(app, wrap)
+
+import dip_page  # /dip — the DIP Venture book (BROKERA entity account: Waffle stake + strategic cash; own module)
+dip_page.register(app, wrap)
 
 import lookups_page  # /lookups — HBS-library upload desk (Capital IQ / IBISWorld exports)
 lookups_page.register(app, wrap)

@@ -64,6 +64,103 @@ FORM_COUNTS = {"10-K": 1, "10-Q": 2, "8-K": 4, "DEF 14A": 1, "DEFM14A": 1,
 EXHIBIT_FORMS = {"8-K", "10-12B", "10-12B/A"}
 EXHIBIT_TYPE_RE = re.compile(r"^EX-99(\.\d+)?$", re.I)
 
+# DEBT-NOTE EXHIBIT INCORPORATION (dossier.py-200): the exhibit INDEX (Item 15) names every
+# material contract by exhibit number plus, for anything not filed WITH this report, the
+# prior filing it was incorporated from. A credit agreement's covenant schedule lives ONLY
+# in that exhibit, never in the note's own prose (MYGN's OrbiMed Credit Agreement, PM
+# 2026-09-11: the covenant ladder that moved a modelled breach a quarter was in Ex-10.1 to
+# the 8-K filed 2025-07-31; the 10-K/10-Q never quotes it). Fetched the same way EX-99.1
+# press releases already land. Scope, deliberately narrow: Ex-10.x whose INDEX DESCRIPTION
+# names a debt keyword — a benefits plan or employment agreement under Ex-10 is not fetched
+# — and only the two citation shapes actually observed on disk (table cell with an explicit
+# filing date; prose "Filed as Exhibit X to Form Y ... filed [on] DATE" or "... for the
+# quarter/year ended DATE"). A citation this doesn't parse is silently skipped, not guessed.
+EX10_TYPE_RE = re.compile(r"^EX-10(\.\d+)?$", re.I)
+DEBT_EXHIBIT_KEYWORDS_RE = re.compile(
+    r"(?i)\b(credit agreement|indenture|loan agreement|credit facility|term loan)\b")
+EXHIBIT_ANCHOR_RE = re.compile(r"(?m)^\s*(10\.\d{1,3})\s*$")
+EXHIBIT_TABLE_CITE_RE = re.compile(
+    r"(?i)\b(8-K|10-K|10-Q|10-12B(?:/A)?|S-1|S-4|DEF ?14A)\s*\(Exhibit\s+(10\.\d{1,3}(?:\.\d+)?)\)")
+EXHIBIT_PROSE_CITE_RE = re.compile(
+    r"(?i)exhibit\s+(10\.\d{1,3}(?:\.\d+)?)[^\n]{0,80}?"
+    r"form\s+(8-K|10-K|10-Q|10-12B(?:/A)?|S-1|S-4|DEF ?14A)[^\n]{0,80}?"
+    r"filed\s+(?:on\s+)?(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+ \d{1,2},\s*\d{4})")
+EXHIBIT_PROSE_PERIOD_CITE_RE = re.compile(
+    r"(?i)exhibit\s+(10\.\d{1,3}(?:\.\d+)?)[^\n]{0,80}?"
+    r"form\s+(8-K|10-K|10-Q|10-12B(?:/A)?|S-1|S-4|DEF ?14A)[^\n]{0,80}?"
+    r"(?:quarter|year)\s+ended\s+(\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+ \d{1,2},\s*\d{4})")
+EXHIBIT_CITE_DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
+EXHIBIT_FILED_HERE_RE = re.compile(r"(?m)^\s*X\s*$")
+
+
+def _parse_cite_date(s):
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return dt.datetime.strptime(s.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def debt_exhibit_refs(txt):
+    """Ex-10.x rows in a 10-K/10-Q's own Exhibit Index whose description names a debt
+    instrument. Returns [{"own": "10.24", "ref_form": "8-K"|None, "ref_exhibit": "10.1"|None,
+    "ref_date": "2025-07-31"|None, "by": "filing_date"|"period_date"|"filed_here"}, ...].
+    ref_form/ref_exhibit/ref_date are None when the exhibit is filed WITH this report
+    (marked "X" in the index rather than incorporated by reference)."""
+    anchors = list(EXHIBIT_ANCHOR_RE.finditer(txt))
+    out = []
+    for i, m in enumerate(anchors):
+        start = m.end()
+        end = min(start + 500, anchors[i + 1].start() if i + 1 < len(anchors) else start + 500)
+        block = txt[start:end]
+        table_cite = EXHIBIT_TABLE_CITE_RE.search(block)
+        prose_cite = EXHIBIT_PROSE_CITE_RE.search(block)
+        prose_period = EXHIBIT_PROSE_PERIOD_CITE_RE.search(block)
+        filed_here = EXHIBIT_FILED_HERE_RE.search(block)
+        candidates = [c for c in (table_cite, prose_cite, prose_period, filed_here) if c]
+        if not candidates:
+            continue
+        first = min(candidates, key=lambda c: c.start())
+        desc = block[:first.start()]
+        if not DEBT_EXHIBIT_KEYWORDS_RE.search(desc):
+            continue
+        own = m.group(1)
+        if first is table_cite:
+            date_m = EXHIBIT_CITE_DATE_RE.search(block, table_cite.end())
+            out.append({"own": own, "ref_form": table_cite.group(1).upper(),
+                        "ref_exhibit": table_cite.group(2),
+                        "ref_date": _parse_cite_date(date_m.group(0)) if date_m else None,
+                        "by": "filing_date"})
+        elif first is prose_cite:
+            out.append({"own": own, "ref_form": prose_cite.group(2).upper(),
+                        "ref_exhibit": prose_cite.group(1),
+                        "ref_date": _parse_cite_date(prose_cite.group(3)), "by": "filing_date"})
+        elif first is prose_period:
+            out.append({"own": own, "ref_form": prose_period.group(2).upper(),
+                        "ref_exhibit": prose_period.group(1),
+                        "ref_date": _parse_cite_date(prose_period.group(3)), "by": "period_date"})
+        else:  # filed_here
+            out.append({"own": own, "ref_form": None, "ref_exhibit": None, "ref_date": None,
+                        "by": "filed_here"})
+    return out
+
+
+def resolve_exhibit_filing(rec, ref):
+    """A debt_exhibit_refs() row -> (form, filingDate, accessionNumber) of the filing that
+    actually carries the exhibit, searched in the submissions API's `recent` window. None if
+    unresolved (older than the recent window, or the citation didn't carry a usable date)."""
+    if ref["by"] == "filed_here" or not ref.get("ref_date"):
+        return None
+    key = "filingDate" if ref["by"] == "filing_date" else "reportDate"
+    matches = [(f, d, a) for f, d, a in zip(rec["form"], rec[key], rec["accessionNumber"])
+               if f == ref["ref_form"] and d == ref["ref_date"]]
+    if len(matches) != 1:
+        return None
+    f, _, a = matches[0]
+    fd = rec["filingDate"][rec["accessionNumber"].index(a)]
+    return f, fd, a
+
 # WALL-CLOCK BUDGET (dossier.py-153, coo 2026-09-06 / numbers 2026-09-08): vp.py wraps
 # the dossier stage in the SAME 900s hard subprocess kill that motivated
 # refresh_cards.py-137's BUDGET_S — the exhibit-fetch loop below is the unbounded part
@@ -83,8 +180,9 @@ EXHIBIT_TYPE_RE = re.compile(r"^EX-99(\.\d+)?$", re.I)
 BUDGET_S = 650
 
 
-def list_exhibits(cik, acc):
-    """EX-99.x exhibits in a filing's index page: [(type, document_filename), ...]."""
+def list_exhibits(cik, acc, type_re=EXHIBIT_TYPE_RE):
+    """Exhibits matching type_re in a filing's index page: [(type, document_filename), ...].
+    Default EXHIBIT_TYPE_RE (EX-99.x); pass EX10_TYPE_RE for a debt-exhibit lookup."""
     url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{acc}-index.htm"
     try:
         idx = get(url)
@@ -94,7 +192,7 @@ def list_exhibits(cik, acc):
     for row in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", idx):
         cells = [htmllib.unescape(re.sub(r"<[^>]+>", "", c)).strip()
                  for c in re.findall(r"(?is)<td[^>]*>(.*?)</td>", row)]
-        if len(cells) >= 4 and EXHIBIT_TYPE_RE.match(cells[3]):
+        if len(cells) >= 4 and type_re.match(cells[3]):
             out.append((cells[3].upper(), cells[2]))
     return out
 FACT_TAGS = {
@@ -198,17 +296,68 @@ def build(tk, cik_override=None):
         (d / "filings" / name).write_text(txt)
         f["file"], f["chars"] = f"filings/{name}", len(txt)
 
-        if f["form"] not in EXHIBIT_FORMS:
+        if f["form"] not in EXHIBIT_FORMS and f["form"] not in ("10-K", "10-Q"):
             continue
         if budget_tripped or time.time() - t0 > BUDGET_S:
             budget_tripped = True
             f["exhibits_skipped"] = f"BUDGET ({BUDGET_S}s) tripped before exhibits were enumerated (dossier.py-153)"
             continue
-        for ex_type, ex_doc in list_exhibits(cik, f["acc"]):
-            if ex_doc == f["doc"]:
-                continue  # already fetched as the primary document
-            ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{ex_doc}"
-            ex = {"form": f["form"], "date": f["date"], "acc": f["acc"], "doc": ex_doc, "exhibit": ex_type}
+
+        if f["form"] in EXHIBIT_FORMS:
+            for ex_type, ex_doc in list_exhibits(cik, f["acc"]):
+                if ex_doc == f["doc"]:
+                    continue  # already fetched as the primary document
+                ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{ex_doc}"
+                ex = {"form": f["form"], "date": f["date"], "acc": f["acc"], "doc": ex_doc, "exhibit": ex_type}
+                try:
+                    ex_txt = strip_html(get(ex_url))
+                except Exception as e:
+                    ex["error"] = str(e)[:80]
+                    extra.append(ex)
+                    continue
+                if len(ex_txt) > 3_000_000:
+                    ex_txt, ex["truncated"] = ex_txt[:3_000_000], True
+                ex_name = f"{f['date']}_{form_clean}_{ex_type.replace(' ', '')}.txt"
+                (d / "filings" / ex_name).write_text(ex_txt)
+                ex["file"], ex["chars"] = f"filings/{ex_name}", len(ex_txt)
+                extra.append(ex)
+                if time.time() - t0 > BUDGET_S:
+                    budget_tripped = True
+                    break
+            continue
+
+        # dossier.py-200: this 10-K/10-Q's own Exhibit Index may name a debt-note exhibit
+        # (Ex-10.x) that never appears in EXHIBIT_FORMS because it rides on a 10-K/10-Q, not
+        # an 8-K. Resolve each ref to the filing that actually carries it — the current
+        # accession if filed with this report, else whatever (form, date) the index cites —
+        # and fetch it the same way an EX-99.x exhibit lands above.
+        for ref in debt_exhibit_refs(txt):
+            if ref["by"] == "filed_here":
+                ex_form, ex_date, ex_acc, ex_num = f["form"], f["date"], f["acc"], ref["own"]
+            else:
+                resolved = resolve_exhibit_filing(rec, ref)
+                if not resolved:
+                    extra.append({"form": f["form"], "date": f["date"], "acc": f["acc"],
+                                   "exhibit": f"EX-{ref['ref_exhibit']}", "own": ref["own"],
+                                   "error": f"debt exhibit ref unresolved (wanted {ref['ref_form']} "
+                                            f"@ {ref['ref_date']}, {ref['by']}) — not in the "
+                                            "submissions API's recent window, or ambiguous"})
+                    continue
+                ex_form, ex_date, ex_acc = resolved
+                ex_num = ref["ref_exhibit"]
+            ex_form_clean = ex_form.replace(" ", "").replace("/", "")
+            ex_name = f"{ex_date}_{ex_form_clean}_EX-{ex_num}.txt"
+            if (d / "filings" / ex_name).exists():
+                continue  # already on disk from a prior build
+            found = next((doc for typ, doc in list_exhibits(cik, ex_acc, EX10_TYPE_RE)
+                          if typ.upper()[3:] == ex_num), None)
+            ex = {"form": ex_form, "date": ex_date, "acc": ex_acc, "exhibit": f"EX-{ex_num}",
+                  "cited_from": f["file"]}
+            if not found:
+                ex["error"] = f"EX-{ex_num} not found in {ex_acc}'s own index"
+                extra.append(ex)
+                continue
+            ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{ex_acc.replace('-', '')}/{found}"
             try:
                 ex_txt = strip_html(get(ex_url))
             except Exception as e:
@@ -217,9 +366,8 @@ def build(tk, cik_override=None):
                 continue
             if len(ex_txt) > 3_000_000:
                 ex_txt, ex["truncated"] = ex_txt[:3_000_000], True
-            ex_name = f"{f['date']}_{form_clean}_{ex_type.replace(' ', '')}.txt"
             (d / "filings" / ex_name).write_text(ex_txt)
-            ex["file"], ex["chars"] = f"filings/{ex_name}", len(ex_txt)
+            ex["doc"], ex["file"], ex["chars"] = found, f"filings/{ex_name}", len(ex_txt)
             extra.append(ex)
             if time.time() - t0 > BUDGET_S:
                 budget_tripped = True
@@ -333,6 +481,15 @@ def fincheck(d, card):
         "'noncurrent') line for the same column, copy the NET-OF-CURRENT-PORTION (noncurrent) "
         "figure, never the gross total — debt_lt excludes the current portion by definition. "
         "If every debt line shows a dash or the balance sheet has none, debt_lt is NOT_SHOWN. "
+        "A Chapter 11 filer may print a SUPPLEMENTAL 'Debtors-only' or 'Non-Debtor Affiliates' "
+        "cash-flow schedule (flagged by its own footnote, e.g. a superscript '(1)' next to the "
+        "caption, saying it EXCLUDES certain affiliates' cash flows) alongside the primary "
+        "Condensed Consolidated Statements of Cash Flows — that supplemental schedule's cfo/"
+        "capex figures are NOT the reported consolidated values; if the consolidated statement "
+        "isn't ALSO shown in these excerpts, answer NOT_SHOWN for that line rather than copying "
+        "the supplemental schedule's number (QVCG 2026-09-12: a Debtors-only table's $(2)M was "
+        "mistaken for consolidated CFO of $56M, a false fincheck MISMATCH against the correct "
+        "TTM-derived card figure). "
         "JSON {\"cash\":\"<digits or NOT_SHOWN>\",\"cfo\":\"...\",\"capex\":"
         "\"...\",\"debt_lt\":\"...\",\"scale\":\"thousands|millions|units|unknown\"}\n\n"
         + "\n\n[---]\n\n".join(wins), num_predict=500, think=True, job="dossier fincheck")
@@ -350,6 +507,18 @@ def fincheck(d, card):
         cardv = (F.get(key) or {}).get("value")
         if not raw or cardv is None:
             out["checks"][key] = {"status": "not_compared", "doc_raw": v.get(key), "card": cardv}
+            continue
+        if (F.get(key) or {}).get("source") == "MANUAL — PM-verified":
+            # a MANUAL figure (fincard.py's MANUAL/manual_overrides.json) may be the SUM of
+            # two additive instruments quoted from two different lines (CVU: Line of credit
+            # 9,173,672 + Long-term debt net of current portion 9,578,051 = 18,751,723) —
+            # comparing it against whichever SINGLE line this extraction happened to read
+            # will always MISMATCH even though the card is right. The MANUAL entry already
+            # carries its own verbatim quote + doc; that IS the verification, so this check
+            # defers to it instead of re-flagging a sum against one of its addends.
+            out["checks"][key] = {"status": "manual", "doc_raw": v.get(key), "card": cardv,
+                                  "note": "card figure is MANUAL (PM-verified, quoted) — not "
+                                          "re-validated against this single-line extraction"}
             continue
         if raw not in txt_digits:
             out["checks"][key] = {"status": "extraction_unverified", "doc_raw": v.get(key),

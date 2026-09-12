@@ -132,6 +132,31 @@ def _trading_days_since(iso_ts):
     return days
 
 
+def stale_quote(q):
+    """Is this quote describing a session other than today's?
+
+    Finnhub's `c` is the LAST trade price, so outside the session it is the PRIOR close and
+    `t` still carries the prior session's timestamp (verified 2026-09-12T08:17:20Z: TLS
+    c=3.95 pc=4.68 t=1789156800 -> 2026-09-11T20:00:00Z). Cron is `*/5 13-20 * * 1-5` UTC
+    and the regular session opens at 13:30Z, so SIX runs a day land pre-open on a stale
+    quote. Rule 1 has guarded this since triggers.py-074 (the TLS +8.6% re-fire 30 min
+    before the 2026-08-28 open); rules 1b and 9 read the same field and did not, which is
+    worse than a duplicate because alert() burns the day's dedupe key on the stale fire and
+    then stays silent through the real intraday crossing. One predicate, used by all three
+    (proof: journal/ops/2026-09-12_hunt_preopen_level_and_buybelow_repro.py).
+
+    Missing `t` is NOT treated as stale — Finnhub has omitted it, and a rule that goes dark
+    on a missing field is the silent-filter failure this engine keeps being bitten by."""
+    t = q.get("t")
+    if not t:
+        return False
+    try:
+        return dt.datetime.fromtimestamp(t, dt.timezone.utc).date() != \
+            dt.datetime.now(dt.timezone.utc).date()
+    except Exception:
+        return False
+
+
 def cum_distributions(c, tk, as_of=None):
     """Total $/share tk has distributed with ex_date <= as_of (default today). Used to keep
     a position's cost basis and a thesis's implied value comparable to a post-distribution
@@ -260,8 +285,7 @@ def run():
         # stale quote is yesterday's already-alerted move, re-priced. The per-day dedup key
         # doesn't catch this because a new calendar day is exactly what lets it back in
         # (triggers.py-074, the TLS +8.6% re-fire 30 min before the 2026-08-28 open).
-        qt = q.get("t")
-        if qt and dt.datetime.fromtimestamp(qt, dt.timezone.utc).date() != dt.datetime.now(dt.timezone.utc).date():
+        if stale_quote(q):
             continue
         # Finnhub's pc (prior close) predates today's distribution; price doesn't. Add today's
         # distribution back before measuring the move, else a scheduled cash-out reads as a drop.
@@ -281,7 +305,9 @@ def run():
     for tk, lv in (c.get("price_levels") or {}).items():
         q = feeds.fh_get("quote", symbol=tk) or {}
         price, prev = q.get("c"), q.get("pc")
-        if not price:
+        # Same prior-session trap rule 1 guards above: pre-open, `c` is yesterday's close,
+        # and a fire here burns seen["level:<tk>:<side>"] for the whole calendar day.
+        if not price or stale_quote(q):
             continue
         hit = None
         if lv.get("above") and price >= lv["above"]:
@@ -509,7 +535,9 @@ def run():
         tk = lf.parent.parent.name.rsplit("-", 1)[-1].upper()
         q = feeds.fh_get("quote", symbol=tk) or {}
         price = q.get("c")
-        if not price or price > buy_below * 1.02:
+        # Pre-open, `c` is the prior close; alerting on it consumes seen["buybelow:<tk>"]
+        # and silences the real intraday touch of the level (2026-09-11T06:57:21Z KT).
+        if not price or stale_quote(q) or price > buy_below * 1.02:
             continue
         ctx, book = impact(tk, price, q.get("pc") or price)
         fired += alert(state, c, f"buybelow:{tk}", "buy-below alert", tk,

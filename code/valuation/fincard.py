@@ -1475,6 +1475,27 @@ FLOW_TAG_EXCLUDE = {
     "XPOF": {"revenue": {"Revenues"}},
 }
 
+MANUAL_OVERRIDES_FILE = ENGINE / "valuation" / "manual_overrides.json"
+
+
+def _manual_for(tk):
+    """MANUAL entries for tk: the hardcoded, curated dict above plus the JSON file the
+    `fincard.py manual` CLI subcommand writes (fincard.py-195 — a PM correction becomes a
+    scripted JSON write instead of a hand-edit to this 2,900-line module). Same fields,
+    same MANUAL contract: verbatim quote, document named, PM-verified. A JSON entry wins
+    over a hardcoded one for the same ticker+field, since it is the more recently keyed one;
+    in practice a field is keyed one place or the other, never both.
+    """
+    out = dict(MANUAL.get(tk.upper()) or {})
+    if MANUAL_OVERRIDES_FILE.exists():
+        try:
+            data = json.loads(MANUAL_OVERRIDES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        out.update(data.get(tk.upper()) or {})
+    return out
+
+
 # Temporary equity an issuer discloses on the FACE of its own balance sheet but tags under
 # a namespace none of MEZZANINE_TAGS or the NCI-backout (StockholdersEquityIncludingPortion...
 # / PartnersCapitalIncludingPortion...) can see — same "companyfacts drops the extension
@@ -1777,7 +1798,7 @@ def build(tk, cik_override=None):
     #   * applied ONLY where the XBRL pass produced nothing (a filing tag always wins)
     #   * every entry carries a verbatim quote + the document it came from
     #   * source is stamped MANUAL and a flag is raised on every card that uses one
-    for name, ov in (MANUAL.get(tk.upper()) or {}).items():
+    for name, ov in _manual_for(tk).items():
         if name not in FLOW:
             continue
         existing = F.get(name)
@@ -1929,7 +1950,7 @@ def build(tk, cik_override=None):
     # understatement risk as the bug this file exists to avoid. MANUAL is the existing,
     # narrower escape hatch (PM-verified, quoted, flagged) for exactly this shape; applied
     # to INSTANT concepts here for the first time, same rules as the FLOW version.
-    for name, ov in (MANUAL.get(tk.upper()) or {}).items():
+    for name, ov in _manual_for(tk).items():
         if name not in INSTANT:
             continue
         existing = F.get(name)
@@ -2077,6 +2098,28 @@ def build(tk, cik_override=None):
                              f"instead of using a stale companyfacts figure.")}
                 card.setdefault("rescued", []).append(
                     {"concept": "shares_out", "value": _val, "asof": _asof, "classes": _n})
+
+    # SOURCED OVERRIDE, shares_out (fincard.py-195/199): shares_out is not a FLOW/INSTANT
+    # concept — it comes off the dei fact directly, above — so it needs its own override
+    # point. Same additivity/staleness logic as the INSTANT block: a strictly newer manual
+    # figure wins (a post-emergence share count beating a pre-emergence dei tag, e.g. QVCG's
+    # dei value of 1 share stuck at its 2026-06-30 pre-reorg 10-Q); an equally-fresh XBRL
+    # figure is trusted over MANUAL.
+    _man_sh = _manual_for(tk).get("shares_out")
+    if _man_sh:
+        existing = F.get("shares_out")
+        if not existing or (existing.get("asof") or "") < (_man_sh.get("period_end") or ""):
+            F["shares_out"] = {"value": _man_sh["value"], "unit": "shares",
+                               "asof": _man_sh["period_end"],
+                               "tag": "MANUAL (not read by the XBRL pass)",
+                               "source": "MANUAL — PM-verified",
+                               "quote": _man_sh["quote"], "doc": _man_sh["doc"],
+                               "entered": _man_sh["entered"], "formula": _man_sh.get("formula")}
+            card["flags"].append(
+                f"shares_out: MANUAL figure — not read by the XBRL pass, keyed from the "
+                f"printed statement ({_man_sh['doc']}, entered {_man_sh['entered']}). Quote "
+                f"on the figure. Market cap and EV inherit this: verify the quote before "
+                f"quoting the derivation.")
 
     # preferred liquidation preference — COMMON book value must exclude it (BOOK.md
     # fincard defect (b), 2026-08-13: ARI printed BVPS 9.79 against 8.47 true, because
@@ -2878,10 +2921,81 @@ def build(tk, cik_override=None):
     return card
 
 
+def _manual_cli(a):
+    """fincard.py-195: a coded route for a PM dollar/share-count correction into MANUAL,
+    so the fix is a scripted JSON write (data/manual_overrides.json — a companion to this
+    module, always in sync with the build) instead of a hand-edit to a 2,900-line module.
+    usage: fincard.py manual TICKER FIELD VALUE --period-end YYYY-MM-DD --quote Q --doc D
+                              [--period P] [--formula F]
+    """
+    if len(a) < 4:
+        sys.exit("usage: fincard.py manual TICKER FIELD VALUE --period-end YYYY-MM-DD "
+                  "--quote Q --doc D [--period P] [--formula F]")
+    tk_, field, value_s, rest = a[1].upper(), a[2], a[3], a[4:]
+
+    def opt(name, required=True, default=None):
+        if f"--{name}" in rest:
+            return rest[rest.index(f"--{name}") + 1]
+        if required:
+            sys.exit(f"manual: --{name} is required")
+        return default
+
+    period_end = opt("period-end")
+    quote = opt("quote")
+    doc = opt("doc")
+    period = opt("period", required=False) or f"instant {period_end}"
+    formula = opt("formula", required=False)
+    known = set(FLOW) | set(INSTANT) | {"shares_out"}
+    if field not in known:
+        sys.exit(f"manual: unknown field {field!r} — not in FLOW, INSTANT, or shares_out")
+    try:
+        value = float(value_s) if "." in value_s else int(value_s)
+    except ValueError:
+        sys.exit(f"manual: {value_s!r} is not a number")
+
+    data = {}
+    if MANUAL_OVERRIDES_FILE.exists():
+        try:
+            data = json.loads(MANUAL_OVERRIDES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    entry = {"value": value, "period": period, "period_end": period_end,
+             "quote": quote, "doc": doc, "entered": dt.date.today().isoformat()}
+    if formula:
+        entry["formula"] = formula
+    data.setdefault(tk_, {})[field] = entry
+    MANUAL_OVERRIDES_FILE.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+    print(f"manual: {tk_}.{field} = {value:,} ({period_end}) -> {MANUAL_OVERRIDES_FILE}")
+
+    def fig(c, name):
+        v = (c or {}).get("derived", {}).get(name) or (c or {}).get("figures", {}).get(name)
+        return v.get("value") if isinstance(v, dict) else None
+
+    card_path = ENGINE / "agent" / "names" / tk_ / "fincard.json"
+    before = json.loads(card_path.read_text()) if card_path.exists() else None
+    card = build(tk_)
+    if card_path.parent.exists():
+        card_path.write_text(json.dumps(card, indent=1))
+        print(f"manual: rebuilt {card_path}")
+    changed = False
+    for k in ("shares_out", "market_cap", "ev", "net_cash", "debt_lt", "total_debt"):
+        b, n = fig(before, k), fig(card, k)
+        if b != n:
+            changed = True
+            print(f"  {k}: {b!r} -> {n!r}")
+    if not changed:
+        print("  (no figures on the standard watch list changed — inspect the card directly)")
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if not a:
-        sys.exit("usage: fincard.py TICKER [--cik N] [--out FILE]")
+        sys.exit("usage: fincard.py TICKER [--cik N] [--out FILE]\n"
+                  "       fincard.py manual TICKER FIELD VALUE --period-end YYYY-MM-DD "
+                  "--quote Q --doc D [--period P] [--formula F]")
+    if a[0] == "manual":
+        _manual_cli(a)
+        sys.exit(0)
     cik = a[a.index("--cik") + 1] if "--cik" in a else None
     card = build(a[0], cik)
     js = json.dumps(card, indent=1)
