@@ -190,6 +190,55 @@ def _last_scheduled(hour, minute, weekdays, slack_h=3):
     return None
 
 
+
+def proofs(file_ask=True):
+    """Run the journal/ops proof corpus and report its verdict (ask coo-194).
+
+    The corpus IS the evidence base — the reproduction behind a closed ask, kept so the
+    close can be re-checked — and until 2026-09-12 nothing in this codebase ran it. It was
+    exercised only when a COO typed the loop by hand, and both times one did it found rot
+    (4 of 29 on 09-06, 6 of 29 on 09-10, two of which had never run a single assertion).
+    That is the guardrail-inert rule: a guardrail with no check proving it is armed
+    manufactures confidence. This is the check that arms it.
+
+      exit 0  every proof asserted and passed
+      exit 1  FAIL   — a live defect, or a proof asserting something no longer true
+      exit 2  CANNOT-RUN — the proof never reached an assertion, so its subject is UNGUARDED
+    """
+    runner = HERE / "journal" / "ops" / "run_proofs.py"
+    if not runner.exists():
+        return {"ok": False, "rc": None, "summary": "run_proofs.py missing"}
+    try:
+        r = subprocess.run(["python3", str(runner), "--quiet"], cwd=str(HERE),
+                           capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": 2, "summary": "run_proofs.py itself timed out (>1800s)"}
+    out = (r.stdout or "") + (r.stderr or "")
+    summary = next((l for l in reversed(out.splitlines()) if "proof(s):" in l), out[-200:])
+    bad = [l.strip() for l in out.splitlines()
+           if l.startswith("FAIL") or l.startswith("CANNOT-RUN")]
+    res = {"ok": r.returncode == 0, "rc": r.returncode,
+           "summary": summary.strip(), "bad": bad[:12]}
+    if r.returncode != 0 and file_ask:
+        try:
+            sys.path.insert(0, str(HERE))
+            import asks
+            already = any(a["status"] == "open" and a.get("by") == "ops-proofs"
+                          for a in asks.load()["asks"])
+            if not already:
+                asks.add("coo", "journal/ops proof corpus is not green: " + res["summary"]
+                         + " — " + "; ".join(b[:70] for b in res["bad"][:4]),
+                         by="ops-proofs", about="_engine/agent/journal/ops",
+                         why="exit 1 = a live defect or a proof asserting something no "
+                             "longer true; exit 2 = the proof never reached an assertion, "
+                             "so its subject has been UNGUARDED for as long as it has been "
+                             "broken. Re-file each one against the role that owns its "
+                             "subject rather than re-diagnosing it in the COO report.")
+        except Exception:
+            pass
+    return res
+
+
 def verify():
     """Did every scheduled role FINISH — i.e. leave its dated report? A missing one gets a
     phone alert and an ask to the COO (the asks channel, not a bespoke ledger, so C15 ages
@@ -259,7 +308,19 @@ def verify():
         subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
                         "Ops role missed its run",
                         ("; ".join(misses))[:190]], check=False)
-    print(json.dumps({"ok": not misses, "misses": misses}))
+    # The proof corpus (ask coo-194): a FAIL/CANNOT-RUN is a finding with an owner, not a
+    # line someone might notice. Non-fatal to verify's own exit code — a rotten proof is
+    # not a missed report — but it files its own ask and says so here.
+    pf = {}
+    try:
+        pf = proofs()
+        print("proofs: " + str(pf.get("summary") or "?") + f" (exit {pf.get('rc')})")
+        for b in pf.get("bad", []):
+            print("  " + b[:140])
+    except Exception as e:
+        print(f"proofs: DID NOT RUN ({type(e).__name__}: {e}) — itself a finding")
+    print(json.dumps({"ok": not misses, "misses": misses,
+                      "proofs_ok": bool(pf.get("ok")), "proofs_rc": pf.get("rc")}))
     return 0 if not misses else 1
 
 
@@ -270,6 +331,13 @@ def launch(role, now=False):
     role = ROLE_ALIASES.get(role, role)
     if role not in PROMPTS:
         return {"ok": False, "msg": f"unknown ops role {role}"}
+    try:   # the lab's service level (mode.py, 2026-09-12): freeze drops hunt + build, hibernate drops all
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+        if not _labmode.allows(role):
+            return {"ok": False, "skipped": True, "msg": f"lab mode {_labmode.lab()}: ops {role} does not run (mode.py)"}
+    except ImportError:
+        pass
     if not now:
         sys.path.insert(0, str(ENGINE))
         import claudeq

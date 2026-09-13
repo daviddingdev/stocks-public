@@ -690,6 +690,18 @@ def _net_guard():
         abort(403)
     if not any(ip in n for n in _ALLOWED_NETS):
         abort(403)
+    # Mutations are POST-only and same-origin (REVIEW-PLAN §1E, 2026-09-12). Twelve routes used
+    # to launch Claude sessions or move directories on a GET — one <img src> on any tailnet page
+    # could fire them. A browser sends Origin / Sec-Fetch-Site on every cross-site POST, so a
+    # mismatch is refused; our own fetch() helper (`post()` in the JS) is same-origin by
+    # construction. curl from the box passes (no Origin, no Sec-Fetch-Site) — that is the CLI.
+    if request.method == "POST" and request.path.startswith("/api/"):
+        origin = request.headers.get("Origin")
+        if origin and origin.split("//", 1)[-1].rstrip("/") != request.host:
+            abort(403)
+        sfs = request.headers.get("Sec-Fetch-Site")
+        if sfs and sfs not in ("same-origin", "none"):
+            abort(403)
 
 FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E"
            "%3Crect width='20' height='20' rx='4' fill='%232563eb'/%3E"
@@ -1618,7 +1630,7 @@ def _sync_accounts(st, qp, accts, bdir, watch):
             wf.write_text(txt + "\n".join(new) + "\n")
     return {"synced": sorted(holdings.keys()), "warn": warn}
 
-@app.route("/api/aggregatora/sync")
+@app.route("/api/aggregatora/sync", methods=["POST"])
 def st_sync():
     st = _st()
     if not st:
@@ -2191,7 +2203,7 @@ def research_update_status():
     status, msg = _run_status(runner.update_log(tk))
     return jsonify({"done": False, "status": status, "msg": msg})
 
-@app.route("/api/recommend")
+@app.route("/api/recommend", methods=["POST"])
 def api_recommend():
     r = runner.launch_rec()
     if not r.get("ok"):
@@ -2211,7 +2223,7 @@ def recommend_status():
     status, msg = _run_status(runner.rec_log())
     return jsonify({"done": False, "status": status, "msg": msg})
 
-@app.route("/api/board/refresh")
+@app.route("/api/board/refresh", methods=["POST"])
 def board_refresh():
     try:
         py = str(ROOT / "_engine/.venv/bin/python")
@@ -2245,7 +2257,7 @@ def api_feedback():
         FEEDBACK.write_text(json.dumps(items, indent=2))
     return jsonify(items)
 
-@app.route("/api/research/archive")
+@app.route("/api/research/archive", methods=["POST"])
 def api_archive():
     tk = request.args.get("ticker", "").upper().strip()
     cf = company_folder(tk)
@@ -3004,7 +3016,7 @@ function readBook(){var b=document.getElementById('bookctx');BOOK=b?(b.dataset.b
 (function(){var _f=window.fetch;window.fetch=function(u,o){
  if(typeof u==='string'&&u.indexOf('/api/')===0&&BOOK!=='brokera'&&u.indexOf('book=')<0)u+=(u.indexOf('?')>=0?'&':'?')+'book='+encodeURIComponent(BOOK);
  return _f.call(window,u,o);};})();
-function syncBrokerage(){toast('Syncing '+(BOOK==='brokera'?'J.P. Morgan':BOOK.toUpperCase())+'…');fetch('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
+function syncBrokerage(){toast('Syncing '+(BOOK==='brokera'?'J.P. Morgan':BOOK.toUpperCase())+'…');post('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
  if(d.ok){var got=(d.books&&d.books[BOOK])||d.synced;toast(d.warn?('⚠ '+d.warn):((got&&got.length)?('Synced '+got.join(', ')):(d.msg||'Synced')));nav(BOOK_HOME,false);}else{toast(d.msg||'sync failed');}}).catch(function(){toast('sync error');});}
 /* auto-sync: when the dashboard is opened and the brokerage snapshot is >15 min old,
    sync once per tab in the background and refresh the numbers when done */
@@ -3014,11 +3026,16 @@ function autoSync(){
  if(sessionStorage.getItem('autosynced'))return;
  sessionStorage.setItem('autosynced','1');
  var n=document.getElementById('syncnote');if(n)n.textContent='· syncing now…';
- fetch('/api/aggregatora/sync').then(function(r){return r.json()}).then(function(d){
+ post('/api/aggregatora/sync').then(function(r){return r.json()}).then(function(d){
   if(d.ok&&!d.skipped){SYNCED=Date.now()/1000;toast('Brokerage synced');
    if(location.pathname==='/')nav('/',false);}
   else if(n)n.textContent='';
  }).catch(function(){if(n)n.textContent='';});}
+function post(u){return fetch(u,{method:'POST',headers:{'X-Requested-With':'fetch'}})}
+/* JSON-body POST (same-origin by construction, like post()): the asks-answer route and any
+   future mutation that carries a payload. fetch() with a JSON body needs the content-type
+   set explicitly or Flask's get_json() sees nothing. */
+function postJson(u,body){return fetch(u,{method:'POST',headers:{'X-Requested-With':'fetch','Content-Type':'application/json'},body:JSON.stringify(body||{})})}
 function toast(msg){var t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);
  requestAnimationFrame(function(){t.classList.add('show')});setTimeout(function(){t.classList.remove('show');setTimeout(function(){t.remove()},260)},1500);}
 /* The sidebar is rendered OUTSIDE #main and nav() only swaps #main, so it was built
@@ -3047,7 +3064,7 @@ function removeWatch(e,tk){if(e){e.stopPropagation();e.preventDefault();}
   toast(tk+' removed from watchlist');});}
 function archiveResearch(e,tk){e.stopPropagation();
  if(!confirm('Archive the '+tk+' research folder? It moves to _archive/ (reversible by moving it back).'))return;
- fetch('/api/research/archive?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
+ post('/api/research/archive?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
   toast(d.msg||'done');if(d.ok){refreshSide();nav('/ticker/'+tk,false);}
  }).catch(function(){toast('error');});}
 function fbSend(e){e.preventDefault();var t=document.getElementById('fbmsg'),v=t.value.trim();if(!v)return false;
@@ -3327,7 +3344,7 @@ function checkResearch(){var box=document.getElementById('research-status');if(!
   if(s.status==='idle'){box.style.display='none';return;}box.style.display='';
   renderResearch(tk,s,box,true);
  }).catch(function(){});}
-function boardRefresh(){toast('Refreshing candidate board…');fetch('/api/board/refresh').then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');});}
+function boardRefresh(){toast('Refreshing candidate board…');post('/api/board/refresh').then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');});}
 var TX_LABEL={BUY:'Buy',SELL:'Sell',DIVIDEND:'Dividend',INTEREST:'Interest',CONTRIBUTION:'Deposit',
  WITHDRAWAL:'Withdrawal',TRANSFER:'Transfer',FEE:'Fee',REINVEST:'Reinvest',REI:'Reinvest'};
 function loadTransactions(){var t=document.getElementById('txtable');if(!t)return;var tb=t.tBodies[0];
@@ -3350,20 +3367,26 @@ function loadTransactions(){var t=document.getElementById('txtable');if(!t)retur
   }).join('');paginate(t,10);
  }).catch(function(){});}
 function agentSync(){toast('Syncing agentic account…');
- fetch('/api/agent/sync').then(function(r){return r.json()}).then(function(d){
+ post('/api/agent/sync').then(function(r){return r.json()}).then(function(d){
   toast(d.msg||(d.ok?'Sync launched — refreshes in ~1 min':'failed'));
   if(d.ok)setTimeout(function(){if(location.pathname==='/agent')nav('/agent',false);},70000);
  }).catch(function(){toast('error');});}
 function agentTrade(){toast('Launching decision session…');
- fetch('/api/agent/trade').then(function(r){return r.json()}).then(function(d){
+ post('/api/agent/trade').then(function(r){return r.json()}).then(function(d){
   toast(d.msg||(d.ok?'Decision session running — check the journal in a few minutes':'failed'));
  }).catch(function(){toast('error');});}
+function agentPause(){var r=prompt('Pause new orders — reason (only you can clear it):');if(!r)return;
+ post('/api/agent/pause?reason='+encodeURIComponent(r)).then(function(x){return x.json()}).then(function(d){toast(d.msg||'paused');nav(location.pathname,false);}).catch(function(){toast('error');});}
+function agentUnpause(){if(!confirm('Clear PAUSED and allow new orders?'))return;
+ post('/api/agent/unpause').then(function(x){return x.json()}).then(function(d){toast(d.msg||'cleared');nav(location.pathname,false);}).catch(function(){toast('error');});}
+function labMode(m){if(!confirm('Set the lab to '+m.toUpperCase()+'?'))return;
+ post('/api/agent/mode?lab='+m).then(function(x){return x.json()}).then(function(d){toast(d.msg||m);nav(location.pathname,false);}).catch(function(){toast('error');});}
 function agentFeeds(){toast('Refreshing intel feed…');
- fetch('/api/agent/feeds').then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');
+ post('/api/agent/feeds').then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');
   if(d.ok)setTimeout(function(){if(location.pathname==='/agent')nav('/agent',false);},75000);
  }).catch(function(){toast('error');});}
 function genRec(){toast('Generating recommendation…');
- fetch('/api/recommend').then(function(r){return r.json()}).then(function(d){
+ post('/api/recommend').then(function(r){return r.json()}).then(function(d){
   var box=document.getElementById('rec-status');
   if(!d.ok){if(box){box.style.display='';box.className='rstatus err';box.textContent=d.msg||'Launch failed.';}else toast(d.msg||'failed');return;}
   if(box){box.style.display='';box.className='rstatus';box.innerHTML='<span class=spin></span> Reading the portfolio and writing today’s recommendation…';pollRec(box);}

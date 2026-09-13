@@ -38,6 +38,39 @@ LOGS = ENGINE / "logs"
 # come up missing, drop MCP_RESTRICT from the command to fall back to full user scope.
 MCP_RESTRICT = ["--strict-mcp-config", "--mcp-config", str(ENGINE / "config" / "agent_mcp.json")]
 
+# TOOL DENYLIST (REVIEW-PLAN §1A sprint 0, 2026-09-12). Until this line existed the PM session
+# held EVERY write tool the broker exposes — options, crypto, exercise, cancel, alerts,
+# scans — with only MANDATE prose ("cash equities only") between it and them. Now the CLI
+# refuses those calls before the model sees them. The equity write set stays open while
+# the gateway runs in SHADOW (config/exec.json mode=shadow: the PM files an intent, places
+# itself with ref_id=<intent_id>, links the broker id); at cut-over (mode=live) it closes
+# too and execute.py is the only writer. Sync/fallback sessions never hold any write tool.
+_RH = "mcp__brokerb-trading__"
+WRITE_TOOLS_EQUITY = [_RH + t for t in ("place_equity_order", "cancel_equity_order")]
+WRITE_TOOLS_OTHER = [_RH + t for t in (
+    "place_option_order", "review_option_order", "cancel_option_order", "exercise_option",
+    "cancel_option_exercise", "place_crypto_order", "preview_crypto_order", "cancel_crypto_order",
+    "create_alert", "update_alert", "delete_alert", "mark_alerts_read",
+    "create_scan", "update_scan_config", "update_scan_filters",
+    "create_watchlist", "update_watchlist", "add_to_watchlist", "remove_from_watchlist",
+    "add_option_to_watchlist", "remove_option_from_watchlist", "follow_watchlist", "unfollow_watchlist")]
+
+
+def gateway_mode():
+    try:
+        return json.loads((ENGINE / "config" / "exec.json").read_text()).get("mode", "shadow")
+    except Exception:
+        return "shadow"
+
+
+def tool_denylist(mode):
+    """The --disallowedTools list for a session of this mode. Trade sessions keep the equity
+    write pair only while the gateway is in shadow; everything else is closed everywhere."""
+    deny = list(WRITE_TOOLS_OTHER)
+    if mode != "trade" or gateway_mode() == "live":
+        deny += WRITE_TOOLS_EQUITY
+    return ["--disallowedTools", ",".join(deny)]
+
 SYNC_PROMPT = f"""READ-ONLY sync of the BrokerB AGENTIC account (the account with agentic=Yes; never any other).
 Do NOT place, modify, or cancel any orders. Using the brokerb-trading MCP tools:
 1) get_accounts + get_portfolio for the agentic account -> write {DATA}/portfolio.json as:
@@ -53,11 +86,12 @@ Do NOT place, modify, or cancel any orders. Using the brokerb-trading MCP tools:
 # The PM's instructions live in prompts/pm.md (decision-core, David-owned) and are
 # rendered by prompts.py at launch — see prompts.py for why they are a file and not a
 # string here. A placeholder that does not resolve fails the launch loudly.
-def trade_prompt():
+def trade_prompt(run_id="unrecorded"):
     """The PM's instructions plus its reflections (REFLECTION.md): the lessons its own
     evaluators and it wrote after the last session. Reflection rendering fails OPEN with a
     visible marker — a session without its lessons is worse than one with them, but a
-    trading session that cannot start because a ledger is unreadable is worse still."""
+    trading session that cannot start because a ledger is unreadable is worse still.
+    `run_id` is the run record's id (runlog.py) so every decision card can carry it."""
     import prompts
     try:
         import reflect
@@ -66,7 +100,7 @@ def trade_prompt():
         block = (f"_reflect.py could not render your reflections ({type(e).__name__}: {e}). You are "
                  "running WITHOUT last session's lessons — say so in your session log and open an "
                  "ask against _engine/agent/reflect.py._")
-    return prompts.render("pm", REFLECTIONS=block)
+    return prompts.render("pm", REFLECTIONS=block, RUN_ID=run_id)
 
 
 # NYSE full-day closures for 2026 — the trade cron does not know a holiday from a Monday.
@@ -105,6 +139,16 @@ def strategy_prompt(today=None):
 def launch(mode, attempt=1, model_idx=0, now=False):
     if mode == "trade" and dt.date.today().isoformat() in MARKET_HOLIDAYS:
         return {"ok": False, "msg": f"market holiday {dt.date.today()} — no trade session (loop.py MARKET_HOLIDAYS)"}
+    if mode in ("trade", "strategy"):
+        # the lab's service level (mode.py, 2026-09-12): hibernate = one PM session a week
+        try:
+            sys.path.insert(0, str(ENGINE))
+            import mode as _labmode
+            job = "strategy" if mode == "strategy" else ("pm_daily" if dt.date.today().weekday() != 0 else "pm_weekly")
+            if not _labmode.allows(job):
+                return {"ok": False, "msg": f"lab mode {_labmode.lab()}: {job} does not run (mode.py) — no session"}
+        except ImportError:
+            pass
     if mode == "strategy" and not now:
         # Filed with the queue (claudeq), like every other Claude job on the desk — the PM
         # itself may call this to give itself another session (David 2026-09-04: "full freedom").
@@ -146,8 +190,10 @@ def launch(mode, attempt=1, model_idx=0, now=False):
     JOURNAL.mkdir(exist_ok=True)
     (JOURNAL / "sessions").mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
+    import runlog   # run records (REVIEW-PLAN §1B): journal/runs/<run_id>.jsonl
+    run_id = runlog.new_run_id()
     try:
-        prompt = SYNC_PROMPT if mode == "sync" else strategy_prompt() if mode == "strategy" else trade_prompt()
+        prompt = SYNC_PROMPT if mode == "sync" else strategy_prompt() if mode == "strategy" else trade_prompt(run_id)
     except Exception as e:   # a prompt with a hole is not a session; say so, do not launch
         return {"ok": False, "msg": f"prompt did not render: {type(e).__name__}: {e}"}
     if mode == "trade":
@@ -171,7 +217,7 @@ def launch(mode, attempt=1, model_idx=0, now=False):
         mcp = ["--strict-mcp-config", "--mcp-config", str(nomcp)] if nomcp.exists() else MCP_RESTRICT
     else:
         mcp = MCP_RESTRICT
-    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + mcp
+    cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + mcp + tool_denylist(mode)
     models = runner.job_models("pm")
     if mode in ("trade", "strategy"):
         cmd += ["--model", models[min(model_idx, len(models) - 1)]]
@@ -193,6 +239,8 @@ def launch(mode, attempt=1, model_idx=0, now=False):
         claudeq = None
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
                             start_new_session=True, env=runner.clean_env())
+    if mode in ("trade", "strategy"):   # the `launched` event: model, hashes of what it read, data freshness
+        runlog.launched(run_id, mode, models[min(model_idx, len(models) - 1)], cmd, prompt, pid=proc.pid)
     if claudeq is not None:
         try:
             if mode != "strategy":     # a strategy session is dispatched BY the queue, which holds the slot for it
@@ -216,9 +264,11 @@ def launch(mode, attempt=1, model_idx=0, now=False):
                          cwd=str(HERE), start_new_session=True,
                          stdout=open(LOGS / "agent_sync_follow.log", "a"),
                          stderr=subprocess.STDOUT)
+        # …then, 30 min after the pid is gone, `orphan` if reconcile never wrote its event
         subprocess.Popen(["bash", "-c",
                           f"while kill -0 {proc.pid} 2>/dev/null; do sleep 20; done; "
-                          f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1"],
+                          f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1; "
+                          f"sleep {runlog.ORPHAN_AFTER_S}; python3 {HERE}/runlog.py orphan {run_id} >> {LOGS}/agent_reconcile.log 2>&1"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if mode == "strategy":
         # same post-session accounting as a trade session (contract, reflect, learn, pmusage,
@@ -329,9 +379,19 @@ def reconcile():
     # blocking sync: broker truth into trades.json/portfolio.json — code first
     # (mcp_sync), claude session only as fallback (2026-08-13: this inner claude
     # sync was a shadow session after EVERY trade session — David saw the pile-up)
+    xr, cv = None, None   # gateway result + contract violations, for the run record below
     try:
         import mcp_sync
         mcp_sync.sync()
+        # the gateway ledger: advance every open intent from broker truth (REVIEW-PLAN §1A);
+        # clears an auto-tripped PAUSED once nothing is unresolved, never a David-set one
+        try:
+            import execute
+            xr = execute.reconcile()
+            print(f"gateway reconcile: {xr}")
+        except Exception as e:
+            xr = f"skipped: {type(e).__name__}: {str(e)[:100]}"
+            print(f"gateway reconcile skipped: {type(e).__name__}: {str(e)[:100]}")
     except Exception as e:
         print(f"code-sync failed in reconcile ({str(e)[:100]}) — claude fallback")
         sys.path.insert(0, str(ENGINE))
@@ -421,12 +481,21 @@ def reconcile():
                 import notify as _n
                 _n.push("Stocks · agent CONTRACT",
                         "Agent desk contract violations:\n" + "\n".join(cv[:10]),
-                        tier="actionable")  # money-book invariants; default-tiered digest, held (08-31)
+                        tier="actionable", kind="blocking")  # money-book invariants; default-tiered digest, held (08-31)
             except Exception:
                 pass
         print(f"{now} contract: {len(cv)} violation(s)" + (" — " + "; ".join(cv[:4]) if cv else ""))
     except Exception as e:
         print(f"{now} contract check failed: {e}")
+    # truthful records (REVIEW-PLAN §1B): the run's `reconciled` event, then the decision cards
+    # into decisions.jsonl and the receipts join. Never fatal.
+    try:
+        import runlog, cards, receipts
+        cur = runlog.current() or {}
+        runlog.reconciled(cur.get("run_id", "unrecorded"), contract_violations=cv, gateway_reconcile=xr,
+                          unresolved=problems, cards=cards.collect(), receipts=receipts.build())
+    except Exception as e:
+        print(f"{now} records failed: {type(e).__name__}: {e}")
     # the reflection ledger (REFLECTION.md): evaluators -> findings, the PM's own
     # `## Reflection` -> lessons, strikes/absorb. Once per session file; never fatal.
     try:

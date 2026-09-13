@@ -403,6 +403,79 @@ def brief(stages=None):
 # The review's instructions are prompts/vp.md (PM-owned), rendered by prompts.py.
 
 
+
+def _review_slot_budget(timeout, analyst_est_min=25):
+    """(wait_seconds, deadline) for review()'s claudeq slot — a DEADLINE, not a fixed 90 min.
+
+    Ask vp.py-184. On 2026-09-08 the sweep ran long (three 900s dossier timeouts), review
+    reached claudeq.slot() at ~07:15Z, ops:numbers held the slot from 06:30Z for 135 min,
+    and slot()'s fixed timeout_s=5400 expired ONE MINUTE before numbers released. The stage
+    failed closed, the PM traded at 14:05Z on a brief with no VP review, and ops verify
+    reported `misses: []`. An ops session is ALLOWED 120-150 min, so a fixed 90-minute wait
+    is structurally shorter than a legitimate holder.
+
+    The real constraint is the trade session's 09:05-14:05Z usage lookback: the review must
+    FINISH before 09:05Z. So wait until (09:05Z - review timeout - the analyst's estimate),
+    which is the last instant starting is still useful, rather than an arbitrary 90 minutes.
+    Outside a weekday morning there is no band to beat and the old bound stands."""
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        import claudeq
+        band = (claudeq.CONFIG.get("band") if hasattr(claudeq, "CONFIG") else None) or [[9, 5]]
+        bh, bm = band[0]
+    except Exception:
+        bh, bm = 9, 5
+    if now.weekday() >= 5:                       # no trade session tomorrow morning
+        return 5400, None
+    deadline = now.replace(hour=bh, minute=bm, second=0, microsecond=0) \
+        - dt.timedelta(seconds=timeout) - dt.timedelta(minutes=analyst_est_min)
+    if deadline <= now:
+        return 0, deadline
+    return int(min((deadline - now).total_seconds(), 5 * 3600)), deadline
+
+
+
+
+def _record_gate_funnel():
+    """funnel_counts row for the gate stage — v3 §7's ">=3 gate passes" was the one quota
+    line with no counter behind it (the roster brief showed it as NO ROWS)."""
+    try:
+        g = _j(ENGINE / "research" / "_evidence" / "gate.json", {})
+        rows = g.get("names") or g.get("results") or g
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        if not isinstance(rows, list):
+            return
+        npass = sum(1 for r in rows if isinstance(r, dict)
+                    and str(r.get("verdict", "")).lower() == "pass")
+        import feeds
+        feeds.funnel_record("gate:pass", len(rows), npass)
+    except Exception:
+        pass
+
+
+def _defer_review(deadline, reason):
+    """Re-file the VP review as a claudeq backstop for the post-trade window (vp.py-184).
+
+    NOT a silent failure and NOT a fail-closed drop: the stage reports, the alert path sees
+    a failed stage, and the review still runs later, labelled late."""
+    now = dt.datetime.now(dt.timezone.utc)
+    base = deadline or now
+    nb = base.replace(hour=14, minute=10, second=0, microsecond=0)
+    if nb <= now:
+        nb += dt.timedelta(days=1)
+    try:
+        import claudeq
+        q = claudeq.enqueue("vp", args={"stage": "review"}, sub="review", key="vp:review",
+                            tier=35, not_before=nb.timestamp(), by="vp sweep")
+        qmsg = q.get("msg") or ("queued" if q.get("queued") else "filed")
+    except Exception as e:
+        qmsg = f"BACKSTOP FILING FAILED: {type(e).__name__}: {e}"
+    msg = f"deferred ({reason}) — refiled for {nb:%Y-%m-%d %H:%M}Z: {qmsg}"
+    print(f"  [FAIL] {'review':<10} {0:6.1f}s  {msg}")
+    return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": msg[:200]}
+
+
 def review(timeout=1800):
     """Launch the VP's Sonnet review over the brief the coded stages just wrote."""
     sys.path.insert(0, str(ENGINE / "research"))
@@ -427,7 +500,10 @@ def review(timeout=1800):
         # ONE CLAUDE SESSION AT A TIME (claudeq): wait for the slot — a queued research job
         # may be live — then run. The wait is outside the stage timeout.
         import claudeq
-        with claudeq.slot("vp review", "vp", "review"):
+        wait_s, deadline = _review_slot_budget(timeout)
+        if wait_s <= 0:
+            return _defer_review(deadline, "past the 09:05Z lookback deadline")
+        with claudeq.slot("vp review", "vp", "review", timeout_s=wait_s):
             p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                                 "--strict-mcp-config", "--mcp-config", str(nomcp),
                                 "--model", runner.job_model("vp")],
@@ -440,8 +516,14 @@ def review(timeout=1800):
             err = f"USAGE LIMIT — {err or tail}"[:200]
     except subprocess.TimeoutExpired:
         ok2, tail, err = False, "", f"timed out after {timeout}s"
-    except TimeoutError as e:            # the slot never freed — fail closed, visibly
-        ok2, tail, err = False, "", str(e)[:200]
+    except TimeoutError as e:
+        # The slot never freed before the deadline. This is the 2026-09-08 path exactly
+        # (ask vp.py-184): failing closed here is what let the PM trade on an unreviewed
+        # brief. Defer it to the post-trade window instead of dropping it.
+        try:
+            return _defer_review(_review_slot_budget(timeout)[1], str(e)[:120])
+        except Exception:
+            ok2, tail, err = False, "", str(e)[:200]
     except Exception as e:
         ok2, tail, err = False, "", f"{type(e).__name__}: {e}"[:200]
     dur = time.time() - t0
@@ -752,6 +834,12 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
         for d in desk:
             if d["build"]:
                 stages.append(run(f"cand:{d['tk']}", ["python3", "dossier.py", "build", d["tk"]], 900))
+    # Thesis-shaped reading (REVIEW-PLAN §8.1, 2026-09-12): every NEW document the dossier
+    # stages just pulled, read with the name's own kill / KPI / prediction questions
+    # (watch.py, prompts/watch.md). ~25 s per 20k-char passage on the dense role, so the cap
+    # bounds the first nights' backlog (~113 docs on 09-12) to roughly 25 minutes. Fires into
+    # alerts.json on a verified kill "yes" or a KPI crossing; never decides, never trades.
+    stages.append(run("watch", ["python3", "watch.py", "run", "--max-chunks", "60"], 2400))
     # The reading pass. Unlike every stage above it, this one is BOUNDED BY TIME, not by a
     # work list — it reads until the window closes. That is the point: the model is free and
     # the night is long (David 2026-08-14: "can run for hours every night"). The queue is
@@ -763,6 +851,12 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     stages.append(run("bench:rank", ["python3", "bench.py", "rank"], 300))
     # Price the top leads so the Funnel and the brief carry numbers, not bare tickers.
     stages.append(run("bench:cards", ["python3", "bench.py", "cards", "--limit", "15"], 1800))
+    # The coded pre-teardown gate (STRATEGY-v3 §7 stage 2, ask vp.py-178). gate.py writes
+    # gate.json + pass_card.json but nothing scheduled it — it only ever ran when someone
+    # typed it, so "teardowns on names that fail the coded gate" (v3 §9) had no enforcement.
+    # AFTER dossier/bench:cards, which populate the facts.json it reads; idempotent and fast.
+    stages.append(run("gate", [PY, str(ENGINE / "research" / "gate.py"), "sweep"], 300))
+    _record_gate_funnel()
     # ORDER IS LOAD-BEARING BELOW THIS LINE (2026-09-05, ask vp.py-121).
     # Every stage above CHANGES state the desk documents quote — cards, the unknowns
     # register, the quality queue, the bench roll. Every stage below WRITES a desk

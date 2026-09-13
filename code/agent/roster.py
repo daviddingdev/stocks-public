@@ -90,7 +90,7 @@ ROLES = [
                    "_engine/agent/journal/LESSONS.md", "_engine/agent/journal/STRATEGY.md"],
         "charter": ["everything except: it may not silently overrule DIRECTIVES.md"],
         "manages": ["vp", "numbers", "signals", "coo", "hunt", "bench", "cannibal",
-                    "numwatch", "scout"],
+                    "numwatch", "scout", "watch"],
     },
     {
         "id": "vp", "name": "VP — night sweep and prep desk",
@@ -116,7 +116,7 @@ ROLES = [
                    "_engine/agent/names/*/numcheck.json", "_engine/agent/names/*/manifest.json",
                    "_engine/agent/data/quality_queue.json", "_engine/agent/data/feed_scored.json"],
         "charter": [],
-        "runs": ["fincard", "numwatch", "quality", "feeds", "relevance", "scout", "dossier", "bench",
+        "runs": ["fincard", "numwatch", "quality", "feeds", "relevance", "scout", "dossier", "watch", "bench",
                  "analyst", "desk"],
     },
     {
@@ -200,6 +200,24 @@ ROLES = [
                    "every real error so far lived in prose no code path touched.",
         "reads": ["_engine/agent/journal/*.md", "_engine/agent/names/*/fincard.json"],
         "writes": ["_engine/agent/data/numwatch.json", "_engine/agent/names/*/numcheck.json"],
+        "charter": [],
+    },
+    {
+        "id": "watch", "name": "watch — thesis-shaped reading",
+        "who": "local model answers (role `dense`) · CODE verifies quotes and fires · zero Claude tokens",
+        "cron": "vp.py sweep",
+        "cadence_note": "inside the VP sweep, after the dossier stages and before the Bench (2026-09-12)",
+        "purpose": "Reads every NEW document on a held or priced name with THAT name's own standing "
+                   "questions, derived from the thesis (kill conditions, KPI levels, open predictions) "
+                   "and versioned with it. A verified kill 'yes' or a KPI crossing appends an alert "
+                   "row; the PM and the trigger engine act. It fires, it never decides.",
+        "reads": ["_engine/agent/prompts/watch.md", "_engine/agent/data/thesis.json", "_engine/agent/data/kpis.json",
+                  "_engine/agent/data/predictions.json", "_engine/agent/journal/*.md",
+                  "_engine/agent/names/*/manifest.json", "_engine/agent/data/feed.json",
+                  "_engine/agent/data/portfolio.json", "_engine/agent/data/candidates.json"],
+        "writes": ["_engine/agent/data/watch_questions.json", "_engine/agent/data/watch_state.json",
+                   "_engine/agent/data/watch.json", "_engine/agent/data/watch_brief.md",
+                   "_engine/agent/data/watch_runs.jsonl", "_engine/agent/data/alerts.json"],
         "charter": [],
     },
     {
@@ -905,6 +923,78 @@ def charter(role_id):
     return []
 
 
+
+FUNNEL_ORDER = ["scout:new", "scout:pre-triaged", "scout:enriched", "scout:triaged",
+                "bench:read", "bench:claimed", "bench:survived", "desk:vp",
+                "gate:pass", "teardown:filed"]
+FUNNEL_QUOTA = {"scout:triaged": 10, "desk:vp": 2, "gate:pass": 3, "teardown:filed": 1}
+
+
+def funnel_week(days=7):
+    """Per-stage totals over the last `days` from data/funnel_counts.jsonl.
+
+    STRATEGY-v3 §7 sets the origination quota and says a week that misses it is a finding on
+    THIS brief — which needed the log to actually be read somewhere (ask desk.py-183)."""
+    import datetime as _d
+    log = HERE / "data" / "funnel_counts.jsonl"
+    if not log.exists():
+        return []
+    cutoff = _d.datetime.now(_d.timezone.utc) - _d.timedelta(days=days)
+    agg = {}
+    for line in log.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+            at = _d.datetime.fromisoformat(str(r["at"]))
+        except Exception:
+            continue
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=_d.timezone.utc)
+        if at < cutoff:
+            continue
+        a = agg.setdefault(r.get("stage", "?"), {"runs": 0, "in": 0, "out": 0, "last": None})
+        a["runs"] += 1
+        a["in"] += int(r.get("in") or 0)
+        a["out"] += int(r.get("out") or 0)
+        a["last"] = max(a["last"] or at, at)
+    order = {k: i for i, k in enumerate(FUNNEL_ORDER)}
+    return sorted(({"stage": k, **v} for k, v in agg.items()),
+                  key=lambda r: (order.get(r["stage"], 99), r["stage"]))
+
+
+def funnel_section(days=7):
+    rows = funnel_week(days)
+    if not rows:
+        return ["## Origination funnel — last 7 days", "",
+                "- **no funnel rows in 7 days** — every stage should append to "
+                "`data/funnel_counts.jsonl`; an empty log is a finding, not an empty week.", ""]
+    L = [f"## Origination funnel — last {days} days (STRATEGY-v3 §7 quota)", "",
+         "| stage | runs | in | out | quota | |", "|---|---|---|---|---|---|"]
+    misses = []
+    for r in rows:
+        q = FUNNEL_QUOTA.get(r["stage"])
+        mark = ""
+        if q is not None:
+            ok = r["out"] >= q
+            mark = ("✓" if ok else "**MISS**")
+            if not ok:
+                misses.append(f"{r['stage']} {r['out']}/{q}")
+        L.append(f"| {r['stage']} | {r['runs']} | {r['in']:,} | {r['out']:,} | "
+                 f"{q if q is not None else '—'} | {mark} |")
+    seen = {r["stage"] for r in rows}
+    silent = [k for k in FUNNEL_QUOTA if k not in seen]
+    for k in silent:
+        L.append(f"| {k} | 0 | — | — | {FUNNEL_QUOTA[k]} | **NO ROWS — stage never reports** |")
+        misses.append(f"{k} (no rows at all)")
+    L.append("")
+    if misses:
+        L += ["_**Quota missed this week:** " + "; ".join(misses) +
+              " — v3 §7 makes that a finding on this brief, not a quiet week._", ""]
+    return L
+
+
 def brief():
     """The PM's org chart, regenerated from live state every night. Never hand-edited."""
     rs = live()
@@ -938,6 +1028,10 @@ def brief():
         L += ["", "_A role on this chart with no crontab line is the `ops.py hunt` failure class: "
               "declared, never launched. File it as an ask against `_engine/agent/roster.py` or the crontab._", ""]
     hy = hunt_yield()
+    try:
+        L += funnel_section()
+    except Exception as e:
+        L += ["## Origination funnel", "", f"- funnel log unreadable ({type(e).__name__}) — a finding", ""]
     L += ["## Bug hunt — measured yield (decides its duration)", "",
           f"- {hy['hunts']} hunt(s) on record · {hy['defects_with_repro']} defect(s) with reproductions "
           f"({hy['defects_per_hunt'] if hy['defects_per_hunt'] is not None else '—'} per hunt) · "

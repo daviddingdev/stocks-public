@@ -377,6 +377,25 @@ def launch_finish(tk, now=False):
     return launch(finish_prompt(tk), research_log(tk), kind="finish")
 
 
+def gate_check(tk):
+    """STRATEGY-PROPOSAL-v3 §7/§8: a name that hasn't passed the coded pre-teardown gate
+    (research/gate.py) doesn't earn a teardown — the most expensive Claude job this book
+    files. Reads the per-name gate.json gate.py already writes (company dir or agent/names
+    shelf); missing or 'fail' returns the reason as a string, the failed gate's own detail
+    line so the refusal is checkable, not just asserted. None means clear to file."""
+    tk = tk.upper()
+    import gate
+    src = gate._company_source(tk) or gate._shelf_source(tk)
+    gate_path = (src["out"] / "gate.json") if src else None
+    g = json.loads(gate_path.read_text()) if gate_path and gate_path.exists() else None
+    if not g:
+        return f"{tk}: no gate.json on file — run `gate.py {tk}` before filing a teardown"
+    if g.get("verdict") == "fail":
+        failed = next((x for x in g.get("gates", []) if x.get("gate") == g.get("failed_gate")), {})
+        return f"{tk}: gate FAIL ({g['failed_gate']}) — {failed.get('detail', '')}"
+    return None
+
+
 def launch_research(tk, now=False, full=False):
     """Deep teardown. Files a queue job (claudeq) unless dispatched by the queue itself
     (now=True). One per ticker: a live run refuses a second launch — OABI launched twice
@@ -385,6 +404,9 @@ def launch_research(tk, now=False, full=False):
     tk = tk.upper()
     if run_state(research_log(tk)) == "alive":
         return {"ok": False, "msg": f"Research on {tk} is already running."}
+    reason = gate_check(tk)
+    if reason:
+        return {"ok": False, "msg": reason}
     if not full and finish_applicable(tk):
         return launch_finish(tk, now=now)
     if not now:
