@@ -310,7 +310,7 @@ INSTANT = {
     # normally a Note-level combined figure (see RESCUE_VETO caution elsewhere in this
     # file) so it is intentionally ordered last — it only replaces a tag that is itself
     # stale or absent, never a fresher, cleaner current/noncurrent split.
-    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt",
+    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermLoansPayable",
                 "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
                 "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
                 "FinanceLeaseLiability", "LongTermNotesPayable", "ConvertibleDebtNoncurrent",
@@ -2577,7 +2577,11 @@ def build(tk, cik_override=None):
                 "formula": f"price {px} x avg_daily_volume {_adv_shares:,.0f} sh "
                     f"({_adv_window} avg, Finnhub /stock/metric)",
                 "note": "trailing average share volume x TODAY's price — an "
-                    "approximation, not a same-day dollar figure"}
+                    "approximation, not a same-day dollar figure",
+                # structured sibling of the formula text (asks.py fincard.py-213,
+                # pm 2026-09-14): safety.py's pre-trade liquidity gate reads a plain
+                # numeric adv_shares, not a value it has to parse out of prose.
+                "shares": round(_adv_shares)}
     # NON-PRIMARY SECURITY is now EVIDENCE-GATED, not assumed from ticker-list position
     # (fixed 2026-08-26, same-night regression): the original cut treated `_cik_tks[0]` as
     # "the" common ticker and suppressed market_cap/EV for every OTHER ticker at that CIK.

@@ -108,7 +108,12 @@ def main():
                  key=lambda x: -x["score"])[:5]
     # scout.py-172: offered = fresh items eligible this run, kept = what survives the
     # 14-day/universe prune and is actually usable downstream.
-    funnel_record("relevance", len(items), len(scores))
+    # relevance.py-204 (coo, 2026-09-12): 'out' was len(scores), the CUMULATIVE persisted
+    # score dict (grows every run), not this run's throughput -- a funnel stage cannot
+    # emit more than it consumed, and 'in 796, out 3058' over 7 days made the row
+    # unreadable. 'kept' is this run's newly-scored items that survived the prune above.
+    kept_this_run = sum(1 for i in todo if i["id"] in scores)
+    funnel_record("relevance", len(items), kept_this_run)
     print(f"{time.strftime('%F %T')} scored {len(todo)} new / {len(scores)} total "
           f"(offered {len(items)}, {already_scored} already scored, {filtered} filtered); "
           f"alerted {len(hot_new)} hot; brief has {len(ranked)} items; "

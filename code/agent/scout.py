@@ -365,8 +365,20 @@ def run(max_pre=25, max_triage=8):
     for e in new:
         items[e["id"]] = {**e, "status": "new", "first_seen": now, "last_seen": now}
     # Stage 1: pre-triage newest-first, capped per run
+    # scout.py-215 (pm, 2026-09-14): a channel that names a SELLER BY CONSTRUCTION --
+    # reg-effective (S-1/S-3 resale/selling-stockholder shelf) and spin-registration (the
+    # distribution itself is the seller's mechanism) -- passes G5 (STRATEGY-v3 §1/§7,
+    # named seller + filing citation) on its face; 13D and cannibal-screen do not (a 13D
+    # names a BUYER, a screen hit names a question). Under the per-run max_pre cap, a
+    # newest-first-only queue can starve seller-named rows behind a larger day's worth of
+    # 13D/screen rows -- QVCG's S-1 (37.6M sh, 75.2% of outstanding, four creditor funds
+    # named) never minted a scout row while five buyer-mechanism leads were reviewed and
+    # all failed G5. Stable two-pass sort: newest-first within each group, seller-named
+    # group promoted ahead of the rest.
+    _SELLER_NAMED_KINDS = {"reg-effective", "spin-registration"}
     todo = [i for i in items.values() if i["status"] == "new"]
     todo.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    todo.sort(key=lambda x: x.get("kind") not in _SELLER_NAMED_KINDS)
     for it in todo[:max_pre]:
         v = ask_json(PRE_PROMPT + "\n\nEVENT: " + json.dumps(
             {k: it.get(k) for k in ("kind", "ticker", "issuer", "date", "detail")}),
@@ -402,6 +414,20 @@ def run(max_pre=25, max_triage=8):
             pl = (it.get("pre") or {}).get("plausible") or 0
             if pl >= 4 or (pl >= 3 and it.get("ticker")):
                 it["status"] = "enriching"
+
+    # signals pipeline-health pass (2026-09-15): enrich_failed had no reader anywhere
+    # (grep confirms) and no retry -- a fincard 404 at enrich time (an unresolvable
+    # ticker, or SEC's endpoint hiccuping) permanently hid the lead from every downstream
+    # view: the PM's queue, desk.py, and the signals new-names table alike. TREO/WCCB/FRTT
+    # were all live, un-reviewed candidates as of 2026-09-12 and had silently become
+    # invisible dead rows by 2026-09-15 for exactly this reason. Retry weekly: often
+    # enough that a transient/now-fixed resolver issue clears, rare enough that a
+    # genuinely unresolvable ticker (OTC-only, no SEC XBRL) doesn't hammer the same 404
+    # every run.
+    _retry_cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat()
+    for it in items.values():
+        if it["status"] == "enrich_failed" and str(it.get("last_seen", "")) < _retry_cutoff:
+            it["status"] = "enriching"
 
     # Stage 2+3: enrich + full triage for the plausible, capped per run
     enrich_backlog = [i for i in items.values() if i["status"] == "enriching"]

@@ -430,7 +430,16 @@ def run():
         if implied <= 0:
             continue
         gap = (implied - price) / implied * 100
-        rec = tstate.setdefault(tk, {"days": 0, "last": ""})
+        # triggers.py-211 (pm, 2026-09-14): the count must be anchored to THIS thesis, not
+        # to whichever thesis started it. th['updated'] is the memo's own re-underwrite
+        # stamp; a change there (new implied_value, or just a documents-first re-read that
+        # reaffirmed the number) means a fresh anchor and the day-count restarts, or an
+        # alert reading "N market days" silently blends days accrued against a superseded
+        # anchor into the current one's count.
+        anchor = th.get("updated") or ""
+        rec = tstate.setdefault(tk, {"days": 0, "last": "", "anchor": anchor})
+        if rec.get("anchor") != anchor:
+            rec["days"], rec["last"], rec["anchor"] = 0, "", anchor
         if gap >= c["thesis_gap_alert_pct"]:
             if rec["last"] != today_s:      # count each market day once
                 rec["days"] += 1
@@ -446,7 +455,7 @@ def run():
                                f"that is evidence, not noise. Re-verify the premise in the PRIMARY DOCUMENTS "
                                f"(dossier terms.json + filings), not in your own memos.", book="Agent")
         else:
-            tstate[tk] = {"days": 0, "last": ""}
+            tstate[tk] = {"days": 0, "last": "", "anchor": anchor}
 
     # --- 6: position drawdown vs cost -> forced re-underwrite (added 2026-08-12) ---
     # Professional practice: a position down >=15% from cost gets a formal fresh-look
@@ -526,7 +535,17 @@ def run():
     # and alert()'s): a Follow name has no position for "held" to mean anything about,
     # and a Buy-below name trading back near its own level is exactly the re-buy signal
     # this exists to catch, held or not. Alert only — no ACTION, no launch; the PM/David
-    # still decides. Dedupe is per name per day via alert()'s own date gate on the key.
+    # still decides.
+    # ask signals-203 (2026-09-12, hunt -> signals, COO option A adopted 2026-09-15): the
+    # original per-day dedupe re-fired an IDENTICAL alert every session a name stayed
+    # inside the band (KT fired 4 sessions running, VSNT joined) -- a name that halves
+    # would alert daily forever, which is the "signal nobody acts on" failure mode
+    # (SOUL.md). The desk's priced-verdict table (ask desk.py-180) now carries the
+    # standing distance-to-level state every session, so this alert's only remaining job
+    # is to mark the MOMENT of crossing: fire once when price first enters the band, then
+    # go silent (state["buybelow_armed"]) until price closes back OUT of the band
+    # (> buy_below*1.02), which re-arms it for the next crossing.
+    armed = state.setdefault("buybelow_armed", {})
     for lf in sorted((ENGINE.parent).glob("*/analysis/lenses.json")):
         ov = (_j(lf, {}) or {}).get("overall") or {}
         verdict, buy_below = ov.get("verdict"), ov.get("buy_below")
@@ -537,13 +556,20 @@ def run():
         price = q.get("c")
         # Pre-open, `c` is the prior close; alerting on it consumes seen["buybelow:<tk>"]
         # and silences the real intraday touch of the level (2026-09-11T06:57:21Z KT).
-        if not price or stale_quote(q) or price > buy_below * 1.02:
+        if not price or stale_quote(q):
             continue
+        if price > buy_below * 1.02:
+            armed[tk] = True   # closed back out of the band -- ready for the next crossing
+            continue
+        if not armed.get(tk, True):
+            continue   # already fired on this crossing; silent until it re-arms
         ctx, book = impact(tk, price, q.get("pc") or price)
-        fired += alert(state, c, f"buybelow:{tk}", "buy-below alert", tk,
-                       f"{tk} ${price:,.2f} is within 2% of (or below) your buy_below "
-                       f"${buy_below:,.2f} ({verdict}, lenses.json as of {ov.get('as_of', '?')})"
-                       + (f" — {ctx}" if ctx else " — not currently held"), book=book)
+        if alert(state, c, f"buybelow:{tk}", "buy-below alert", tk,
+                 f"{tk} ${price:,.2f} crossed within 2% of (or below) your buy_below "
+                 f"${buy_below:,.2f} ({verdict}, lenses.json as of {ov.get('as_of', '?')})"
+                 + (f" — {ctx}" if ctx else " — not currently held"), book=book):
+            armed[tk] = False
+            fired += 1
 
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "

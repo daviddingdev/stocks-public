@@ -622,7 +622,18 @@ def extract_terms(d, title, deadline=None):
     legal documents) means 14-18 such calls in sequence. `deadline` (an absolute
     time.time(), the SAME budget build() already spends on fetching) is checked
     before each call so a tight run stops calling the LLM rather than being killed
-    mid-call by vp.py's external 900s cap — partial terms, not zero."""
+    mid-call by vp.py's external 900s cap — partial terms, not zero.
+
+    ZERO OUTPUT ON A FULL KILL (dossier.py-202, ask from signals 2026-09-12): the
+    deadline check above bounds when a NEW call starts, not how long an in-flight
+    one runs — a single call that started just under the deadline but then ran long
+    under GPU contention is still mid-flight when vp.py's external 900s subprocess
+    timeout SIGKILLs the whole process. Before this fix, `out["terms"]` only ever
+    reached disk once, at the very end of build(); a kill anywhere in this loop lost
+    every term this run had already extracted, not just the in-flight doc's — the
+    ARI sweep that motivated this ask reported "14 filings, 0 terms" despite several
+    calls plausibly having completed first. Writing `d/"terms.json"` after every doc
+    means a kill now loses only whatever was in flight at the moment it landed."""
     out = {"extracted_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
            "model": f"{DEFAULT_MODEL} (local)", "terms": [], "budget_skipped": []}
     # NEWEST FIRST (dossier.py-153): filenames are "YYYY-MM-DD_FORM[...].txt", so a
@@ -676,6 +687,13 @@ def extract_terms(d, title, deadline=None):
             t["doc"] = doc.name
             t["verified"] = bool(q) and norm(q) in ntxt
             out["terms"].append(t)
+        # incremental write (dossier.py-202): survives an external SIGKILL mid-loop.
+        # build() overwrites this with the fully merged version once extract_terms
+        # returns normally, so a clean run's terms.json is unaffected.
+        try:
+            (d / "terms.json").write_text(json.dumps(out, indent=1))
+        except Exception:
+            pass
     return out
 
 
