@@ -396,17 +396,96 @@ def gate_check(tk):
     return None
 
 
+# ---------- funnel accounting for the 'teardown' stage (runner.py-214) ----------
+# scout.py-172 gave every earlier stage a funnel_counts.jsonl row; 'teardown:filed' had
+# none, so the roster brief's §7 quota table showed "NO ROWS — stage never reports" in a
+# week CNDT was filed and consumed. A filed teardown is asynchronous (queued, dispatched
+# minutes to hours later, runs up to CAP_MIN["research"] minutes) so 'teardown:done' can't
+# fire inline — it's resolved later by reconcile_teardowns() against the two ground
+# truths that actually exist: lenses.json landing, or the claudeq job for that ticker
+# ending in release/fail.
+TEARDOWN_PENDING = ENGINE / "agent" / "data" / "teardown_pending.json"
+
+
+def _load_pending_teardowns():
+    try:
+        return json.loads(TEARDOWN_PENDING.read_text())
+    except Exception:
+        return {}
+
+
+def _save_pending_teardowns(d):
+    TEARDOWN_PENDING.parent.mkdir(parents=True, exist_ok=True)
+    TEARDOWN_PENDING.write_text(json.dumps(d, indent=2))
+
+
+def _record_teardown_filed(tk):
+    sys.path.insert(0, str(ENGINE / "agent"))
+    from feeds import funnel_record
+    funnel_record("teardown:filed", 1, 1, ticker=tk)
+    d = _load_pending_teardowns()
+    d[tk] = time.time()
+    _save_pending_teardowns(d)
+
+
+def _teardown_job_died(tk, since):
+    """A release/fail event for this ticker's research or finish job, after it was
+    filed — read-only against claudeq's own event log (coo-owned; we never write it)."""
+    try:
+        import claudeq
+        lines = claudeq.EVENTS.read_text(errors="ignore").splitlines()
+    except Exception:
+        return False
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("at", 0) < since or e.get("ev") not in ("release", "fail"):
+            continue
+        if e.get("job") in (f"research:{tk}", f"finish:{tk}"):
+            return True
+    return False
+
+
+def reconcile_teardowns():
+    """Runs opportunistically on every runner.py entry point: for each ticker filed but
+    not yet resolved, check whether lenses.json landed (success) or the job died without
+    one (failure) and emit the matching 'teardown:done' row. Idle (no-op) once caught up."""
+    d = _load_pending_teardowns()
+    if not d:
+        return
+    sys.path.insert(0, str(ENGINE / "agent"))
+    from feeds import funnel_record
+    changed = False
+    for tk, since in list(d.items()):
+        cd = company_dir(tk)
+        lenses = (cd / "analysis" / "lenses.json") if cd else None
+        if lenses and lenses.exists() and lenses.stat().st_mtime >= since:
+            funnel_record("teardown:done", 1, 1, ticker=tk)
+            del d[tk]
+            changed = True
+        elif _teardown_job_died(tk, since):
+            funnel_record("teardown:done", 1, 0, ticker=tk)
+            del d[tk]
+            changed = True
+    if changed:
+        _save_pending_teardowns(d)
+
+
 def launch_research(tk, now=False, full=False):
     """Deep teardown. Files a queue job (claudeq) unless dispatched by the queue itself
     (now=True). One per ticker: a live run refuses a second launch — OABI launched twice
     nine seconds apart on 2026-09-04 and one copy died at 94s for nothing. A teardown that
     only lacks its synthesis is FINISHED, not redone, unless full=True."""
     tk = tk.upper()
+    reconcile_teardowns()
     if run_state(research_log(tk)) == "alive":
         return {"ok": False, "msg": f"Research on {tk} is already running."}
     reason = gate_check(tk)
     if reason:
         return {"ok": False, "msg": reason}
+    _record_teardown_filed(tk)
     if not full and finish_applicable(tk):
         return launch_finish(tk, now=now)
     if not now:
@@ -797,6 +876,7 @@ def save_token_interactive():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    reconcile_teardowns()    # cheap, idle once caught up — see runner.py-214
     if args[:1] == ["save-token"]:
         save_token_interactive()
         sys.exit(0)
