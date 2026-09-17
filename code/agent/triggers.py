@@ -571,6 +571,26 @@ def run():
             armed[tk] = False
             fired += 1
 
+    # --- 10: the resting-order guard (David 2026-09-16) — a standing limit is cancelled BY
+    # CODE the moment an event lands on its name (filing, news, 13D, a big move, or its own
+    # expiry); the PM is woken to re-decide, never asked to react in time. guard.py owns the
+    # event sources and the cancel; this rule only turns each cancel into an alert + ACTION.
+    # Runs every tick this engine runs, so the 13:00Z run sees overnight news before the open.
+    try:
+        import guard
+        for rec in guard.run():
+            if not rec["reasons"]:
+                continue
+            line = guard.describe(rec)
+            fired += alert(state, c, f"guard:{rec['intent_id']}", "order guard", rec["symbol"],
+                           f"Resting order {line} — re-decide at the next session (intent {rec['intent_id'][:8]})",
+                           action=rec["canceled"], book="Agent")
+            if not rec["canceled"]:
+                push(c["ntfy_topic"], "Stocks · agent · GUARD CANCEL FAILED",
+                     f"{line} · {json.dumps(rec.get('cancel_result'), default=str)[:160]}")
+    except Exception as e:
+        print(f"  ! guard failed: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
+
     _write_json(STATE_F, state)
     print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "
           f"({len(jpm_pos)} brokera, {len(ag_pos)} agent holdings watched)")

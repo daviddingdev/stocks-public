@@ -3693,6 +3693,8 @@ autoSync();
 
 import agent_page  # /agent page + APIs for the BrokerB agentic account (kept in its own module)
 agent_page.register(app, wrap)
+import strategies_page  # /agent/strategies — definitions of undervalued / selling activity / thesis types (2026-09-16)
+strategies_page.register(app, wrap)
 
 import today_page  # /today — same-day read on the companies we own (own module; owns its JS/CSS)
 today_page.register(app, wrap)

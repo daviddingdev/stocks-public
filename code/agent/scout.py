@@ -190,6 +190,11 @@ def _events():
     # (top > all_hits > extreme_shrink — top is already the algorithmically-ranked
     # subset), and carry which bucket produced the row so triage/the PM can see it wasn't
     # a top-15 name.
+    can_ran_at = None
+    try:
+        can_ran_at = dt.datetime.fromisoformat(str(can.get("ran_at", "")).replace("Z", "+00:00"))
+    except Exception:
+        pass
     seen_tk = set()
     for bucket in ("top", "all_hits", "extreme_shrink"):
         for h in can.get(bucket, []):
@@ -197,6 +202,33 @@ def _events():
             if not tk or tk in seen_tk:
                 continue
             seen_tk.add(tk)
+            # cannibal.py-227 (David 2026-09-16, C17 on can:KFY): cannibal.json is only as
+            # fresh as its own run cadence (weekly), but this loop re-quotes it into the
+            # candidate detail EVERY scout.py run — so a row can keep asserting a frames-
+            # derived net cash for days after our own fincard (built later, tag-precedence +
+            # zero-proof) corrects it. If a fincard exists and postdates the screen, re-quote
+            # net cash/cap/FCF yield from the card rather than the stale screen figures.
+            nc, mc, fy, src_note = h.get("net_cash"), h.get("market_cap"), h.get("fcf_yield_pct"), ""
+            card_path = HERE / "names" / tk / "fincard.json"
+            if can_ran_at is not None and card_path.exists():
+                try:
+                    card = json.loads(card_path.read_text())
+                    built = dt.datetime.fromisoformat(str(card.get("built", "")).replace("Z", "+00:00"))
+                    if built > can_ran_at:
+                        d = card.get("derived") or {}
+                        cnc = (d.get("net_cash") or {}).get("value")
+                        cmc = (d.get("market_cap") or {}).get("value")
+                        cfy = (d.get("fcf_yield_pct") or {}).get("value")
+                        if cnc is not None:
+                            nc = cnc
+                        if cmc is not None:
+                            mc = cmc
+                        if cfy is not None:
+                            fy = cfy
+                        if cnc is not None or cmc is not None or cfy is not None:
+                            src_note = " (re-quoted from fincard, newer than screen)"
+                except Exception:
+                    pass
             # Keyed by TICKER, not ticker+date (scout.py-056): the screen re-hits the same
             # names every run it survives on, and a dated id minted a fresh row per sighting —
             # 120 rows for 25 tickers, with a PM verdict (dropped/pm_reviewed) on one day's row
@@ -208,9 +240,10 @@ def _events():
                        "kind": "cannibal-screen", "ticker": tk, "date": str(can.get("ran_at", ""))[:10],
                        "bucket": bucket,
                        "runs_on_screen": h.get("runs_on_screen") or h.get("weeks_on_screen") or 1,
-                       "detail": (f"Cannibal screen [{bucket}]: FCF yield {h['fcf_yield_pct']}%, shares "
-                                  f"-{h['share_shrink_pct']}% y/y, net cash ${h['net_cash'] / 1e6:,.0f}M, "
-                                  f"cap ${h['market_cap'] / 1e6:,.0f}M, {h.get('runs_on_screen') or h.get('weeks_on_screen') or 1} run(s) on screen"
+                       "detail": (f"Cannibal screen [{bucket}]: FCF yield {fy}%, shares "
+                                  f"-{h['share_shrink_pct']}% y/y, net cash ${nc / 1e6:,.0f}M, "
+                                  f"cap ${mc / 1e6:,.0f}M, {h.get('runs_on_screen') or h.get('weeks_on_screen') or 1} run(s) on screen"
+                                  + src_note
                                   + (f" · {h['fcf_note']}" if h.get("fcf_note") else "")
                                   + " — a screen hit is a QUESTION: why is it cheap, who is the wrong-price seller?")})
     return ev
