@@ -1063,10 +1063,34 @@ if __name__ == "__main__":
         # to; the positional form is kept as shorthand for --ask only.
         q = question()
         positional = sys.argv[2] if sys.argv[2:] and not sys.argv[2].startswith("--") else None
-        for flag, key in (("--ask", "ask"), ("--rule", "rule"),
-                          ("--channel", "channel"), ("--schema", "schema"),
-                          ("--claim-key", "claim_key")):
-            v = arg(flag)
+        flag_keys = (("--ask", "ask"), ("--rule", "rule"), ("--channel", "channel"),
+                     ("--schema", "schema"), ("--claim-key", "claim_key"),
+                     ("--amount-key", "amount_key"), ("--min-filing-date", "min_filing_date"))
+        flags = {flag: arg(flag) for flag, _ in flag_keys}
+        # bench.py-230(c): a bare call (no positional, no flags) is a READ — it used to
+        # fall through to the write path below and restamp set_by/set_at on every no-op
+        # invocation, hiding when the question was actually last changed.
+        if positional is None and not any(v is not None for v in flags.values()):
+            print(f"question: channel={q['channel']!r} ask={q['ask'][:60]!r}... "
+                  f"set_by={q.get('set_by')} set_at={q.get('set_at')}")
+            forms = _corpus_forms()
+            print("corpus forms: " + (", ".join(f"{n} {f}" for f, n in forms.items()) or "not built yet"))
+            sys.exit(0)
+        new_ask = positional if positional is not None else flags["--ask"]
+        # bench.py-230(a): 2026-09-17 — the PM set channel 13 with --ask only, leaving
+        # channel/rule/schema/claim_key on channel 12's stored values, and a night of GPU
+        # scored the wrong question. REFUSE a new --ask that leads with a different channel
+        # id than the one on file unless --channel, --rule and --schema all switch with it
+        # (no named channel preset exists yet to switch all four from).
+        old_id, new_id = _chan_id(q.get("channel")), (_chan_id(new_ask) if new_ask is not None else None)
+        if new_id and old_id and new_id != old_id:
+            switched_all = all(flags[f] is not None for f in ("--channel", "--rule", "--schema"))
+            if not switched_all:
+                sys.exit(f"REFUSED: --ask leads with channel {new_id} but the stored question is "
+                         f"channel {old_id} — pass --channel, --rule and --schema together with "
+                         f"--ask when switching channels")
+        for flag, key in flag_keys:
+            v = flags[flag]
             if v is not None:
                 q[key] = v
         if positional is not None:

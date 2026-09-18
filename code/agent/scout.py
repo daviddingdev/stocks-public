@@ -106,6 +106,21 @@ def _self_filed_13d(filer, subject):
     return bool(ftoks) and ftoks <= _name_tokens(subject)
 
 
+def _local_read_seller(tk, kind):
+    """scout.py-215: the registered share count/pct lives in the S-1/S-3's own
+    selling-stockholder table, not in feed.json's EFFECT-notice row — local_read.py
+    (vp.py-173's LOCAL READ stage, shipped seller-only 2026-09-18) reads that table and
+    verifies the quote verbatim. Returns (holder, shares_or_pct) or (None, None) when no
+    verified seller read exists yet for this ticker/kind."""
+    if not tk:
+        return None, None
+    d = _j(NAMES / tk / "local_read.json", {})
+    for e in reversed(d.get("seller") or []):
+        if e.get("kind") == kind and e.get("verified"):
+            return e.get("holder") or None, e.get("shares_or_pct") or None
+    return None, None
+
+
 def _events():
     """Stage 0: normalized events with stable ids from the feeds."""
     feed = _j(DATA / "feed.json", {})
@@ -154,12 +169,19 @@ def _events():
         # here uses, not to a document-text heuristic guessed at collection time. id keyed on
         # cik+file_number (both stable regardless of ticker-resolution status) -- same lesson
         # as the 13D id bug two channels up.
+        holder, shares_or_pct = _local_read_seller(r.get("ticker"), "reg_effective")
+        detail = (f"{r.get('reg_form', '?')} registration effective "
+                  f"{r.get('effective_date', '?')} for {r.get('company', '?')} "
+                  f"(file {r.get('file_number', '?')}) — resale/selling-stockholder "
+                  f"shelf or primary raise?")
+        if holder:
+            # vp.py-173 LOCAL READ verified this against the S-1/S-3's own text — a resale
+            # shelf, not a guess, and the number the pre-triage prompt can now cite instead
+            # of asking "shelf or primary raise?" with nothing to answer it.
+            detail += f" RESALE SHELF confirmed: {holder}" + (f", {shares_or_pct}" if shares_or_pct else "")
         ev.append({"id": f"regfx:{r.get('cik')}:{r.get('file_number')}", "kind": "reg-effective",
                    "ticker": r.get("ticker"), "date": r.get("effective_date") or r.get("date"),
-                   "detail": f"{r.get('reg_form', '?')} registration effective "
-                             f"{r.get('effective_date', '?')} for {r.get('company', '?')} "
-                             f"(file {r.get('file_number', '?')}) — resale/selling-stockholder "
-                             f"shelf or primary raise?", "url": r.get("url")})
+                   "detail": detail, "url": r.get("url")})
     for r in (sit.get("n14") or []):
         # build-003: N-14 registers a fund merger/reorganization -- including a mutual-
         # fund/CEF converting into an ETF share class, the specific pattern the ask names.
@@ -380,6 +402,18 @@ def run(max_pre=25, max_triage=8):
                 # unblocks it same as a fresh event would, not just events arriving after
                 # the fix (scout.py-037).
                 cur["status"] = "enriching"
+        if cur and e.get("kind") == "reg-effective" and "RESALE SHELF confirmed" in (e.get("detail") or "") \
+                and "RESALE SHELF confirmed" not in (cur.get("detail") or ""):
+            # scout.py-215: local_read.py's verified seller quote usually lands AFTER this
+            # row already exists and was pre-triaged blind ("shelf or primary raise?" with
+            # no answer, e.g. GWHWW scored plausible:1 on 2026-09-18 before its S-3 had been
+            # read). A newly-verified named seller + share count is new evidence, not a
+            # re-derivation of an old verdict — carry it onto the card and let it be
+            # re-scored, same as a ticker resolving unblocks a "no_ticker" row above. Only a
+            # not-yet-human-judged row moves; pm_reviewed/dropped/underwriting stand.
+            cur["detail"] = e["detail"]
+            if cur.get("status") in ("new", "pre_triaged", "enriching", "triaged"):
+                cur["status"] = "new"
         if cur and e.get("kind") == "cannibal-screen":
             # scout.py-056: a re-hit refreshes the screen's numbers and sighting count on
             # the SAME row — never status or pm_note. A dropped/pm_reviewed verdict must
