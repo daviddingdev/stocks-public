@@ -221,10 +221,18 @@ INSTANT = {
     # so st_investments read STALE and net cash lost $311M — 2026-08-18). Precise
     # current/noncurrent tags stay ahead of the AFS TOTAL fallback for the KLAC/LYFT
     # reason above.
+    # TradingSecurities/MarketableSecurities (no Current/Noncurrent qualifier) added
+    # LAST, same reasoning as the AFS-total fallback above — MATW retired
+    # ShortTermInvestments in 2011 (STALE 5387d, quality.py fincard-flag:MATW:
+    # st_investments, numbers 2026-09-19) and moved to TradingSecurities, which is
+    # current-only for MATW (confirmed: both read $0 at 2026-06-30, same period) but an
+    # unqualified tag is a TOTAL on some issuers, so it stays behind every current-
+    # qualified alternate.
     "st_investments": ["ShortTermInvestments", "MarketableSecuritiesCurrent",
                        "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
                        "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent",
-                       "AvailableForSaleSecuritiesDebtSecurities"],
+                       "AvailableForSaleSecuritiesDebtSecurities",
+                       "TradingSecurities", "MarketableSecurities"],
     "lt_investments": ["LongTermInvestments", "MarketableSecuritiesNoncurrent",
                        "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
                        "DebtSecuritiesAvailableForSaleExcludingAccruedInterestNoncurrent"],
@@ -319,7 +327,12 @@ INSTANT = {
     "debt_current": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
                      "LongTermDebtAndCapitalLeaseObligationsCurrent",
                      "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent",
-                     "NotesPayableCurrent", "NotesPayableToBankCurrent", "LinesOfCreditCurrent"],
+                     "NotesPayableCurrent", "NotesPayableToBankCurrent", "LinesOfCreditCurrent",
+                     # ENTX (numbers, 2026-09-19, quality.py fincard-flag:ENTX:debt_current):
+                     # OtherNotesPayableCurrent=408,000 at 2026-06-30 was an unmapped debt-like
+                     # hit leaving debt_current UNKNOWN — the sibling of the already-trusted
+                     # NotesPayableCurrent tag, LOWEST priority since it is the "other" bucket.
+                     "OtherNotesPayableCurrent"],
     "operating_lease_liab": ["OperatingLeaseLiability"],
     "total_liabilities": ["Liabilities"],
     # PartnersCapital{,IncludingPortionAttributableToNoncontrollingInterest} last: an LP
@@ -1471,8 +1484,18 @@ MEZZANINE_EXCLUDE = {
 # fincard-147 (numbers, 2026-09-08): pulled XPOF's companyfacts directly, both tags carry
 # the same 2026-06-30 period end so rows_for's recency tiebreak picks whichever is first in
 # FLOW["revenue"] — Revenues — regardless of which one is actually the total.
+#
+# VRRM's us-gaap:Revenues fact ($25,831,000 for Q2 2026, $53,146,000 H1) matches neither the
+# "Service revenue" line (246,710) nor "Product sales" (16,881) nor "Total revenue" (263,591,
+# all in thousands, EX-99.1 filed 2026-08-05) — same drop-dimensional-remainder mechanism as
+# XPOF above, a different small leftover concept. RevenueFromContractWithCustomerExcluding-
+# AssessedTax ($263,591,000) ties to the filed "Total revenue" line to the dollar, and its
+# segment sum (Commercial 115.1M + Government 128.5M + Parking 20.0M = 263.6M) confirms it.
+# Both tags carry the same 2026-06-30 period end, so the same tiebreak-picks-list-order bug
+# applies (numbers, 2026-09-19, ask fincard.py-238).
 FLOW_TAG_EXCLUDE = {
     "XPOF": {"revenue": {"Revenues"}},
+    "VRRM": {"revenue": {"Revenues"}},
 }
 
 MANUAL_OVERRIDES_FILE = ENGINE / "valuation" / "manual_overrides.json"
@@ -1519,16 +1542,36 @@ MEZZANINE_MANUAL = {
 }
 
 
-def _mezzanine_equity(gaap, asof, parent_eq, ticker=None):
+_NCI_INCLUSIVE_EQUITY_TAGS = ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                              "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest")
+
+
+def _mezzanine_equity(gaap, asof, parent_eq, ticker=None, eq_tag=None):
     """Sum of NCI/temporary-equity concepts reported AT the balance-sheet date. Read from
     the ALREADY-FETCHED companyfacts blob, not a fresh companyconcept call: the per-tag
     companyconcept endpoint served an empty units.USD for WELL's MinorityInterest (939.184M
     at 2026-03-31) while the very same figure sat right there in bulk companyfacts —
     an SEC API inconsistency, not a data gap (2026-08-18). Returns None (not 0) when
-    nothing is found, so the caller can tell 'no mezzanine equity' from 'not present'."""
-    total, found, got_minority = 0.0, False, False
+    nothing is found, so the caller can tell 'no mezzanine equity' from 'not present'.
+
+    SWRD (numbers, 2026-09-19, quality.py fincard-flag:SWRD:BALANCE SHEET DOES NOT FOOT):
+    no plain StockholdersEquity tag exists, so F["equity"] falls back to ...Including-
+    PortionAttributableToNoncontrollingInterest (29,464,000) — which, unlike the usual
+    parent-only case this function is built for, ALREADY contains MinorityInterest
+    (27,452,000). Summing MinorityInterest again on top double-counted it, overshooting
+    the identity by exactly 27,452,000 (a 25.3% "gap" the wrong direction) where the true
+    gap was RedeemableNoncontrollingInterestEquityCarryingAmount alone (8,462,000, genuine
+    mezzanine — never inside ANY stockholders'-equity tag, parent-only or NCI-inclusive,
+    so it is never double-counted). eq_tag tells this function which case it is in."""
+    # eq already contains MinorityInterest when it came off an "Including NCI" tag — treat
+    # it as already-accounted, same as a genuine MinorityInterest hit below, so the
+    # not-got_minority NCI-backout fallback correctly no-ops (incl - parent_eq == 0, same
+    # tag/asof) instead of being skipped into a redundant refetch.
+    total, found, got_minority = 0.0, False, eq_tag in _NCI_INCLUSIVE_EQUITY_TAGS
     seen_vals = set()
-    exclude = MEZZANINE_EXCLUDE.get((ticker or "").upper(), ())
+    exclude = set(MEZZANINE_EXCLUDE.get((ticker or "").upper(), ()))
+    if eq_tag in _NCI_INCLUSIVE_EQUITY_TAGS:
+        exclude.add("MinorityInterest")
     for tag in MEZZANINE_TAGS:
         if tag in exclude:
             continue
@@ -1615,7 +1658,8 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
     gap = implied - tl
     err = abs(gap) / implied
     if err > tol:
-        mezz = _mezzanine_equity(gaap, asof, eq, ticker=card.get("ticker"))
+        mezz = _mezzanine_equity(gaap, asof, eq, ticker=card.get("ticker"),
+                                 eq_tag=(F.get("equity") or {}).get("tag"))
         if mezz:
             implied2 = ta - (eq + mezz)
             gap2 = implied2 - tl
@@ -1830,6 +1874,25 @@ def build(tk, cik_override=None):
                            .get("units", {}) or {}).get("USD")) \
         or bool((gaap.get("InterestExpenseDeposits", {})
                 .get("units", {}) or {}).get("USD"))
+
+    # CHAPTER 11 / REORG TEST (numbers, 2026-09-19, ask fincard.py-235): tag presence,
+    # self-contained in the XBRL pass. LiabilitiesSubjectToCompromise is the ASC 852
+    # concept a Chapter 11 debtor uses for pre-petition claims not yet resolved — QVCG's
+    # 10-Q filed 2026-08-04 carries $5,093,000,000 of it at 2026-06-30 while debt_lt/
+    # debt_current (which never look at this tag) read $0/$1,000,000, so net_cash printed
+    # +$1,018,000,000 and EV -$219,501,645 against a balance sheet with $5.1B of unresolved
+    # claims — the standard debt-derived figures are not wrong, they are UNDEFINED until
+    # the plan of reorganization fixes what portion becomes cash-pay debt, equity, or a
+    # discharge (QVCG's 8-K filed 2026-08-07 shows Takeback Notes/Loans issued at
+    # emergence, but companyfacts has not yet served a post-emergence balance sheet).
+    # 270-day freshness gate matches the STALE threshold used elsewhere in this file —
+    # a resolved, years-old reorg must not permanently suppress a card.
+    _reorg_rows = [r for r in (gaap.get("LiabilitiesSubjectToCompromise", {})
+                                .get("units", {}) or {}).get("USD", [])
+                   if r.get("val") and r.get("end")]
+    _reorg_latest = max(_reorg_rows, key=lambda r: r["end"]) if _reorg_rows else None
+    _is_reorg = bool(_reorg_latest and _reorg_latest["val"]
+                      and _days(_reorg_latest["end"], now[:10]) <= 270)
 
     # BANK/THRIFT REVENUE BASIS (fincard.py-072, PM decision 2026-08-28): a depository
     # tags no Revenues/RevenueFromContractWithCustomer* concept at all, so the standard
@@ -2179,6 +2242,23 @@ def build(tk, cik_override=None):
                 "liabilities, not financing debt, so net cash and EV are undefined "
                 "(fincard.py-072, PM 2026-08-28). Use market_cap, pe and "
                 "price_over_book instead.")
+        elif _is_reorg:
+            # REORG SUPPRESSION (numbers, 2026-09-19, ask fincard.py-235) — same shape as
+            # BANK EV SUPPRESSION above: LiabilitiesSubjectToCompromise carries no
+            # debt_lt/debt_current tag of its own, so net_cash/EV would print as if that
+            # entire unresolved pre-petition claim did not exist. Skip net_cash/EV/EV-
+            # multiples/the DCF grid rather than guess how much of it becomes cash-pay
+            # debt vs equity vs discharge — that split is fixed by the plan of
+            # reorganization, not by this file. Keep market_cap, pe and price_over_book.
+            card["flags"].append(
+                f"IN REORG: net_cash/enterprise_value/ev_over_revenue/ev_over_ebitda/"
+                f"ev_over_fcf/DCF grid not computed — LiabilitiesSubjectToCompromise "
+                f"{_reorg_latest['val']:,.0f} at {_reorg_latest['end']} is excluded from "
+                f"debt_lt/debt_current (neither tag covers it), so those figures would be "
+                f"UNQUOTABLE-REORG, not merely imprecise. How much of this liability "
+                f"becomes cash-pay debt vs equity vs discharge is fixed by the plan of "
+                f"reorganization — wait for a post-emergence balance sheet (fincard.py-235). "
+                f"Use market_cap, pe and price_over_book instead.")
         else:
             put("net_cash", cash + sti - dlt - dcur,
                 f"cash {cash:,.0f} + st_investments {sti:,.0f} - total_debt {dlt + dcur:,.0f}",
@@ -2529,8 +2609,11 @@ def build(tk, cik_override=None):
     eb = (D.get("ebitda_approx") or {}).get("value")
     td = (D.get("total_debt") or {}).get("value")
     # debt_over_ebitda suppressed for depositories too (fincard.py-072) — total_debt
-    # is deposits/borrowings, a depository's operating liability, not leverage.
-    if eb and eb > 0 and td is not None and not _is_depository:
+    # is deposits/borrowings, a depository's operating liability, not leverage. Suppressed
+    # in reorg (fincard.py-235) for the same reason net_cash/EV are: total_debt excludes
+    # LiabilitiesSubjectToCompromise entirely, so it understates leverage, not merely
+    # imprecisely.
+    if eb and eb > 0 and td is not None and not _is_depository and not _is_reorg:
         _eb_days = _partial_period_days(F.get("dna"))
         if _eb_days:
             _ann_eb = eb * 365.0 / _eb_days
@@ -2829,7 +2912,12 @@ def build(tk, cik_override=None):
 
         fcf = (D.get("fcf") or {}).get("value")
         nc0 = (D.get("net_cash") or {}).get("value") or 0
-        if fcf and fcf > 0:
+        # REORG SUPPRESSION continued (fincard.py-235): net_cash is intentionally absent
+        # from D above, but nc0's `or 0` fallback would silently feed the DCF grid as if
+        # the issuer held zero cash and zero debt — still wrong, just wrong in the other
+        # direction. Skip the grid entirely rather than launder an unquotable net_cash
+        # through a default.
+        if fcf and fcf > 0 and not _is_reorg:
             sys.path.insert(0, str(ENGINE / "valuation"))
             import toolkit
             V = card["valuation"]

@@ -85,7 +85,7 @@ def _book():
     if b is None:
         b = (request.args.get("book") or "").strip().lower()
         if not b:
-            b = "dip" if request.path == "/dip" else "brokera"
+            b = "dip" if (request.path == "/dip" or request.path.startswith("/dip/")) else "brokera"
         if b not in _books.slugs():
             b = "brokera"
         g.book = b
@@ -725,8 +725,8 @@ def pfseg():
     get a back-bar to /agent instead (that book has its own segs)."""
     from flask import request as _rq
     path, active = _rq.path, None
-    if path == "/dip":   # DIP Venture: one seg for now — which other tabs it keeps is David's call (2026-09-11)
-        return "<div class=pfnav><a class='pfseg on' data-route='/dip' href='/dip'>Book</a></div>"
+    if path == "/dip" or path.startswith("/dip/"):   # DIP Venture: Book + Options (2026-09-19); other BROKERA tabs still David's call
+        return dip_page.pfseg(path)
     if path in {p for p, _ in PF_SEGS}:
         active = path
     back = ""
@@ -858,6 +858,7 @@ def home_inner():
                      "<div class=pfempty2>No public positions yet — the cash is the position until a name earns it.</div></div>"))
     if not is_jpm:
         hold_w += dip_page.private_widget(priv)   # the book's hand-marked private stakes (Waffle)
+        hold_w += dip_page.options_widget()       # the advisor's options, evaluated (config/dip/options.json)
         hold_w = dip_page.connect_widget(bk) + hold_w
 
     wrows = "".join(pos_row(t, pos.get(t, {}), False) for t in watch)
@@ -2073,7 +2074,7 @@ def api_pfhist():
         return _bjson("pf_history.json", [])  # snapshot fallback (grows on each sync)
     return jsonify(cached(f"pfhist:{_book()}", 1800, fetch))
 
-@app.route("/api/research")
+@app.route("/api/research", methods=["POST"])
 def api_research():
     tk = request.args.get("ticker", "").upper().strip()
     if not tk:
@@ -2177,7 +2178,7 @@ def research_status():
         status = "idle"
     return jsonify({"done": False, "status": status, "msg": msg, "progress": prog})
 
-@app.route("/api/research/update")
+@app.route("/api/research/update", methods=["POST"])
 def api_research_update():
     tk = request.args.get("ticker", "").upper().strip()
     if not tk:
@@ -3407,7 +3408,7 @@ function checkRec(){var box=document.getElementById('rec-status');if(!box)return
   else if(s.status==='error'){box.style.display='';box.className='rstatus err';box.textContent=s.msg;}
  }).catch(function(){});}
 function updResearch(e,tk){e.stopPropagation();toast('Updating '+tk+' research…');
- fetch('/api/research/update?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
+ post('/api/research/update?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
   var box=document.getElementById('research-status');
   if(!d.ok){if(box){box.style.display='';box.className='rstatus err';box.textContent=d.msg||'failed';}else toast(d.msg||'failed');return;}
   if(box){box.style.display='';box.className='rstatus';box.innerHTML='<span class=spin></span> Updating '+esc(tk)+' — reading what’s new since the report…';
@@ -3420,7 +3421,7 @@ function updResearch(e,tk){e.stopPropagation();toast('Updating '+tk+' research�
     }).catch(function(){});},6000);}
  }).catch(function(){toast('error');});}
 function genResearch(e,tk){e.stopPropagation();toast('Launching research on '+tk+'…');
- fetch('/api/research?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');
+ post('/api/research?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');
   var box=document.getElementById('research-status');if(box){box.style.display='';box.className='rstatus';box.innerHTML='<span class=spin></span> Researching '+esc(tk)+'…  <span class=rmsg>starting</span>';pollResearch(tk,box);}}).catch(function(){toast('error');});}
 function loadStats(){var g=document.querySelector('.statgrid[data-stats]');if(!g)return;
  fetch('/api/quote?ticker='+encodeURIComponent(g.dataset.stats)).then(function(r){return r.json()}).then(function(d){
@@ -3756,7 +3757,12 @@ def _warm_loop():
     while True:
         try:
             nowu = dt.datetime.now(dt.timezone.utc)
-            market = nowu.weekday() < 5 and 13 <= nowu.hour < 21
+            # coo-065: from asof.market_open (America/New_York), not a hardcoded UTC
+            # window — the old 13:30-20:00Z window was EDT-only and ran an hour early
+            # for the four EST months.
+            sys.path.insert(0, str(ROOT / "_engine" / "agent"))
+            import asof as _asof
+            market = _asof.market_open(nowu)
             tks = tracked_tickers()
             if tks and (tick == 0 or market or tick % 6 == 0):
                 with ThreadPoolExecutor(min(16, len(tks))) as ex:

@@ -47,6 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 NAMES = HERE / "names"
 JOURNAL = HERE / "journal"
+DATA = HERE / "data"
 sys.path.insert(0, os.path.expanduser("~/maintenance/bin"))
 from localllm import ask_json, DEFAULT_MODEL  # noqa: E402
 import feeds                    # noqa: E402  (cik_map cache, UA)
@@ -258,6 +259,58 @@ def resolve_cik(tk, override=None):
     raise SystemExit(f"{tk}: no CIK found (share class? pass --cik N)")
 
 
+def _candidate_verdict_reason(tk, sub):
+    """None -> build normally. A reason string -> the PM's verdict on this candidate
+    has not moved and EDGAR has filed nothing since, so the full rebuild below (filing
+    fetch/strip, local-model terms extraction, fincard.build — the 697-782s/name cost)
+    is skipped (numbers, 2026-09-19, ask dossier.py-220, VP review 2026-09-15 §4:
+    QVCG/SUJA/GPI/IMMR rebuilt in full nightly with verdicts unchanged since 08-21..09-01
+    and no new filing — that GPU/wall-clock time belongs to new candidates).
+
+    Deliberately narrow: a held position (loop.py's daily dossier:{tk} stage) is never
+    skipped even if it also carries a candidates.json row, and ANY row for this ticker
+    still short of a terminal status (not pm_reviewed/dropped) forces a normal build —
+    this only fires once every row on file has a PM verdict recorded and no filing has
+    landed since the newest one."""
+    if not (NAMES / tk / "manifest.json").exists():
+        return None  # never built before — nothing to compare a "no change" claim against
+    try:
+        held = {p.get("symbol") for p in _j(DATA / "portfolio.json", {}).get("positions", [])}
+    except Exception:
+        held = set()
+    if tk in held:
+        return None
+    items = _j(DATA / "candidates.json", {}).get("items", [])
+    items = items if isinstance(items, list) else list(items.values())
+    rows = [r for r in items if (r.get("ticker") or "").upper() == tk]
+    if not rows:
+        return None
+    verdicts = []
+    for r in rows:
+        if r.get("status") not in ("pm_reviewed", "dropped"):
+            return None  # a row still awaiting a PM verdict — build
+        pra = r.get("pm_reviewed_at")
+        if not pra:
+            return None  # terminal status with no verdict timestamp on file — can't compare, build
+        verdicts.append(pra)
+    verdict_at = max(verdicts)[:10]  # ISO8601 date prefix, sortable as a string
+    filing_dates = sub.get("filings", {}).get("recent", {}).get("filingDate", [])
+    newest_filing = max(filing_dates) if filing_dates else ""
+    if newest_filing > verdict_at:
+        return None  # EDGAR has filed something since the verdict — build
+    return (f"candidate verdict unchanged since {verdict_at} (status "
+            f"{'/'.join(sorted({r['status'] for r in rows}))}) and no EDGAR filing since "
+            f"(newest on file {newest_filing or 'none'}) — skipping full rebuild "
+            f"(dossier.py-220)")
+
+
+def _j(p, default):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
 # ---------------- build ----------------
 def build(tk, cik_override=None):
     t0 = time.time()
@@ -268,6 +321,19 @@ def build(tk, cik_override=None):
 
     sub = json.loads(get(f"https://data.sec.gov/submissions/CIK{cik}.json"))
     title = sub.get("name", tk)
+
+    skip_reason = _candidate_verdict_reason(tk, sub)
+    if skip_reason:
+        try:
+            manifest = json.loads((d / "manifest.json").read_text())
+        except Exception:
+            manifest = {"ticker": tk, "cik": cik, "resolved_via": via, "title": title}
+        manifest["skipped"] = skip_reason
+        manifest["skip_checked"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        (d / "manifest.json").write_text(json.dumps(manifest, indent=1))
+        print(f"dossier {tk}: SKIPPED — {skip_reason}")
+        return d
+
     rec = sub["filings"]["recent"]
     picked, counts = [], {f: 0 for f in FORM_COUNTS}
     for form, date, acc, doc in zip(rec["form"], rec["filingDate"],

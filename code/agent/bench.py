@@ -474,7 +474,8 @@ def work(minutes=60, model_key="fast", worker=None, think=None):
             if min_date:
                 fdate = _filing_date(t["file"])
                 date_ok = bool(fdate) and fdate >= min_date
-            survived = claimed and verbatim and amount_ok and date_ok
+            quote_fields_ok = _quote_fields_ok(qn, out, quote)
+            survived = claimed and verbatim and amount_ok and date_ok and quote_fields_ok
             if survived:
                 kept += 1
             q = _load(); tt = q["tasks"][t["id"]]
@@ -522,6 +523,28 @@ def _norm_amount(s):
     a 24k-char chunk — exactly the two rows the PM's own manual check found absent from
     the filing. Keeping the amount as a normalized PHRASE avoids that collision."""
     return re.sub(r"\s+", " ", (s or "").replace("$", "").lower()).strip()
+
+
+def _quote_fields_ok(qn, result, quote):
+    """bench.py-234: a rule can NAME fields the model must copy out of contradicting_disclosure
+    (channel 13's rule: 'holder and shares_or_pct must both be copied from inside
+    contradicting_disclosure') without the gate enforcing it — left to the model, a blank
+    field trivially 'appears' in the chunk and the row survives anyway. qn['quote_fields']
+    names the schema keys that must be (a) non-empty and (b) verbatim-present INSIDE the
+    quote itself (stricter than amount_key's chunk-wide check, which exists for a different
+    reason — see _norm_amount). Opt-in and empty by default, so channels that never set it
+    are unaffected. Also doubles as version drift protection: a channel number reused for a
+    redefined question (rank()'s _chan_id match is on the leading token only, bench.py-176)
+    carries an old schema with none of the new fields, so this rejects it too."""
+    fields = qn.get("quote_fields") or []
+    if not fields:
+        return True
+    nq = _norm(quote)
+    for fk in fields:
+        val = _norm((result or {}).get(fk) or "")
+        if not val or val not in nq:
+            return False
+    return True
 
 
 _FILE_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
@@ -652,17 +675,24 @@ def rank():
     here, at the source, means bench.json only ever holds evidence for the question actually
     on the PM's desk right now — matching _channel_stats()'s existing per-channel filter."""
     q = _load()
-    cur_channel = question()["channel"]
+    qn = question()
+    cur_channel = qn["channel"]
     cur_key = _chan_id(cur_channel)
     by = {}
     n_matched = 0
     for t in q["tasks"].values():
         if t.get("state") != "done" or not t.get("survived") or _chan_id(t.get("channel")) != cur_key:
             continue
-        n_matched += 1
         r = t["result"]
-        row = by.setdefault(t["ticker"], {"ticker": t["ticker"], "evidence": [], "best": 0})
         quote = r.get("contradicting_disclosure")
+        # bench.py-234: a channel number can be reused for a redefined question (_chan_id
+        # matches the leading token only) — a task scored under the OLD schema still has
+        # survived=True stored but carries none of the CURRENT question's quote_fields, so
+        # re-derive here rather than trust the stored flag.
+        if not _quote_fields_ok(qn, r, quote):
+            continue
+        n_matched += 1
+        row = by.setdefault(t["ticker"], {"ticker": t["ticker"], "evidence": [], "best": 0})
         row["evidence"].append({"quote": quote,
                                 "narrative": r.get("narrative"),
                                 "why": r.get("why_it_matters"),
@@ -696,9 +726,15 @@ def _channel_stats(channel):
     wording edit to the channel description doesn't orphan every task stamped before it."""
     q = _load()
     key = _chan_id(channel)
+    qn = question()
+    # bench.py-234: only apply the live question's quote_fields when this call IS about the
+    # live channel (its only caller) — a stale survived=True from a since-redefined question
+    # reusing this channel number must not count.
+    qn_applies = _chan_id(qn.get("channel")) == key
     done = [t for t in q["tasks"].values() if t.get("state") == "done" and _chan_id(t.get("channel")) == key]
     claimed = sum(1 for t in done if t.get("claimed"))
-    survived = sum(1 for t in done if t.get("survived"))
+    survived = sum(1 for t in done if t.get("survived")
+                   and (not qn_applies or _quote_fields_ok(qn, t.get("result"), (t.get("result") or {}).get("contradicting_disclosure"))))
     return {"read": len(done), "claimed": claimed, "survived": survived}
 
 
@@ -1067,10 +1103,11 @@ if __name__ == "__main__":
                      ("--schema", "schema"), ("--claim-key", "claim_key"),
                      ("--amount-key", "amount_key"), ("--min-filing-date", "min_filing_date"))
         flags = {flag: arg(flag) for flag, _ in flag_keys}
+        quote_fields_raw = arg("--quote-fields")
         # bench.py-230(c): a bare call (no positional, no flags) is a READ — it used to
         # fall through to the write path below and restamp set_by/set_at on every no-op
         # invocation, hiding when the question was actually last changed.
-        if positional is None and not any(v is not None for v in flags.values()):
+        if positional is None and not any(v is not None for v in flags.values()) and quote_fields_raw is None:
             print(f"question: channel={q['channel']!r} ask={q['ask'][:60]!r}... "
                   f"set_by={q.get('set_by')} set_at={q.get('set_at')}")
             forms = _corpus_forms()
@@ -1095,6 +1132,11 @@ if __name__ == "__main__":
                 q[key] = v
         if positional is not None:
             q["ask"] = positional
+        # bench.py-234: --quote-fields names schema keys (e.g. holder,shares_or_pct) whose
+        # value the gate requires non-empty AND verbatim-present inside contradicting_
+        # disclosure — see _quote_fields_ok. Comma-separated; blank clears it.
+        if quote_fields_raw is not None:
+            q["quote_fields"] = [f.strip() for f in quote_fields_raw.split(",") if f.strip()]
         # bench.py-066: the gate reads q['claim_key'] — REFUSE any question whose
         # schema does not declare that boolean, so a renamed key can never re-arm
         # the silent-zero failure (channels 12/13 scored 78 TRUE reads as 0).
