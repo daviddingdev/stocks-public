@@ -100,13 +100,49 @@ def trade_prompt(run_id="unrecorded"):
         block = (f"_reflect.py could not render your reflections ({type(e).__name__}: {e}). You are "
                  "running WITHOUT last session's lessons — say so in your session log and open an "
                  "ask against _engine/agent/reflect.py._")
-    return prompts.render("pm", REFLECTIONS=block, RUN_ID=run_id)
+    return prompts.render("pm", REFLECTIONS=block, RUN_ID=run_id, LAB_MODE=lab_mode_block())
+
+
+def lab_mode_block():
+    """The PM's service level, rendered into pm.md (${LAB_MODE}). The GUARD is safety.py's
+    LAB_MODE_NO_NEW_POSITIONS (HARD outside build); this block is the explanation the PM
+    reads so it plans exits and adds rather than filing intents the gateway will refuse."""
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+        m = _labmode.read()
+    except Exception:
+        return "LAB MODE: build (mode.py unavailable — assume full mandate)."
+    if m["lab"] == "build":
+        return "LAB MODE: build — the full MANDATE applies."
+    if m["lab"] == "lean":
+        return (f"LAB MODE: LEAN (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+                "The full MANDATE applies to your trades and you run daily as before. What changed is your STAFF: "
+                "no Sonnet VP review, no nightly Opus analyst, no numbers/signals engineers, no COO, no bug hunt, no "
+                "build engineer — the desk you read is code and the local model only (the VP's coded stages, fincards, "
+                "feeds, triggers, the Bench at 400 filings/120 min). David moved the desk's Claude budget and the night "
+                "GPU to his own PE and industry streams. Verify numbers from the fincards yourself, file asks only when "
+                "they block a trade (they queue for a build week; nobody reads them tomorrow), do not file research "
+                "or extra strategy sessions, and say in one paragraph of the session log what a staffed desk would "
+                "have caught that you could not.")
+    day = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}.get(_labmode.pm_day(), "the scheduled day")
+    return (f"LAB MODE: {m['lab'].upper()} (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+            "David has put this book at minimum capacity while the desk's resources go to his own books. "
+            "You open NO NEW POSITION: the execution gateway refuses a buy on any symbol not already held "
+            "(safety.py LAB_MODE_NO_NEW_POSITIONS, HARD). Sells, trims and adds to held names are yours as before. "
+            f"You run once a week ({day}) plus a session when a trigger trips; there is no nightly analyst except "
+            "before your day, so re-underwrite from the fincards yourself when a held name moves. Do not file "
+            "strategy sessions or new research; file asks that matter to the exits and say what you would have "
+            "done with a full mandate in one paragraph of the session log.")
 
 
 # NYSE full-day closures for 2026 — the trade cron does not know a holiday from a Monday.
 # 2026-09-07 is Labor Day: the strategy arc runs instead (David 2026-09-04).
 MARKET_HOLIDAYS = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
-                   "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"}
+                   "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+                   # 2027 (added 2026-09-20 with the weekly Tuesday PM — MLK and Presidents' Day are Mondays)
+                   "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+                   "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"}
 
 STRATEGY_ARC = ["2026-09-05", "2026-09-06", "2026-09-07"]   # David's three-day arc, markets closed
 
@@ -136,7 +172,9 @@ def strategy_prompt(today=None):
                           PRIOR=prior_txt, REFLECTIONS=block)
 
 
-def launch(mode, attempt=1, model_idx=0, now=False):
+def launch(mode, attempt=1, model_idx=0, now=False, event=False):
+    """event=True: a session a trigger launched (triggers.py ACTION) — job `pm_event`, which
+    every mode allows, so a held name can exit on a Wednesday in hibernate (2026-09-20)."""
     if mode == "trade" and dt.date.today().isoformat() in MARKET_HOLIDAYS:
         return {"ok": False, "msg": f"market holiday {dt.date.today()} — no trade session (loop.py MARKET_HOLIDAYS)"}
     if mode in ("trade", "strategy"):
@@ -144,7 +182,9 @@ def launch(mode, attempt=1, model_idx=0, now=False):
         try:
             sys.path.insert(0, str(ENGINE))
             import mode as _labmode
-            job = "strategy" if mode == "strategy" else ("pm_daily" if dt.date.today().weekday() != 0 else "pm_weekly")
+            weekly_day = _labmode.pm_day() if _labmode.pm_day() is not None else 0
+            job = ("strategy" if mode == "strategy" else "pm_event" if event
+                   else ("pm_weekly" if dt.date.today().weekday() == weekly_day else "pm_daily"))
             if not _labmode.allows(job):
                 return {"ok": False, "msg": f"lab mode {_labmode.lab()}: {job} does not run (mode.py) — no session"}
         except ImportError:

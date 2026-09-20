@@ -3585,6 +3585,8 @@ function nav(route,push){
   return x.text;}).then(function(h){if(h==null)return;
   /* inline, so it beats the stylesheet — keep it in step with #main{animation} */
   var m=document.getElementById('main');m.innerHTML=h;m.style.animation='none';void m.offsetWidth;m.style.animation='fade .07s linear';
+  /* a page module's own <script data-run> (charts on /dip/industries, 2026-09-20): innerHTML never executes scripts, so re-create them */
+  m.querySelectorAll('script[data-run]').forEach(function(s){var n=document.createElement('script');n.textContent=s.textContent;s.parentNode.replaceChild(n,s);});
   readBook();setActive(route);
   if(push)history.pushState({route:route},'',route);
   var nv=document.getElementById('nav');if(nv)nv.checked=false;window.scrollTo(0,0);setTitle();enhance();

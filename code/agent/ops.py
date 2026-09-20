@@ -244,7 +244,15 @@ def verify():
     phone alert and an ask to the COO (the asks channel, not a bespoke ledger, so C15 ages
     it and the board shows it). Run from cron daily, after the morning windows."""
     misses = []
+    try:   # a role the lab mode switches off cannot "miss" (lean 2026-09-20: numbers/signals/coo
+        sys.path.insert(0, str(ENGINE))   # are gated, their cron lines stay — verify must not page)
+        import mode as _labmode
+        _off = {r for r in FINISH if not _labmode.allows(r)}
+    except ImportError:
+        _off = set()
     for role, (pats, h, m, days) in FINISH.items():
+        if role in _off:
+            continue
         due = _last_scheduled(h, m, days)
         if due is None:
             continue

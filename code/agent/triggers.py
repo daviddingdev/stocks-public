@@ -201,7 +201,7 @@ def move_context(tk):
     return ctx
 
 
-def push(topic, title, msg):
+def push(topic, title, msg, nkind=None):
     """Routed through Mission Control's notify.sh so box-wide tiering sees it
     (PROJECT_STANDARDS §1). `topic` is kept for signature compatibility and is the
     same string the `stocks` channel resolves to; the channel is what we pass now."""
@@ -213,7 +213,7 @@ def push(topic, title, msg):
     # Declared actionable: every push from this engine is market-timed by construction,
     # but titles like "thesis-vs-price · ARI" miss the policy's actionable regex and were
     # held for the 23:00 rollup as digest (proven in the ledger, 2026-08-31 — 152/152 held).
-    _n.push(title, msg, channel="stocks", tier="actionable")
+    _n.push(title, msg, channel="stocks", tier="actionable", kind=nkind)
 
 
 def alert(state, c, key, kind, symbol, msg, action=False, book=""):
@@ -229,13 +229,16 @@ def alert(state, c, key, kind, symbol, msg, action=False, book=""):
     alerts.append({"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                    "kind": kind, "symbol": symbol, "msg": msg, "action": bool(action), "book": book})
     _write_json(ALERTS_F, alerts[-200:])
-    push(c["ntfy_topic"], f"{book or 'Stocks'} · {kind}" + (f" · {symbol}" if symbol and symbol != "AGENT" else ""), msg)
+    # an ACTION trip is the one alert class that must reach the phone in every lab mode
+    # (mode.PHONE: hibernate allows only "blocking") — a held name gapping on a Wednesday.
+    push(c["ntfy_topic"], f"{book or 'Stocks'} · {kind}" + (f" · {symbol}" if symbol and symbol != "AGENT" else ""), msg,
+         nkind="blocking" if action else None)
     if action:
         n = state.setdefault("trade_sessions", {})
         if n.get(today, 0) < c["max_auto_trade_sessions_per_day"]:
             pf = _j(DATA / "portfolio.json", {})
             if (pf.get("cash") or 0) > 0 or (pf.get("total_value") or 0) > 0:
-                r = loop.launch("trade")
+                r = loop.launch("trade", event=True)   # job pm_event: allowed in every mode
                 if r.get("ok"):
                     n[today] = n.get(today, 0) + 1
                     push(c["ntfy_topic"], "Stocks · agent", f"Decision session launched: {msg}")

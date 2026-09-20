@@ -476,8 +476,21 @@ def _defer_review(deadline, reason):
     return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": msg[:200]}
 
 
+def _pm_prep_today():
+    """hibernate (mode.py, 2026-09-20): the Claude prep stages run only on the PM's day."""
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+        return _labmode.pm_prep_today()
+    except Exception:
+        return True
+
+
 def review(timeout=1800):
     """Launch the VP's Sonnet review over the brief the coded stages just wrote."""
+    if not _pm_prep_today():
+        print("  [skip] review     lab mode: not the PM's day (mode.py pm_prep_today)")
+        return {"stage": "review", "ok": True, "seconds": 0, "out": "skipped: lab mode", "err": ""}
     sys.path.insert(0, str(ENGINE / "research"))
     import runner
     ok, msg = runner.auth_check()
@@ -656,6 +669,9 @@ def analyst(timeout=2400, take_slot=True):
     """The overnight ANALYST (Sonnet): a documents-first re-underwrite of the rotation name so
     the PM judges an analyst's work instead of doing it (David, 2026-09-01 — the human split:
     the analyst re-derives, the PM decides). Instructions: prompts/analyst.md (PM-owned)."""
+    if not _pm_prep_today():
+        print("  [skip] analyst    lab mode: not the PM's day (mode.py pm_prep_today)")
+        return {"stage": "analyst", "ok": True, "seconds": 0, "out": "skipped: lab mode", "err": ""}
     sys.path.insert(0, str(ENGINE / "research"))
     import runner
     ok, msg = runner.auth_check()

@@ -1068,6 +1068,18 @@ def brief(top=25):
     return BENCH_BRIEF
 
 
+def _plan():
+    """Tonight's (fill limit, worker minutes) from the lab mode (mode.py BENCH; lean = 400/120,
+    the rest 1500/300). The nightly cron line passes no numbers so one flag sizes the night;
+    an explicit --limit/--minutes still wins. Without mode.py: the old CLI defaults."""
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+        return _labmode.bench_plan()
+    except Exception:
+        return (40, 60)
+
+
 if __name__ == "__main__":
     a = sys.argv[1:2]
     def arg(flag, d=None, cast=str):
@@ -1077,9 +1089,16 @@ if __name__ == "__main__":
     elif a == ["fetch"]:
         fetch(arg("--limit", 120, int))
     elif a == ["fill"]:
-        fill(arg("--limit", 40, int))
+        fill(arg("--limit", _plan()[0], int))
     elif a == ["work"]:
-        work(arg("--minutes", 60, int), arg("--model", "fast"), arg("--worker"),
+        try:   # the lab's service level (mode.py): a mode may switch the Bench off
+            sys.path.insert(0, str(ENGINE))
+            import mode as _labmode
+            if not _labmode.allows("bench"):
+                print(f"lab mode {_labmode.lab()}: bench does not run (mode.py)"); sys.exit(0)
+        except ImportError:
+            pass
+        work(arg("--minutes", _plan()[1], int), arg("--model", "fast"), arg("--worker"),
              think=(True if "--think" in sys.argv else (False if "--no-think" in sys.argv else None)))
     elif a == ["status"]:
         status()
