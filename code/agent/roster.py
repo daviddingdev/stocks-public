@@ -99,7 +99,7 @@ ROLES = [
         # little boost in intelligence until things run smoothly." The 16 coded stages are
         # unchanged and still cost zero tokens; what Sonnet adds is a REVIEW of their output
         # before the PM sees it — the judgment a stage table cannot make.
-        "model": "sonnet",
+        "model": "opus",   # David 2026-09-20: every Claude job on the best Opus; sonnet retired
         "cron": "vp.py sweep",
         "purpose": "Prepares the PM's desk before it wakes: rebuilds cards, runs the numbers "
                    "watchdog, refreshes intel, scores and triages the funnel, rebuilds a dossier "
@@ -230,7 +230,7 @@ ROLES = [
         # RENAMED fixer -> numbers 2026-08-19 (ORG_PLAN): the org now has two engineers split
         # by DOMAIN, and "fixer" said nothing about which domain. `fixer` stays a working
         # alias everywhere (ops.py CLI, asks.py addresses) so nothing breaks mid-transition.
-        "model": "sonnet",
+        "model": "opus",   # David 2026-09-20: every Claude job on the best Opus; sonnet retired
         "cron": ["ops.py numbers", "ops.py fixer"],   # crontab still says fixer (alias)
         "purpose": "Owns the NUMBER pipeline (owners.py: subsystem `numbers`) — XBRL to card "
                    "to dossier to the watchdog. Works the quality queue and its ask inbox to "
@@ -253,7 +253,7 @@ ROLES = [
         # same reason the Numbers Engineer is: mechanical repair against evidence, judgment
         # deferred to the PM. Scheduled 30 min after Numbers so no new usage window opens
         # and the two never edit concurrently.
-        "model": "sonnet",
+        "model": "opus",   # David 2026-09-20: every Claude job on the best Opus; sonnet retired
         "cron": "ops.py signals",
         "purpose": "Owns the SIGNAL pipeline (owners.py: subsystem `signals`) — scout, feeds, "
                    "relevance, cannibal, the Bench, insider clusters, trigger RULES. Its "
@@ -275,7 +275,7 @@ ROLES = [
         # never ran — 4 asks deep, oldest stalled 5 days, while the /agent page showed a
         # false MISSED daily. Weekly on Friday: surface defects are real but rarely urgent,
         # and the hunt's Thursday run feeds it fresh repros.
-        "model": "sonnet",
+        "model": "opus",   # David 2026-09-20: every Claude job on the best Opus; sonnet retired
         # ON DEMAND since 2026-09-04 — no crontab line, by decision, not by drift
         # (CRON_REGISTRY.md line 42; PM on roster.py-145: both 14-day runs found 0 asks,
         # 0 defects). `cron: None` is what makes that intentional rather than a finding:
