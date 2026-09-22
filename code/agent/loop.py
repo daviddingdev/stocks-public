@@ -86,7 +86,7 @@ Do NOT place, modify, or cancel any orders. Using the brokerb-trading MCP tools:
 # The PM's instructions live in prompts/pm.md (decision-core, David-owned) and are
 # rendered by prompts.py at launch — see prompts.py for why they are a file and not a
 # string here. A placeholder that does not resolve fails the launch loudly.
-def trade_prompt(run_id="unrecorded"):
+def trade_prompt(run_id="unrecorded", finish=None):
     """The PM's instructions plus its reflections (REFLECTION.md): the lessons its own
     evaluators and it wrote after the last session. Reflection rendering fails OPEN with a
     visible marker — a session without its lessons is worse than one with them, but a
@@ -100,7 +100,27 @@ def trade_prompt(run_id="unrecorded"):
         block = (f"_reflect.py could not render your reflections ({type(e).__name__}: {e}). You are "
                  "running WITHOUT last session's lessons — say so in your session log and open an "
                  "ask against _engine/agent/reflect.py._")
-    return prompts.render("pm", REFLECTIONS=block, RUN_ID=run_id, LAB_MODE=lab_mode_block())
+    body = prompts.render("pm", REFLECTIONS=block, RUN_ID=run_id, LAB_MODE=lab_mode_block())
+    if finish:   # a finish_guard relaunch: finish the dead session, do not re-decide it
+        body = prompts.render("_finish_guard", DATE=dt.date.today().isoformat(),
+                              RUN_ID=finish.get("run_id", "unrecorded"),
+                              MISSING=finish.get("missing", "it wrote no session log")) + "\n\n" + body
+    return body + single_turn_note()
+
+
+def single_turn_note():
+    """prompts/_session_mechanics.md — the single-turn finish contract.
+
+    It has said "ending your turn to WAIT for a background task or Monitor notification IS
+    session death" since 2026-09-01 and ONLY ops.py appended it, so the PM — the one session
+    that moves dollars — never read it. On 2026-09-21 the 14:05Z session started two dossier
+    builds, ended its turn to wait for the notification, and died at 14:11Z having written
+    BOOK.md but no session log, no cards, and no gate on the day's two new board names
+    (C11). The rule existed, was correct, and was not wired to the session that needed it —
+    the `guardrail-inert` failure ~/CLAUDE.md names. contract.py C35 now proves it is armed
+    for every launcher, so this cannot silently come unwired again."""
+    import prompts
+    return prompts.mechanics()
 
 
 def lab_mode_block():
@@ -117,14 +137,18 @@ def lab_mode_block():
         return "LAB MODE: build — the full MANDATE applies."
     if m["lab"] == "lean":
         return (f"LAB MODE: LEAN (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
-                "The full MANDATE applies to your trades and you run daily as before. What changed is your STAFF: "
-                "no Sonnet VP review, no nightly Opus analyst, no numbers/signals engineers, no COO, no bug hunt, no "
-                "build engineer — the desk you read is code and the local model only (the VP's coded stages, fincards, "
-                "feeds, triggers, the Bench at 400 filings/120 min). David moved the desk's Claude budget and the night "
-                "GPU to his own PE and industry streams. Verify numbers from the fincards yourself, file asks only when "
-                "they block a trade (they queue for a build week; nobody reads them tomorrow), do not file research "
-                "or extra strategy sessions, and say in one paragraph of the session log what a staffed desk would "
-                "have caught that you could not.")
+                "That note is from the day the mode was set; David AMENDED it on 2026-09-21 and the "
+                "amendment is what follows, so read the staffing below over the note above. "
+                "The full MANDATE applies to your trades and you run daily as before. What changed is your STAFF. "
+                "You DO have: the VP's nightly sweep including its Opus review stage (so vp_brief.md is a prepared "
+                "desk again, not just the coded one), and the COO's weekend process review — which may itself file "
+                "ad-hoc numbers or signals sessions when it judges one is worth the tokens (David 2026-09-21). "
+                "You do NOT have: the overnight one-name analyst, numbers/signals on their own clocks, the bug hunt, "
+                "or the build engineer. The Bench runs short (400 filings/120 min) because David's PE and industry "
+                "streams have the night GPU. So: verify numbers from the fincards yourself on any name the analyst "
+                "would have re-underwritten, file asks only when they block a trade (they queue for a build week; "
+                "nobody reads them tomorrow), do not file research or extra strategy sessions, and say in one "
+                "paragraph of the session log what a fully staffed desk would have caught that you could not.")
     day = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}.get(_labmode.pm_day(), "the scheduled day")
     return (f"LAB MODE: {m['lab'].upper()} (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
             "David has put this book at minimum capacity while the desk's resources go to his own books. "
@@ -169,10 +193,10 @@ def strategy_prompt(today=None):
                  "running WITHOUT last session's lessons — say so in your session log and open an "
                  "ask against _engine/agent/reflect.py._")
     return prompts.render("pm_strategy", ARC=" / ".join(STRATEGY_ARC), DAY=day, DATE=today,
-                          PRIOR=prior_txt, REFLECTIONS=block)
+                          PRIOR=prior_txt, REFLECTIONS=block) + single_turn_note()
 
 
-def launch(mode, attempt=1, model_idx=0, now=False, event=False):
+def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
     """event=True: a session a trigger launched (triggers.py ACTION) — job `pm_event`, which
     every mode allows, so a held name can exit on a Wednesday in hibernate (2026-09-20)."""
     if mode == "trade" and dt.date.today().isoformat() in MARKET_HOLIDAYS:
@@ -233,7 +257,7 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False):
     import runlog   # run records (REVIEW-PLAN §1B): journal/runs/<run_id>.jsonl
     run_id = runlog.new_run_id()
     try:
-        prompt = SYNC_PROMPT if mode == "sync" else strategy_prompt() if mode == "strategy" else trade_prompt(run_id)
+        prompt = SYNC_PROMPT if mode == "sync" else strategy_prompt() if mode == "strategy" else trade_prompt(run_id, finish=finish)
     except Exception as e:   # a prompt with a hole is not a session; say so, do not launch
         return {"ok": False, "msg": f"prompt did not render: {type(e).__name__}: {e}"}
     if mode == "trade":
@@ -260,10 +284,9 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False):
     cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + mcp + tool_denylist(mode)
     models = runner.job_models("pm")
     if mode in ("trade", "strategy"):
-        cmd += ["--model", models[min(model_idx, len(models) - 1)]]
-    if mode == "trade":
         # the org chart's tier for the PM (roster CLAUDE_TIERS["best"]); _launch_guard falls
-        # back to the next entry if the installed CLI cannot run this one
+        # back to the next entry if the installed CLI cannot run this one. Appended ONCE —
+        # this block emitted `--model` twice for a trade session until 2026-09-21.
         cmd += ["--model", models[min(model_idx, len(models) - 1)]]
     # ONE CLAUDE SESSION AT A TIME (claudeq, David 2026-09-04). The TRADE session never
     # waits: it takes the slot over whatever is running (the queue's fit rule keeps the
@@ -308,6 +331,8 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False):
         subprocess.Popen(["bash", "-c",
                           f"while kill -0 {proc.pid} 2>/dev/null; do sleep 20; done; "
                           f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1; "
+                          # the session either left a log or gets one more attempt (2026-09-21)
+                          f"python3 {HERE}/loop.py finish-guard {run_id} >> {LOGS}/agent_reconcile.log 2>&1; "
                           f"sleep {runlog.ORPHAN_AFTER_S}; python3 {HERE}/runlog.py orphan {run_id} >> {LOGS}/agent_reconcile.log 2>&1"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if mode == "strategy":
@@ -394,6 +419,73 @@ def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"ok": False, "msg": f"trade died on usage limit; retry {attempt + 1} at {launch_at:%H:%M}Z"}
     return {"ok": False, "msg": "trade died on usage limit; no retry scheduled — needs eyes"}
+
+
+def finish_guard(run_id="unrecorded"):
+    """A TRADE SESSION THAT LEFT NO SESSION LOG DID NOT FINISH — relaunch it once.
+
+    David 2026-09-21, after the 14:05Z session died 6 minutes in: the harness-level cause is
+    fixed (runner.clean_env's background-wait ceiling) and the PM now reads the single-turn
+    contract (single_turn_note), but a prompt rule and an env var are both things that can come
+    undone. This is the part that holds regardless of WHY the session stopped: the run either
+    leaves a session log or it gets one more attempt, and David hears about it either way.
+
+    Runs from the detached watcher launch() already starts, after `reconcile` — so the pid is
+    long gone and the log, if there is one, is final. Guards against every way this could go
+    wrong on its own:
+      · one relaunch a day, ever (the marker file), so a session that keeps dying cannot loop
+      · nothing when the LAUNCH died (usage limit, model refused) — _launch_guard owns those
+        and re-files them; a second relaunch here would race it
+      · nothing after 19:30Z, the same cutoff _launch_guard uses: a session opening in the
+        last half hour of the market day cannot do its job
+      · the relaunch reads prompts/_finish_guard.md first, so it FINISHES the dead session
+        instead of re-deciding the day
+    """
+    today = dt.date.today().isoformat()
+    sessions = sorted((JOURNAL / "sessions").glob(f"{today}T*_session.md"))
+    if sessions:
+        return {"ok": True, "msg": f"session log present ({sessions[-1].name}) — nothing to finish"}
+
+    marker = DATA / f"finish_guard_{today}"
+    if marker.exists():
+        return {"ok": False, "msg": f"no session log for {today} and the one relaunch is spent "
+                                    f"({marker.read_text()[:80]}) — needs eyes"}
+
+    # a LAUNCH death belongs to _launch_guard, which pages and re-files on the stated reset
+    try:
+        tail = (LOGS / "agent_trade.log").read_text()[-600:].lower()
+    except Exception:
+        tail = ""
+    if "limit" in tail or "does not support this model" in tail or "invalid model" in tail:
+        return {"ok": False, "msg": "launch-time death (usage limit / model) — _launch_guard owns the retry"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    missing = "it wrote no session log"
+    try:      # name what else it skipped, so the relaunch knows where to start
+        import contract
+        cv = [c for c in contract.check() if c.startswith(("C11", "C30", "C33"))]
+        if cv:
+            missing += " — and " + "; ".join(c[:90] for c in cv[:3])
+    except Exception:
+        pass
+
+    late = (now.hour, now.minute) >= (19, 30)
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import notify as _n
+        _n.push("Agent trade session FAILED to finish — no session log",
+                f"run {run_id} left no session log for {today}. "
+                + ("NO relaunch (past 19:30Z, too late in the market day) — needs eyes."
+                   if late else "Relaunching once to finish it (prompts/_finish_guard.md)."),
+                tier="critical")   # money-book; never held, never capped (notify_policy.json)
+    except Exception:
+        pass
+    if late:
+        return {"ok": False, "msg": f"no session log for {today} and it is past 19:30Z — paged, no relaunch"}
+
+    marker.write_text(f"{now.isoformat(timespec='seconds')} relaunched to finish {run_id}: {missing}")
+    r = launch("trade", finish={"run_id": run_id, "missing": missing})
+    return {"ok": bool(r.get("ok")), "msg": f"finish relaunch: {r.get('msg', '?')}"}
 
 
 def reconcile():
@@ -600,11 +692,13 @@ if __name__ == "__main__":
     m = sys.argv[1] if sys.argv[1:] else ""
     if m == "reconcile":
         r = reconcile()
+    elif m in ("finish-guard", "finish_guard"):
+        r = finish_guard(sys.argv[2] if sys.argv[2:] else "unrecorded")
     elif m in ("sync", "trade", "strategy"):
         att = int(sys.argv[2]) if sys.argv[2:] and sys.argv[2].isdigit() else 1
         midx = int(sys.argv[3]) if sys.argv[3:] and sys.argv[3].isdigit() else 0
         r = launch(m, attempt=att, model_idx=midx, now="--now" in sys.argv)
     else:
-        sys.exit("usage: loop.py sync | loop.py trade | loop.py strategy [--now] | loop.py reconcile")
+        sys.exit("usage: loop.py sync | loop.py trade | loop.py strategy [--now] | loop.py reconcile | loop.py finish-guard [run_id]")
     print(json.dumps(r))
     sys.exit(0 if r["ok"] else 1)

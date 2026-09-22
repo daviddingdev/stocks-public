@@ -476,20 +476,22 @@ def _defer_review(deadline, reason):
     return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": msg[:200]}
 
 
-def _pm_prep_today():
-    """hibernate (mode.py, 2026-09-20): the Claude prep stages run only on the PM's day."""
+def _pm_prep_today(stage=None):
+    """hibernate (mode.py, 2026-09-20): the Claude prep stages run only on the PM's day.
+    Asked PER STAGE since 2026-09-21, because lean runs `review` and not `analyst`."""
     try:
         sys.path.insert(0, str(ENGINE))
         import mode as _labmode
-        return _labmode.pm_prep_today()
+        return _labmode.pm_prep_today(stage=stage)
     except Exception:
         return True
 
 
 def review(timeout=1800):
-    """Launch the VP's Sonnet review over the brief the coded stages just wrote."""
-    if not _pm_prep_today():
-        print("  [skip] review     lab mode: not the PM's day (mode.py pm_prep_today)")
+    """Launch the VP's review over the brief the coded stages just wrote. OPUS since the org
+    chart moved it there (roster.py vp=opus) — this docstring said Sonnet until 2026-09-21."""
+    if not _pm_prep_today("review"):
+        print("  [skip] review     lab mode: review does not run (mode.py pm_prep_today)")
         return {"stage": "review", "ok": True, "seconds": 0, "out": "skipped: lab mode", "err": ""}
     sys.path.insert(0, str(ENGINE / "research"))
     import runner
@@ -504,7 +506,9 @@ def review(timeout=1800):
                                      "mcpServers": {}}, indent=1))
     try:
         import prompts
-        prompt = prompts.render("vp")
+        # + the single-turn contract: the VP reads a desk and writes a brief in ONE turn,
+        # and until 2026-09-21 only ops roles were told that (see prompts.mechanics()).
+        prompt = prompts.render("vp") + prompts.mechanics()
     except Exception as e:
         print(f"  [FAIL] review     prompt did not render: {e}")
         return {"stage": "review", "ok": False, "seconds": 0, "out": "", "err": str(e)[:200]}
@@ -669,8 +673,8 @@ def analyst(timeout=2400, take_slot=True):
     """The overnight ANALYST (Sonnet): a documents-first re-underwrite of the rotation name so
     the PM judges an analyst's work instead of doing it (David, 2026-09-01 — the human split:
     the analyst re-derives, the PM decides). Instructions: prompts/analyst.md (PM-owned)."""
-    if not _pm_prep_today():
-        print("  [skip] analyst    lab mode: not the PM's day (mode.py pm_prep_today)")
+    if not _pm_prep_today("analyst"):
+        print("  [skip] analyst    lab mode: analyst does not run (mode.py pm_prep_today)")
         return {"stage": "analyst", "ok": True, "seconds": 0, "out": "skipped: lab mode", "err": ""}
     sys.path.insert(0, str(ENGINE / "research"))
     import runner
@@ -688,7 +692,7 @@ def analyst(timeout=2400, take_slot=True):
     try:
         import prompts
         prompt = prompts.render("analyst", SYMBOL=tk, LAST_REUNDERWRITE=last if last != "0000-00-00" else "never",
-                                MEMOS=", ".join(str(m) for m in memos[-4:]) or "(no memos yet)")
+                                MEMOS=", ".join(str(m) for m in memos[-4:]) or "(no memos yet)") + prompts.mechanics()
     except Exception as e:
         print(f"  [FAIL] analyst    prompt did not render: {e}")
         return {"stage": "analyst", "ok": False, "seconds": 0, "out": "", "err": str(e)[:200]}

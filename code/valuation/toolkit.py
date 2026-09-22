@@ -99,6 +99,29 @@ def reverse_target(target_price, shares, net_cash, fixed_rnpv, driver):
             "driver_peak_needed": need_from_driver / per_peak if per_peak else None}
 
 
+def epv(ebit, tax_rate=0.23, wacc=0.09, maintenance_capex=None, dna=None, net_cash=0.0, shares=None):
+    """EARNINGS POWER VALUE — Greenwald's no-growth floor. What the business is worth if it never
+    grows again: normalised after-tax operating earnings capitalised at the cost of capital.
+
+    Growth is the assumption every DCF argues about; EPV removes it. If EPV alone already covers
+    the price, the growth is free. If the price is three times EPV, the whole case is the growth —
+    which is the question to ask before paying a multiple, not after.
+
+    maintenance capex defaults to D&A (the standard proxy: what it costs to stand still)."""
+    if not ebit or not wacc:
+        return None
+    mcap_x = dna if maintenance_capex is None else maintenance_capex
+    adj = float(ebit) - (float(mcap_x) - float(dna)) if (mcap_x is not None and dna is not None) else float(ebit)
+    nopat = adj * (1.0 - float(tax_rate))
+    ev = nopat / float(wacc)
+    out = {"nopat": nopat, "ev": ev, "equity": ev + float(net_cash),
+           "assumptions": {"tax_rate": tax_rate, "wacc": wacc,
+                           "maintenance_capex": mcap_x, "dna": dna}}
+    if shares:
+        out["per_share"] = out["equity"] / float(shares)
+    return out
+
+
 def comps_ev(metric_value, multiple, net_cash=0.0, shares=None):
     """Relative valuation — value off what peers trade at.
 

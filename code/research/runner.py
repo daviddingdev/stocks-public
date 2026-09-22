@@ -95,8 +95,20 @@ def clean_env():
     # `claude -p` kills background tasks at a 600s ceiling and exits — that is exactly
     # how the PANW run died (2026-08-14: "Background tasks still running after 600s;
     # terminating"), losing adversarial-review, FINAL-REPORT, lenses and card after
-    # four hours of work. 0 = wait for them.
-    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"
+    # four hours of work.
+    #
+    # THIS WAS "0" FOR A MONTH, MEANING THE OPPOSITE OF WHAT IT SAID (fixed 2026-09-21).
+    # The CLI reads the value as the ceiling ITSELF, not as a sentinel:
+    #   var __=600000; function Hm(){ return a.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? __ }
+    # `?? ` only fills in when the var is ABSENT, so "0" is a zero-millisecond ceiling —
+    # already exceeded the instant the turn ends — and the wind-down kills every background
+    # shell after a 5s grace. That is how the 2026-09-21 14:05Z PM session died: it started
+    # two dossier builds, ended its turn to wait for the completion notification, and the
+    # harness swept the waiter 18 seconds later ("[killed]" in the task output) instead of
+    # holding the process for the pending notification the way a non-zero ceiling does.
+    # 30 minutes = 3x the default, finite so a runaway background task cannot hold the
+    # claudeq slot forever.
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "1800000"
     tok = saved_token()
     if tok:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
@@ -163,7 +175,8 @@ def _watchdog(pid, log_path, cap_min):
 
 
 def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s=0):
-    """Spawn ONE headless Claude session. ONE AT A TIME (claudeq, David 2026-09-04): a
+    """Spawn ONE headless Claude session. `prompt` may be a string or a CALLABLE — a callable is
+    resolved after the slot is acquired, so a queued job picks its work when it starts. ONE AT A TIME (claudeq, David 2026-09-04): a
     caller that names its `job` is a fixed cron launch (board, primer) — it waits up to
     wait_s for the Claude slot and then holds it; a caller that does not is being
     dispatched by claudeq.tick(), which already holds the slot for it. Either way a
@@ -177,6 +190,14 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
         if not claudeq.wait_free(wait_s):
             h = claudeq._read(claudeq.HOLDER) or {}
             return {"ok": False, "msg": f"Claude slot busy after {wait_s}s: {h.get('job', '?')} still running"}
+    # A job that WAITED for the slot must choose its work now, not when it was filed. Pass a
+    # callable and it is resolved here, after the wait. Three one-pager sessions chained on
+    # 2026-09-21 each computed their ten names up front, so the second rewrote six the first had
+    # already written — six minutes of Opus on work that was already done.
+    if callable(prompt):
+        prompt = prompt()
+    if not prompt:
+        return {"ok": False, "msg": "nothing to do: the prompt builder returned empty"}
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "w")
     try:

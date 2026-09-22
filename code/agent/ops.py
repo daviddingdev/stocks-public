@@ -120,7 +120,7 @@ ROLE_ALIASES = {"fixer": "numbers"}
 # single-turn finish contract. On 2026-08-20 the Numbers Engineer rebuilt 150 cards,
 # then ended its turn to "genuinely wait" for background notifications — and died.
 def single_turn_note():
-    return "\n\n" + prompts.render("_session_mechanics")
+    return prompts.mechanics()
 
 
 # role -> (report globs, cron hour, cron minute, weekdays as Mon=0) — the finish contract
@@ -332,20 +332,66 @@ def verify():
     return 0 if not misses else 1
 
 
-def launch(role, now=False):
+GRANT_TTL_H = 48   # a weekend grant still dispatches on Monday if the queue ran late
+
+
+def _grant_file(role):
+    return DATA / f"ops_grant_{role}.json"
+
+
+def _mode_ok(role, by=None, now=False):
+    """(allowed, why-not). The lab's service level (mode.py) with one wrinkle: an AD-HOC GRANT
+    has to survive the queue. The COO files `ops.py numbers --by coo` on a Saturday; the queue
+    dispatches it later as `ops.launch("numbers", now=True)` with no `by` at all (Mission
+    Control's claudeq.py-1037 — a foreign file this project does not edit, box rule 6). So the
+    filing writes the grant down, and the dispatch reads it back. The record says who granted
+    it and when, which is also what makes it auditable after the fact."""
+    import datetime as _dt
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+    except ImportError:
+        return True, ""
+    if _labmode.allows(role):
+        return True, ""
+    if by and _labmode.allows(role, by=by):
+        if not now:   # filing: record the grant so the dispatch can honour it
+            try:
+                DATA.mkdir(parents=True, exist_ok=True)
+                _grant_file(role).write_text(json.dumps(
+                    {"role": role, "by": by, "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+                     "mode": _labmode.lab()}, indent=1))
+            except Exception:
+                pass
+        return True, ""
+    if now:   # dispatch: is there a live grant from a role that was entitled to give one?
+        try:
+            g = json.loads(_grant_file(role).read_text())
+            at = _dt.datetime.fromisoformat(g["at"])
+            age_h = (_dt.datetime.now(_dt.timezone.utc) - at).total_seconds() / 3600
+            if age_h <= GRANT_TTL_H and _labmode.allows(role, by=g.get("by"), t=at):
+                return True, ""
+        except Exception:
+            pass
+    return False, (f"lab mode {_labmode.lab()}: ops {role} does not run (mode.py)"
+                   + (f" and {by} has no ad-hoc grant for it today" if by else ""))
+
+
+def launch(role, now=False, by=None):
     """An ops role's cron line FILES the job (claudeq) — the queue runs it when the Claude
     slot is free and the clock allows, one session at a time (David 2026-09-04). now=True
-    is the queue dispatching it."""
+    is the queue dispatching it.
+
+    `by` is the role asking on its own authority. David 2026-09-21: the COO may file ad-hoc
+    numbers/signals sessions on the weekend even in a mode whose schedule has them off, so
+    `ops.py numbers --by coo` runs where the Tue 06:30Z cron line does not (mode.ON_DEMAND_BY).
+    A cron line passes no `by` and stays gated — the distinction is deliberate."""
     role = ROLE_ALIASES.get(role, role)
     if role not in PROMPTS:
         return {"ok": False, "msg": f"unknown ops role {role}"}
-    try:   # the lab's service level (mode.py, 2026-09-12): freeze drops hunt + build, hibernate drops all
-        sys.path.insert(0, str(ENGINE))
-        import mode as _labmode
-        if not _labmode.allows(role):
-            return {"ok": False, "skipped": True, "msg": f"lab mode {_labmode.lab()}: ops {role} does not run (mode.py)"}
-    except ImportError:
-        pass
+    ok_mode, why = _mode_ok(role, by=by, now=now)
+    if not ok_mode:
+        return {"ok": False, "skipped": True, "msg": why}
     if not now:
         sys.path.insert(0, str(ENGINE))
         import claudeq
@@ -389,7 +435,11 @@ if __name__ == "__main__":
     if r == "verify":
         sys.exit(verify())
     if r in PROMPTS:
-        out = launch(r)
+        # --by <role>: the caller's own authority (mode.ON_DEMAND_BY). The COO uses
+        # `ops.py numbers --by coo` for the ad-hoc weekend sessions David granted 2026-09-21.
+        by = sys.argv[sys.argv.index("--by") + 1] if "--by" in sys.argv[2:] else None
+        out = launch(r, by=by)
         print(json.dumps(out))
         sys.exit(0 if out["ok"] else 1)
-    sys.exit("usage: ops.py numbers|signals|coo|hunt|verify   (fixer = alias for numbers)")
+    sys.exit("usage: ops.py numbers|signals|coo|hunt|verify [--by <role>]   "
+             "(fixer = alias for numbers)")

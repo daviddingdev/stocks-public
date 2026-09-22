@@ -38,6 +38,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -47,6 +48,11 @@ HERE = Path(__file__).resolve().parent
 ENGINE = HERE.parent
 DATA = HERE / "data"
 NAMES = HERE / "names"
+# A question that claims NOTHING in this many reads is not a question this corpus can answer.
+# Two nights on channel 13 (2026-09-20/21) read 796 filings for 1 claim and 0 survivors; nothing
+# in the run said so, because the end-of-run survival line only prints when hits > 0.
+YIELD_FLOOR = 300
+
 QUEUE = DATA / "bench_queue.json"
 QFILE = DATA / "bench_question.json"
 BENCH = DATA / "bench.json"
@@ -217,9 +223,18 @@ def _strip(raw):
     return _WS_RE.sub(" ", txt)
 
 
-def universe(min_rev=50e6, max_rev=20e9):
+def universe(min_rev=50e6, max_rev=None):
     """Every SEC filer with real disclosed revenue in the band. One frames request per tag
-    covers the whole market — no per-name fetching, no vendor, no survivorship filter."""
+    covers the whole market — no per-name fetching, no vendor, no survivorship filter.
+
+    THE UPPER CAP IS GONE (2026-09-21). It was $20B, and David asked the right question — "the
+    2500 names might only be small companies, can look at bigger ones too." Measured: the capped
+    universe had a $1.0B median and a $19.9B maximum, and **16 of the 80 tracked industry names
+    sat outside it** — CRM, ADBE, CRWD, NVDA, AVGO, AMD, QCOM, MU, MCHP, LRCX, AMAT, AMGN, ETN,
+    PWR, LHX (too big) and OABI (too small). Eight of the twenty semis were above the cap, which
+    is why the expansion could never nominate a semis peer: the only comps it could see were
+    structurally smaller than the companies being analysed. min_rev stays at $50M — below that the
+    revenue tag is mostly shells and pre-revenue filers."""
     rev = {}
     for tag in REV_TAGS:
         for per in ("CY2024", "CY2025"):
@@ -229,7 +244,7 @@ def universe(min_rev=50e6, max_rev=20e9):
     names = {int(v["cik_str"]): v["title"] for v in m.values()}
     out = {}
     for cik, v in rev.items():
-        if not v or not (min_rev <= v <= max_rev):
+        if not v or v < min_rev or (max_rev is not None and v > max_rev):
             continue
         tk = by_cik.get(int(cik))
         if not tk or not tk.isalpha():      # drop units/warrants/preferreds
@@ -239,7 +254,8 @@ def universe(min_rev=50e6, max_rev=20e9):
                       "_doc": "Whole-market readable set. The book gets no privileged place here.",
                       "names": out})
     funnel_record("bench:universe", len(rev), len(out))
-    print(f"universe: {len(out)} companies with ${min_rev/1e6:.0f}M-${max_rev/1e9:.0f}B revenue")
+    cap = f"${max_rev/1e9:.0f}B" if max_rev else "no cap"
+    print(f"universe: {len(out)} companies with revenue ${min_rev/1e6:.0f}M-{cap}")
     return out
 
 
@@ -489,6 +505,12 @@ def work(minutes=60, model_key="fast", worker=None, think=None):
             done += 1
             if survived:
                 print(f"  HIT {t['ticker']:<6} {quote[:90]}")
+            # THE YIELD GUARD: zero claims in YIELD_FLOOR reads means the corpus does not hold
+            # what the question asks for. Reading on is provably wasted GPU, and silence is
+            # indistinguishable from working — so stop and say so where someone will see it.
+            if hits == 0 and done >= YIELD_FLOOR:
+                _yield_alarm(qn, done, el_min=(time.time() - t_start) / 60)
+                break
         except Exception as e:
             q = _load(); tt = q["tasks"].get(t["id"])
             if tt:
@@ -505,8 +527,17 @@ def work(minutes=60, model_key="fast", worker=None, think=None):
     funnel_record("bench:survived", hits, kept)
     print(f"\nworker {worker}: {done} read · {errs} err · {hits} claimed · {kept} SURVIVED "
           f"verbatim check · {el:.1f}m · {rate:.1f} reads/min")
+    # Two different failure modes, and the old single line conflated them: it printed
+    # "survival rate 0% — a low rate means the prompt is too loose" for a night whose real
+    # problem was 1 claim in 564 reads (too RARE), and printed nothing at all when hits was 0.
+    if done:
+        print(f"yield {100.0 * hits / done:.1f}% ({hits} claims in {done} reads) — "
+              + ("nothing claimed: the corpus likely does not hold what this question asks for"
+                 if hits == 0 else
+                 "a low yield means the question is too RARE or too narrow for this corpus"))
     if hits:
-        print(f"survival rate {100*kept//hits}% — a low rate means the prompt is too loose")
+        print(f"survival {100 * kept // hits}% ({kept} of {hits} claims verified) — "
+              "a low survival means the prompt is too LOOSE and the model is over-claiming")
     return done
 
 
@@ -736,6 +767,51 @@ def _channel_stats(channel):
     survived = sum(1 for t in done if t.get("survived")
                    and (not qn_applies or _quote_fields_ok(qn, t.get("result"), (t.get("result") or {}).get("contradicting_disclosure"))))
     return {"read": len(done), "claimed": claimed, "survived": survived}
+
+
+def _yield_alarm(qn, done, el_min):
+    """Zero claims in YIELD_FLOOR reads. Stop the run and make it loud — box rule 1 says the
+    push goes through maintenance/bin/notify.sh, never a raw ntfy POST."""
+    ch = str(qn.get("channel", "?"))[:70]
+    msg = (f"{done} reads, 0 claims in {el_min:.0f}m. The corpus is "
+           + ", ".join(f"{n} {f}" for f, n in _corpus_forms().items())
+           + f". Question: {ch}")
+    print(f"\n*** YIELD GUARD: stopping. {msg}")
+    print("*** Nothing was claimed, so nothing could survive. Change the question or the corpus;")
+    print("*** reading on would spend the rest of the window to learn the same thing again.")
+    try:
+        subprocess.run(["/home/user/maintenance/bin/notify.sh", "--tier", "critical", "alerts",
+                        "Bench yield guard tripped", msg], timeout=30, check=False)
+    except Exception as e:
+        print(f"*** (notify failed: {str(e)[:70]})")
+    try:
+        _write(DATA / "bench_yield_alarm.json",
+               {"at": _now(), "channel": qn.get("channel"), "reads": done, "claims": 0,
+                "minutes": round(el_min, 1), "corpus_forms": _corpus_forms()})
+    except Exception:
+        pass
+
+
+# Mechanisms and the forms that actually disclose them. A question naming one of these words
+# needs the matching form in the corpus; asking a 10-K/10-Q corpus about a lock-up is asking a
+# document that does not carry the disclosure.
+FORM_HINTS = {
+    "S-1":    ("lock-up", "lockup", "selling stockholder", "registration rights", "ipo prospectus"),
+    "424B":   ("lock-up", "lockup", "secondary offering", "selling stockholder", "prospectus supplement"),
+    "S-3":    ("shelf", "shelf registration", "at-the-market", "atm program"),
+    "8-K":    ("delisting", "going concern notice", "bankruptcy filing", "chapter 11"),
+    "SC 13D": ("13d", "schedule 13d", "activist stake", "intends to sell its shares"),
+    "SC 13G": ("13g", "schedule 13g", "passive stake"),
+    "DEF 14A": ("say-on-pay", "compensation discussion and analysis", "proxy statement"),
+    "4":      ("form 4", "insider sale", "10b5-1"),
+}
+
+
+def _forms_the_question_needs(q):
+    """The SEC forms a question's own words imply. Conservative: only fires on the phrases above,
+    so an ordinary question about a 10-K's contents needs nothing and the check is a no-op."""
+    hay = " ".join(str(q.get(k, "")) for k in ("channel", "ask", "rule")).lower()
+    return {form for form, words in FORM_HINTS.items() if any(w in hay for w in words)}
 
 
 def _corpus_forms():
@@ -1168,10 +1244,28 @@ if __name__ == "__main__":
                 sys.exit(f"REFUSED: schema booleans {bools} do not include claim_key "
                          f"{ck!r} — pass --claim-key naming the boolean the gate should read")
         q["claim_key"] = ck
-        q["set_by"] = "PM"; q["set_at"] = _now()
+        # bench.py: `set_by` was hard-coded "PM" on every write, so the field recorded who the
+        # author was ASSUMED to be, not who ran the command — and "set_by PM" then got read back
+        # as evidence the PM had chosen this question. It is not evidence. --by names the caller;
+        # BENCH_SET_BY lets a job stamp itself without passing a flag.
+        # bench.py-059 printed the corpus forms here and let the write proceed. Channel 13 —
+        # a lock-up / registration-rights question — was set twice anyway, and each night read
+        # the whole window for nothing. _corpus_forms()'s own docstring already says a channel
+        # asking about a mechanism disclosed in absent forms "cannot find it no matter how good
+        # the question is", so the check is now binding. --force-corpus overrides it on purpose.
+        forms = _corpus_forms()
+        missing = _forms_the_question_needs(q) - set(forms)
+        if missing and "--force-corpus" not in sys.argv:
+            sys.exit(f"REFUSED: this question reads on {', '.join(sorted(missing))}, and the corpus "
+                     f"holds only {', '.join(f'{n} {f}' for f, n in forms.items())}. That mechanism "
+                     f"is not disclosed in these forms, so no prompt can find it. Rebuild the corpus "
+                     f"with those forms, pick a mechanism these forms DO disclose, or pass "
+                     f"--force-corpus if you mean to spend the window anyway.")
+
+        q["set_by"] = arg("--by") or os.environ.get("BENCH_SET_BY") or "unattributed"
+        q["set_at"] = _now()
         _write(QFILE, q)
         print(f"question set: channel={q['channel']!r} ask={q['ask'][:60]!r}... rule={q['rule'][:60]!r}...")
-        forms = _corpus_forms()
         # bench.py-059: printed at set-time so the PM sees the constraint BEFORE spending a
         # night on a channel the corpus structurally cannot answer (e.g. lock-ups/shelves,
         # which live in S-1/S-3/424B/8-K — forms this 10-K/10-Q corpus does not contain).

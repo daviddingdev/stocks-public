@@ -2514,7 +2514,7 @@ article{max-width:min(100%,100ch);font-size:clamp(15px,.32vw + 11.5px,19px);line
 .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;flex-wrap:wrap;margin-bottom:clamp(18px,2vw,30px)}
 .pagehead h1{margin:0;font-size:clamp(26px,1.2vw + 20px,36px);letter-spacing:-.02em}.headactions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .connectbtn .ic,.btn .ic{width:14px;height:14px}
-.kpirow{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin-bottom:28px}
+.kpirow{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:18px;margin-bottom:28px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:24px 26px;box-shadow:var(--shadow)}
 .kpi.hero{grid-column:span 2}
 .kk{font-size:13px;color:var(--mut);margin-bottom:12px;font-weight:500}
@@ -2539,6 +2539,16 @@ article{max-width:min(100%,100ch);font-size:clamp(15px,.32vw + 11.5px,19px);line
 .dt .rmc{width:40px;text-align:center}.dt .cat{color:var(--mut);font-size:14px}
 .pfempty2{padding:40px 24px;color:var(--mut);font-size:15.5px;text-align:center}
 .subname{font-size:12.5px;color:var(--mut);font-weight:400;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
+/* max-width, overflow and text-overflow do NOT apply to an inline non-replaced box, so the
+   rule above only ever set nowrap on a <span class=subname> — long text then ran past its
+   container instead of ellipsising (PE firm cards, 1,298px of strategy text in a 900px
+   column, 2026-09-21). Inline ones wrap; the block ones keep the ellipsis. */
+span.subname{white-space:normal;overflow:visible;max-width:none}
+/* A grid/flex child defaults to min-width:auto and will not shrink below its content, which
+   pushes it out of its own track on a narrow phone. These two are the home layout's columns.
+   Long unbreakable strings (paths, tickers in <code>) break instead of overflowing. */
+.homegrid>*,.homemain,.homerail,.whead>*{min-width:0}
+code{overflow-wrap:anywhere}
 .dt .pnl.up{color:var(--pos)}.dt .pnl.down{color:var(--neg)}.dt .pnl{font-weight:600}.dt .pnl .pct{font-weight:400;opacity:.8}
 .arow{display:flex;justify-content:space-between;align-items:baseline;padding:11px 0;border-bottom:1px solid var(--line);font-size:15px}
 .arow:last-child{border-bottom:none}.arow>span:first-child{color:var(--mut)}
@@ -2600,7 +2610,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .mchg{font-size:14px;font-weight:500}.mchg.up{color:var(--pos)}.mchg.down{color:var(--neg)}
 .mmeta{font-size:13px;color:var(--mut)}.mload{font-size:13px;color:var(--fade)}
 .spark{flex-shrink:0;line-height:0}.spark svg{display:block}
-.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:.4em 0 .6em}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(150px,100%),1fr));gap:10px;margin:.4em 0 .6em}
 .tile{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .tk{font-size:12px;color:var(--mut);margin-bottom:4px}.tv{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums}
 .tv.neg{color:var(--neg)}.tp{font-size:11px;color:var(--fade);margin-top:2px}
@@ -2635,7 +2645,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .vsig{font-size:21px;font-weight:600;display:flex;align-items:baseline;gap:10px}
 .vconf{font-size:12px;font-weight:400;color:var(--mut);text-transform:none}
 .vsum{font-size:14px;color:var(--mut);margin-top:6px;max-width:78ch}.vbar{font-size:12.5px;color:var(--muted,#8a8a8a);margin:2px 0 6px}.vbar b{font-weight:600;color:inherit}
-.lensgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px}
+.lensgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(232px,100%),1fr));gap:10px}
 .lens{border:1px solid var(--line);border-radius:11px;padding:13px 15px;background:var(--panel);transition:border-color .12s}
 .lens:hover{border-color:var(--mut)}
 .lhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:3px}
@@ -2652,7 +2662,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .lnote{font-size:13px;color:var(--mut);line-height:1.5}
 .theadbtns{display:flex;gap:10px;flex-wrap:wrap}
 .pchart{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin:.2em 0 1.4em;box-shadow:var(--shadow)}
-.ranges{display:flex;gap:6px;margin-bottom:12px}
+.ranges{display:flex;gap:6px;margin-bottom:12px;min-width:0;flex-wrap:wrap}
 .rbtn{border:1px solid var(--line);background:transparent;color:var(--mut);border-radius:8px;padding:6px 13px;font-size:13px;font-weight:500;cursor:pointer}
 .rbtn:hover{border-color:var(--acc);color:var(--acc)}.rbtn.on{background:var(--accbg);border-color:var(--acc);color:var(--acc)}
 .chartbox{position:relative;height:320px;width:100%}
@@ -2687,7 +2697,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .pfstat .pfk{font-size:12px;color:var(--mut)}.pfstat .pfv{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
 .pfstat .pfv.up{color:var(--pos)}.pfstat .pfv.down{color:var(--neg)}
 .pfempty{background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:20px 22px;color:var(--mut);font-size:14px;margin:.4em 0}
-.board{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.board{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(220px,100%),1fr));gap:12px}
 .pcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;cursor:pointer;transition:border-color .12s,transform .08s}
 .pcard:hover{border-color:var(--acc)}.pcard:active{transform:scale(.995)}
 .pctop{display:flex;align-items:center;justify-content:space-between}
@@ -2731,7 +2741,7 @@ main{padding:16px 16px 60px;max-width:100%}
 .widget{border-radius:14px}.chips{gap:5px}
 .headactions{width:100%}.headactions .btn,.headactions .connectbtn{flex:1;justify-content:center}}
 /* ---- key stats grid ---- */
-.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:1px;background:var(--line);
+.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(178px,100%),1fr));gap:1px;background:var(--line);
 border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:0 0 22px}
 .stat{background:var(--panel);padding:13px 16px;min-width:0}
 .stat.wide{grid-column:span 2}
@@ -2845,7 +2855,7 @@ padding:16px 20px;margin:0 0 18px;box-shadow:var(--shadow)}
 .tchead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;font-size:13px}
 .tcthesis{font-size:15.5px;font-weight:600;line-height:1.5;letter-spacing:-.005em}
 .tcnote{font-size:13.5px;color:var(--mut);margin-top:5px;line-height:1.55}
-.tccols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:4px 22px;margin-top:12px}
+.tccols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:4px 22px;margin-top:12px}
 .tccol ul{margin:4px 0 0;padding-left:1.15em}
 .tccol li{font-size:13.5px;line-height:1.5;margin:.25em 0}
 .tclab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600;margin-top:6px}
@@ -3711,6 +3721,9 @@ advised_page.register(app, wrap)
 
 import dip_page  # /dip — the DIP Venture book (BROKERA entity account: Waffle stake + strategic cash; own module)
 dip_page.register(app, wrap)
+
+import judgements_page  # /dip/judgements — what the local models concluded, and their reasoning
+judgements_page.register(app, wrap)
 
 import lookups_page  # /lookups — HBS-library upload desk (Capital IQ / IBISWorld exports)
 lookups_page.register(app, wrap)
