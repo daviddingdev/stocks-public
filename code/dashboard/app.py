@@ -11,10 +11,12 @@ Finnhub quotes/news; EDGAR filings; yfinance fallback.
 
 View: http://<host-ip>:8787
 """
+import collections
 import csv as csvmod
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import subprocess
@@ -23,6 +25,13 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# serve.sh runs this file as __main__; the page modules' lazy `import app` (dip_page, jpm_page,
+# industries_page) then loaded it a SECOND time as `app`: a second quote cache nobody warms, and
+# every page module registered again on a second Flask app nobody serves (2026-09-23). One module.
+if __name__ == "__main__":
+    sys.modules.setdefault("app", sys.modules["__main__"])
 
 import markdown
 import requests
@@ -161,39 +170,356 @@ def _cache_lock(k):
     with _CACHE_GUARD:
         return _CACHE_LOCKS.setdefault(k, threading.Lock())
 
+class _Failed(list):
+    """What a fetch returns when its source failed, in place of its empty value (an empty list;
+    _FailedDict for a dict). The page shows it like any empty answer, but cached() owes the key a
+    retry — retry_s, then doubling, retry_tries times — instead of trusting it for a whole TTL: off-
+    market a TTL runs to the next open, and on the slow link Yahoo answers part of a batch with
+    "possibly delisted" (13 of 30 names in the post-close pass, 2026-09-23). A later success clears it."""
+
+
+class _FailedDict(dict):
+    __doc__ = _Failed.__doc__
+
+
+_CRETRY = {}   # cache key -> (failures in a row, epoch its retry falls due; inf = given up till its TTL)
+
+
+def _note_fetch(k, v):
+    if isinstance(v, (_Failed, _FailedDict)):
+        n = _CRETRY.get(k, (0, 0.0))[0] + 1
+        _CRETRY[k] = (n, time.time() + LIVE["retry_s"] * 2 ** (n - 1) if n <= LIVE["retry_tries"] else float("inf"))
+    else:
+        _CRETRY.pop(k, None)
+
+
+def _fresh_hit(k, hit, ttl):
+    return bool(hit) and time.time() - hit[0] < ttl and time.time() < _CRETRY.get(k, (0, float("inf")))[1]
+
+
 def cached(k, ttl, fn, stale=False):
     """TTL cache, single-flight: a second caller arriving mid-fetch waits for the first
     result instead of fetching again (a phone and a laptop opening together used to pay
     every upstream call twice). stale=True hands back the expired value at once and
     refreshes it on a background thread — for panes that are minutes-old by nature (the
-    digest), never for prices or broker state (David 2026-09-03: "data feels slow")."""
+    digest, the 1y perf table), never for broker state or a live price (David 2026-09-03:
+    "data feels slow"); _quote() has its own bounded rule for prices (_quote_window). A value
+    that marks its fetch as failed (_Failed) is retried sooner than its TTL."""
     hit = _CACHE.get(k)
-    if hit and time.time() - hit[0] < ttl:
+    if _fresh_hit(k, hit, ttl):
         return hit[1]
     lock = _cache_lock(k)
     if stale and hit:
         if lock.acquire(blocking=False):
             def refresh():
                 try:
-                    _CACHE[k] = (time.time(), fn())
+                    v = fn()
+                    _CACHE[k] = (time.time(), v)
+                    _note_fetch(k, v)
                 finally:
                     lock.release()
             threading.Thread(target=refresh, daemon=True).start()
         return hit[1]
     with lock:
         hit = _CACHE.get(k)
-        if hit and time.time() - hit[0] < ttl:
+        if _fresh_hit(k, hit, ttl):
             return hit[1]
         v = fn()
         _CACHE[k] = (time.time(), v)
+        _note_fetch(k, v)
         return v
+
+# ---------- live data: what refreshes when (David, 2026-09-23) ----------
+# "for stocks i own ofcourse as real time as possible, but other stuff doesn't need to be so
+# strict and can be like every 5 min during market hours and off-market don't need to reload
+# anything." Every cadence the dashboard keeps for market data is in this one table; the plain-
+# English version is the top of INTERACTIVITY.md ("Live data: what refreshes when").
+#
+#   market hours  owned names (every book: BROKERA, DIP, the BrokerB agent) re-quote every
+#                 owned_every() s — owned_s, lengthened if the owned set outgrows the budget —
+#                 and are never served older than owned_max_s; everything else ~every other_s.
+#   off-market    nothing reloads. One pass settle_s after the close (the closing prints)
+#                 refreshes every tracked name and pane, then nothing until the next open, whose
+#                 first pass refreshes everything. Weekends and NYSE holidays: nothing.
+#
+# Finnhub's free tier allows 60 calls/min per key, shared with feeds.py (30-min cron, self-paced
+# at ~55/min while it runs) and with whoever opens a ticker page nobody tracks. The warmer keeps
+# the dashboard's steady state inside finnhub_budget. With the set on 2026-09-23 (8 owned, 22
+# other tracked names):
+#   owned quotes    8 × 60/15              = 32.0 /min
+#   other quotes   22 × 60/(300 − 30)      =  4.9
+#   company news   30 × 60/600             =  3.0
+#   cap + 52-week  30 × 2 × 60/21600       =  0.2
+#   earnings date  30 × 60/86400           =  0.0
+#                                            40.1 /min of a 45 budget and the 60 cap
+# finnhub_per_min() is that sum and owned_every() solves it for the owned cadence, so a bigger
+# owned set lengthens it on its own (12 owned → 20 s).
+#
+# That is the steady state; the open is not. At 9:30 every price is 17.5 h old and every cap/52-
+# week range is past meta_s, and a warmer that paid for all of it at once ran 69 calls in its first
+# minute (measured on a virtual clock, 2026-09-23). So in market hours the owned re-quotes are a
+# RESERVATION (owned_beat(): 8 × 4 = 32 a minute) held back before anything else is paid for, and
+# every other background call — other quotes, then cap/52-week renewals, then news and earnings —
+# shares what is left (fh_room(): 13 a minute at the open). A call that does not fit waits: the
+# price warmer defers it a tick, the pane warmer waits in _fh_wait and skips it if no room comes.
+# The open then catches up over a few minutes inside the budget. A page's own call never waits,
+# and neither does an owned re-quote. Not modelled here: feeds.py, whose */30 cron starts at 9:30
+# ET exactly and runs ~54/min on the same key — the one collision this budget cannot see.
+LIVE = {
+    "tick_s": 5,            # the price warmer wakes this often; it fetches only what is due
+    "panes_tick_s": 30,     # the pane warmer (perf, digest, news, filings, charts, broker activity)
+    "owned_s": 15,          # owned names: re-quoted this often in market hours (a floor, see above)
+    "owned_max_s": 30,      # ...and never served older than this in market hours
+    "other_s": 300,         # everything else: never served older than this in market hours, and
+    "other_lead_s": 30,     # ...re-quoted this much before it gets there, so no page waits on it
+    "news_s": 600,          # filings, company news and the digest
+    "activity_s": 600,      # AggregatorA activity: transactions, lots
+    "chart_s": 1800,        # close series: price charts, sparklines, the portfolio chart
+    "slow_s": 3600,         # company profile, lifetime P&L, the calendar
+    "meta_s": 6 * 3600,     # market cap + 52-week range
+    "earn_s": 86400,        # next earnings date
+    "sync_s": 900,          # AggregatorA autoSync on page open, market hours (off-market: only when
+                            # the snapshot predates the last close)
+    "settle_s": 300,        # the one post-close pass runs this long after the bell
+    "retry_s": 60,          # a refused or unpriced quote (_quote_backoff) and a failed pane fetch
+    "retry_tries": 3,       # ...(_Failed) are retried after this, doubling, this many times
+    "finnhub_cap": 60,      # Finnhub free tier, calls/min per key
+    "finnhub_budget": 45,   # the dashboard's steady share of it
+}
+
+# NYSE 1:00pm ET closes. asof.market_open() knows neither these nor holidays (it decides whether
+# to EXPECT fresh market data, never a trade), so market() takes them away from it: the holidays
+# from loop.MARKET_HOLIDAYS — the trade cron's own table, so the two cannot disagree — and the
+# early closes from here. Hand-kept: add a year when loop.py adds one.
+EARLY_CLOSES = {"2026-11-27", "2026-12-24", "2027-11-26"}
+_NY = ZoneInfo("America/New_York")
+_HOLIDAYS = []
+
+
+def _asof():
+    p = str(ROOT / "_engine" / "agent")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    import asof
+    return asof
+
+
+def _holidays():
+    if not _HOLIDAYS:
+        try:
+            _asof()   # agent/ on the path
+            from loop import MARKET_HOLIDAYS
+            _HOLIDAYS.append(frozenset(MARKET_HOLIDAYS))
+        except Exception:
+            _HOLIDAYS.append(frozenset())
+    return _HOLIDAYS[0]
+
+
+def _session(d):
+    """(open, close) of the NYSE regular session on ET date d, or None: a weekend or a holiday."""
+    if d.weekday() >= 5 or d.isoformat() in _holidays():
+        return None
+    close = dt.time(13) if d.isoformat() in EARLY_CLOSES else dt.time(16)
+    return dt.datetime.combine(d, dt.time(9, 30), _NY), dt.datetime.combine(d, close, _NY)
+
+
+def market(now=None):
+    """Is the market open, and what changes next: the ONE answer the warmers, every market-data
+    TTL and the page script (MKT, from market_client()) share.
+      open     asof.market_open (9:30–16:00 ET weekdays, the desk's clock) minus NYSE holidays
+               and the hours after a 1pm close
+      close    epoch of the latest session close at or before now
+      settled  epoch of the latest close + settle_s at or before now: off-market, anything
+               fetched since this moment is final until the next open
+      pending  closed, and the latest close's settle point not reached yet
+      next     epoch of the next change the page acts on: a minute past the close while open, a
+               minute past the settle point while pending, the next open otherwise"""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    et = now.astimezone(_NY)
+    day = et.date().isoformat()
+    try:
+        is_open = bool(_asof().market_open(now))
+    except Exception:
+        s = _session(et.date())
+        is_open = bool(s and s[0] <= et <= s[1] + dt.timedelta(seconds=59))
+    if day in _holidays() or (day in EARLY_CLOSES and (et.hour, et.minute) > (13, 0)):
+        is_open = False
+    closes, nxt_open = [], None
+    for k in range(15):
+        s = _session(et.date() - dt.timedelta(days=k))
+        if s and s[1] <= et:
+            closes.append(s[1])
+            if len(closes) == 2:
+                break
+    for k in range(15):
+        s = _session(et.date() + dt.timedelta(days=k))
+        if s and s[0] > et:
+            nxt_open = s[0]
+            break
+    settle = dt.timedelta(seconds=LIVE["settle_s"])
+    settled = next((c + settle for c in closes if c + settle <= et), None)
+    pending = not is_open and bool(closes) and closes[0] + settle > et
+    if is_open:
+        today = _session(et.date())
+        nxt = (today[1] if today else et) + dt.timedelta(seconds=60)
+    elif pending:
+        nxt = closes[0] + settle + dt.timedelta(seconds=60)
+    else:
+        nxt = (nxt_open or et + dt.timedelta(hours=1)) + dt.timedelta(seconds=5)
+    return {"open": is_open, "pending": pending, "close": closes[0].timestamp() if closes else 0.0,
+            "settled": settled.timestamp() if settled else 0.0, "next": nxt.timestamp(),
+            "now": now.timestamp()}
+
+
+def _ttl(base, now=None):
+    """A market-data cache TTL under the policy: `base` in market hours; off-market, the time back
+    to the settle point — anything fetched since (the post-close pass) is final until the open,
+    anything older is fetched once."""
+    m = market(now)
+    if m["open"] or not m["settled"]:
+        return base
+    return max(0.0, m["now"] - m["settled"])
+
+
+_SETS = {"at": 0.0, "owned": frozenset(), "tracked": frozenset()}
+
+
+def _sets():
+    """(owned, tracked): held_all() and tracked_tickers(), re-read at most once a tick — _quote()
+    asks per name, and both walk every book and the research tree."""
+    if time.time() - _SETS["at"] > LIVE["tick_s"]:
+        try:
+            owned = frozenset(held_all())
+            _SETS.update(owned=owned, tracked=frozenset(tracked_tickers()) | owned)
+        except Exception:
+            pass
+        _SETS["at"] = time.time()
+    return _SETS["owned"], _SETS["tracked"]
+
+
+def finnhub_per_min(owned_s, n_owned, n_other):
+    """The dashboard's steady Finnhub calls a minute in market hours — the sum in LIVE's comment."""
+    n = n_owned + n_other
+    return (n_owned * 60 / owned_s + n_other * 60 / (LIVE["other_s"] - LIVE["other_lead_s"])
+            + n * 60 / LIVE["news_s"] + n * 2 * 60 / LIVE["meta_s"] + n * 60 / LIVE["earn_s"])
+
+
+def owned_every(n_owned=None, n_other=None):
+    """Seconds between re-quotes of each owned name in market hours: owned_s, or longer when that
+    would put the dashboard over its Finnhub budget — the owned set then shares what is left once
+    everything else is paid for (and falls back to other_s if nothing is)."""
+    if n_owned is None:
+        owned, tracked = _sets()
+        n_owned, n_other = len(owned), len(tracked - owned)
+    if not n_owned:
+        return LIVE["owned_s"]
+    room = LIVE["finnhub_budget"] - finnhub_per_min(float("inf"), n_owned, n_other)
+    if room <= 0:
+        return LIVE["other_s"]
+    return max(LIVE["owned_s"], math.ceil(n_owned * 60 / room))
+
+
+def _post_close_done(m, now=None):
+    """Off-market: whether the server's pass for the latest close is over — no price is still owed
+    (a name in its retry backoff does not count) and the 1y table has been rebuilt since the settle
+    point, or has given up retrying. What the page's one final pass waits for. Never raises."""
+    if m["open"] or not m["settled"]:
+        return True
+    try:
+        if _quotes_due(now):
+            return False
+        hit = _CACHE.get("perf")
+        return bool(hit) and (hit[0] >= m["settled"] or _CRETRY.get("perf", (0, 0.0))[1] == float("inf"))
+    except Exception:
+        return True
+
+
+def market_client(now=None):
+    """What the page script runs its timers on (MKT in the boot script and on the Holdings list).
+    `pending` also covers the server's own post-close pass: while it runs (the price warmer spreads
+    the closing prints over the budget; perf is a slow Yahoo batch) the page asks again each minute,
+    and its one final pass reads what that pass wrote, not the pre-close values."""
+    m = market(now)
+    pending, nxt = m["pending"], m["next"]
+    if not m["open"] and not pending and not _post_close_done(m, now):
+        pending, nxt = True, m["now"] + 60
+    return {"open": m["open"], "pending": pending, "close": int(m["close"]),
+            "next_s": max(1, int(nxt - m["now"])), "owned_s": owned_every(),
+            "other_s": LIVE["other_s"], "sync_s": LIVE["sync_s"], "at": int(m["now"])}
+
+
+# Upstream calls this process made, by kind (read on /api/live), and Finnhub's rolling minute:
+# (monotonic time, whether it was an owned name's re-quote — the calls owned_beat() reserves).
+_UPSTREAM = collections.Counter()
+_FH_CALLS = collections.deque()
+_FH_LOCK = threading.Lock()
+
+
+def _up(kind):
+    _UPSTREAM[kind] += 1
+
+
+def _fh_note(kind, t=None):
+    """Count one Finnhub call; every Finnhub call site in this file notes itself (a quote names
+    its ticker, so an owned re-quote is told apart from everything else)."""
+    _up("finnhub:" + kind)
+    owned = kind == "quote" and t in _sets()[0]
+    with _FH_LOCK:
+        _FH_CALLS.append((time.monotonic(), owned))
+
+
+def fh_last_minute(owned=None):
+    """Finnhub calls in the rolling minute (strictly the last 60 s): all of them, or with
+    owned=True only the owned names' quotes."""
+    with _FH_LOCK:
+        cut = time.monotonic() - 60
+        while _FH_CALLS and _FH_CALLS[0][0] <= cut:
+            _FH_CALLS.popleft()
+        return sum(1 for _, o in _FH_CALLS if o) if owned else len(_FH_CALLS)
+
+
+def owned_beat(m=None):
+    """In market hours, the Finnhub calls a rolling minute holds for the owned names' re-quotes
+    (n owned × ceil(60 / owned_every())) — reserved before any other background call is paid for.
+    Off-market there is no beat: 0."""
+    m = m or market()
+    n = len(_sets()[0])
+    return n * math.ceil(60 / owned_every()) if m["open"] and n else 0
+
+
+def fh_room(m=None):
+    """Finnhub calls the warmers may still make in this rolling minute, beyond the owned beat.
+    Market hours: finnhub_budget, less the owned reservation (or what the owned re-quotes in the
+    window actually used, if more), less every other call in the window. Off-market: the budget
+    less every call in it."""
+    m = m or market()
+    total = fh_last_minute()
+    if not m["open"]:
+        return LIVE["finnhub_budget"] - total
+    mine = fh_last_minute(owned=True)
+    return LIVE["finnhub_budget"] - max(owned_beat(m), mine) - (total - mine)
+
+
+def _fh_wait(n=1, deadline=90):
+    """A pane warmer's background call waits here for fh_room() — never while holding a cache
+    lock, so a page asking for the same name is not stuck behind it. True once there is room;
+    False at the deadline, and the caller skips the call (its entry stays due for the next pass)
+    rather than spend past the budget — at the open the price warmer has first claim for a few
+    minutes."""
+    end = time.monotonic() + deadline
+    while fh_room() < n:
+        if time.monotonic() >= end:
+            return False
+        time.sleep(1)
+    return True
 
 def edgar_filings(cik, n=20):
     def fetch():
+        _up("edgar:filings")
         try:
             rec = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=UA, timeout=20).json()["filings"]["recent"]
         except Exception:
-            return []
+            return _Failed()
         desc = rec.get("primaryDocDescription", [""] * len(rec["form"]))
         out = []
         for i in range(min(n, len(rec["form"]))):
@@ -205,7 +531,7 @@ def edgar_filings(cik, n=20):
                         "material": form.startswith("8-K"),
                         "earnings": form.startswith("8-K") and ("result" in d.lower() or "earning" in d.lower())})
         return out
-    return cached(f"edgar:{cik}", 600, fetch)
+    return cached(f"edgar:{cik}", _ttl(LIVE["news_s"]), fetch)
 
 def finnhub_news(sym):
     key = load_key("finnhub")
@@ -213,18 +539,20 @@ def finnhub_news(sym):
         return None
     def fetch():
         to = dt.date.today(); frm = to - dt.timedelta(21)
+        _fh_note("news")
         try:
             return requests.get("https://finnhub.io/api/v1/company-news",
                                 params={"symbol": sym.upper(), "from": str(frm), "to": str(to), "token": key}, timeout=15).json()[:20]
-        except Exception:
-            return []
-    return cached(f"news:{sym}", 600, fetch)
+        except Exception:   # a 429 answers a dict, which cannot be sliced: lands here too
+            return _Failed()
+    return cached(f"news:{sym}", _ttl(LIVE["news_s"]), fetch)
 
 def next_earnings(sym):
     key = load_key("finnhub")
     if not key:
         return None
     def fetch():
+        _fh_note("earnings")
         try:
             to = dt.date.today() + dt.timedelta(120)
             r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
@@ -233,19 +561,20 @@ def next_earnings(sym):
             ds = sorted(e.get("date") for e in (r.get("earningsCalendar") or []) if e.get("date"))
             return ds[0] if ds else None
         except Exception:
-            return None
-    return cached(f"earn:{sym}", 86400, fetch)
+            return _Failed()   # falsy, like None
+    return cached(f"earn:{sym}", _ttl(LIVE["earn_s"]), fetch)
 
 def profile(sym):
     def fetch():
+        _up("yahoo:profile")
         try:
             import yfinance as yf
             i = yf.Ticker(sym).info
             return {"name": i.get("shortName") or i.get("longName") or sym, "sector": i.get("sector"),
                     "industry": i.get("industry"), "country": i.get("country"), "summary": i.get("longBusinessSummary")}
         except Exception:
-            return {}
-    return cached(f"prof:{sym}", 3600, fetch)
+            return _FailedDict()
+    return cached(f"prof:{sym}", _ttl(LIVE["slow_s"]), fetch)
 
 # ---------- filesystem nav ----------
 def order_key(f):
@@ -314,86 +643,323 @@ I_SPARK = ("<svg class=ic viewBox='0 0 16 16' fill='currentColor'><path d='M8 1.
 I_TODAY = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' "
            "stroke-linejoin='round'><path d='M2 11.5 6 6.5l3 2.6 5-6.1'/><path d='M10.6 3h3.4v3.4'/></svg>")
 
+I_BOOK = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' "
+          "stroke-linejoin='round'><rect x='2' y='5' width='12' height='9' rx='1.5'/>"
+          "<path d='M5.5 5V3.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V5'/><path d='M2 9.2h12'/></svg>")
+I_BANK = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' "
+          "stroke-linejoin='round'><path d='M2 6 8 2.5 14 6z'/><path d='M3.8 6.5v5.5M6.6 6.5v5.5M9.4 6.5v5.5M12.2 6.5v5.5'/>"
+          "<path d='M2 14h12'/></svg>")
+I_LENS = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' "
+          "stroke-linejoin='round'><path d='M8.5 14H3.5a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v4'/>"
+          "<path d='M5 5h4M5 7.5h2.5'/><circle cx='11' cy='11' r='2.2'/><path d='m12.6 12.6 1.6 1.6'/></svg>")
+I_LEARN = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' "
+           "stroke-linejoin='round'><path d='M1.5 6 8 3l6.5 3L8 9z'/><path d='M4.5 7.6v3c0 1 1.6 2 3.5 2s3.5-1 3.5-2v-3'/>"
+           "<path d='M14.5 6v3.5'/></svg>")
+I_PAUSE = ("<svg class=ic viewBox='0 0 16 16' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round'>"
+           "<path d='M6 4.5v7M10 4.5v7'/></svg>")
+
 def company_display(c):
     tk = ticker_of(c)
     nm = read_positions().get(tk, {}).get("name") or c.name.rsplit("-", 1)[0].replace("_", " ")
     return tk, nm
 
-def sidebar():
-    wl = watchlist(); pos = read_positions()
-    held = {t for t, m in pos.items() if (m.get("shares") or 0) > 0}
+# ---------- left navigation (2026-09-22 redesign) ----------
+# David: "we don't need all the watchlist/research stuff in left hand side ... the watchlist on
+# left side should just be stocks/things we own across each book and have dollar changes along
+# with the percent changes relative to our position." So the sidebar is five destinations, then
+# Holdings. The watchlist, the research tree, the candidate boards and the system docs moved to
+# /research (research_inner / research_companies_inner / research_boards_inner below).
+NAV = [("personal", "Personal book"), ("dip", "DIP Venture"), ("agent", "BrokerB agent"),
+       ("research", "Research"), ("learn", "Learn")]
+PERSONAL_ROUTES = ("/", "", "/today", "/recommendation", "/journal", "/brokera")
+
+
+def _under(path, root):
+    return path == root or path.startswith(root + "/")
+
+
+def nav_key(path, view_path="", owners=None):
+    """Which nav item owns a page: one answer per route, so exactly one item lights up.
+    `view_path` is /view's ?path=. A ticker page belongs to the book that HOLDS the name
+    (ticker_owners(); `owners` overrides it in tests), and to Research when no book does.
+    The page JS carries the same table as navKey() (setActive), fed the same owners (OWN);
+    tests/test_dashboard_nav.py runs both over every route and pins them together."""
+    if _under(path, "/dip"):
+        return "dip"
+    if _under(path, "/agent"):
+        return "agent"
+    if _under(path, "/research") or path.startswith("/company/"):
+        return "research"
+    if _under(path, "/learn") or path in ("/primer", "/lookups"):
+        return "learn"
+    if path == "/advised":
+        return "paused"
+    if path == "/view":
+        if view_path.startswith("_engine/agent"):
+            return "agent"
+        if view_path.startswith("_engine/recommendations") or "journal" in view_path.split("/")[0:2]:
+            return "personal"
+        return "research"          # dossiers, boards, system docs
+    if path.startswith("/ticker/"):
+        tk = path[len("/ticker/"):].split("/")[0].upper()
+        return (ticker_owners() if owners is None else owners).get(tk, "research")
+    if path in PERSONAL_ROUTES:
+        return "personal"
+    return ""
+
+
+# ---------- holdings: what we own, every book (the sidebar list) ----------
+AGENT_PF = ROOT / "_engine" / "agent" / "data" / "portfolio.json"
+BOOK_NAMES = {"brokera": ("Personal book", "/"), "dip": ("DIP Venture", "/dip")}
+
+
+def _rj(p, default):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def agent_positions():
+    """The BrokerB agent's open positions, from its own sync snapshot (mcp_sync.py, code
+    only, every 15 min in market hours)."""
+    pf = _rj(AGENT_PF, {})
+    return [p for p in (pf.get("positions") or []) if isinstance(p, dict)
+            and p.get("symbol") and float(p.get("qty") or 0) > 0]
+
+
+def held_all():
+    """Every ticker owned in ANY book: BROKERA and DIP through books.py, the BrokerB agent
+    through its portfolio.json. read_positions() follows the book on screen; this does not."""
+    held = set()
+    for slug in _books.slugs():
+        pos = _rj(_books.book_dir(slug) / "positions.json", {})
+        held |= {t for t, m in pos.items() if float((m or {}).get("shares") or 0) > 0}
+    return held | {p["symbol"].upper() for p in agent_positions()}
+
+
+BOOK_NAV = {"brokera": "personal", "dip": "dip"}
+
+
+def ticker_owners():
+    """{TK: nav key} for every ticker a book holds — the book a /ticker page belongs to. The
+    Personal book wins a name it shares, then DIP, then the BrokerB agent (review 2026-09-22:
+    ARI tapped under "BrokerB agent" in Holdings opened a page lit as the Personal book, with
+    no agent position on it). A name no book holds is Research's, which nav_key() supplies."""
+    own = {}
+    try:
+        books = _books.load()
+        for slug in _books.slugs(books):
+            key = BOOK_NAV.get(slug)
+            if not key:
+                continue
+            for t, m in _rj(_books.book_dir(slug, books) / "positions.json", {}).items():
+                if isinstance(m, dict) and float(m.get("shares") or 0) > 0:
+                    own.setdefault(t.upper(), key)
+    except Exception:
+        pass
+    for p in agent_positions():
+        own.setdefault(p["symbol"].upper(), "agent")
+    return own
+
+
+def day_change(shares, price, prev):
+    """Today's move ON OUR POSITION: shares × (price − previous close), and the price's own %
+    move. (None, None) when a quote leg is missing — unknown is not zero. The page JS
+    (holdDay) is the same arithmetic; tests pin the two together."""
+    try:
+        shares, price, prev = float(shares or 0), float(price or 0), float(prev or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if not shares or not price or not prev:
+        return None, None
+    return shares * (price - prev), (price - prev) / prev * 100
+
+
+def _cached_quote(tk):
+    """A quote already in memory — never a network call. The sidebar renders on every full page
+    load; the page's one /api/quotes batch brings the live numbers a moment later."""
+    hit = _QCACHE.get(tk)
+    return (hit[1] if hit else None) or {}
+
+
+def _perf_close(tk):
+    hit = _CACHE.get("perf")
+    return (((hit[1] if hit else None) or {}).get(tk) or {}).get("price")
+
+
+def _hq(tk, shares, cost=None, snap_px=None, book="brokera"):
+    """One quoted holding. Its value uses the best price already on hand — the live-quote
+    cache, the book's own snapshot (the agent's sync), the perf batch's last close, else cost —
+    so a row whose quote never arrives still reads as a position, never a blank."""
+    q = _cached_quote(tk)
+    usd, pct = day_change(shares, q.get("price"), q.get("prev"))
+    px = q.get("price") or snap_px or _perf_close(tk)
+    try:
+        value = shares * float(px or cost or 0) or None
+    except (TypeError, ValueError):
+        value = None
+    return {"kind": "quote", "tk": tk, "shares": shares, "book": book, "value": value,
+            "at_cost": not px and bool(value), "day_usd": usd, "day_pct": pct}
+
+
+def _mark_date(s):
+    """'2026-06-03 · at cost' → 'Jun 3'; 'Sep 22, 3:53 PM ET' → 'Sep 22'. The year shows only
+    when it is not this year, so an old mark says it is old."""
+    s = str(s or "").split("·")[0].strip()
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            d = dt.date(int(m[1]), int(m[2]), int(m[3]))
+            return f"{d:%b} {d.day}" + ("" if d.year == dt.date.today().year else f", {d.year}")
+        except ValueError:
+            pass
+    return s.split(",")[0].strip() or "—"
+
+
+def holdings():
+    """What we own, by book: [{slug, label, route, day_usd, rows}]. Each book is read from its
+    own files — positions.json, the broker-marked note (account.json) and private.json through
+    books.py; the BrokerB agent's portfolio.json — never through read_positions()."""
+    groups = []
+    books = _books.load()
+    for slug in _books.slugs(books):
+        bdir = _books.book_dir(slug, books)
+        label, route = BOOK_NAMES.get(slug, ((books.get(slug) or {}).get("label") or slug, f"/{slug}"))
+        rows = [_hq(tk, float(m.get("shares") or 0), m.get("cost_basis"), book=slug)
+                for tk, m in _rj(bdir / "positions.json", {}).items()
+                if isinstance(m, dict) and float(m.get("shares") or 0) > 0]
+        rows.sort(key=lambda r: -(r["value"] or 0))
+        acct = _rj(bdir / "account.json", {})
+        if acct.get("structured_note"):
+            rows.append({"kind": "mark", "tk": "Structured note", "value": float(acct["structured_note"]),
+                         "book": slug, "route": route, "tag": "broker mark",
+                         "sub": f"as of {_mark_date(acct.get('as_of'))}"})
+        for x in _rj(bdir / "private.json", []):
+            if isinstance(x, dict) and x.get("name"):
+                rows.append({"kind": "private", "tk": x["name"], "value": float(x.get("value") or 0) or None,
+                             "book": slug, "route": route, "tag": "private",
+                             "sub": f"marked {_mark_date(x.get('as_of'))}"})
+        if rows:
+            groups.append({"slug": slug, "label": label, "route": route, "rows": rows})
+    ag = sorted(agent_positions(), key=lambda p: -float(p.get("value") or 0))
+    if ag:
+        groups.append({"slug": "agent", "label": "BrokerB agent", "route": "/agent",
+                       "rows": [_hq(p["symbol"].upper(), float(p.get("qty") or 0), p.get("avg_cost"),
+                                    p.get("price"), book="agent") for p in ag]})
+    for g in groups:
+        known = [r["day_usd"] for r in g["rows"] if r.get("day_usd") is not None]
+        g["day_usd"] = sum(known) if known else None
+    return groups
+
+
+def _usd_signed(v):
+    return ("+" if v >= 0 else "−") + f"${abs(v):,.0f}"
+
+
+def _pct_signed(v):
+    """+1.3%; under 0.1% it keeps two decimals so a small move on a big position (VTI +$153 on
+    $343k) reads +0.04%, not a +0.0% that contradicts its own dollar figure."""
+    a = abs(v)
+    return ("+" if v >= 0 else "−") + (f"{a:.2f}%" if 0 < a < 0.1 else f"{a:.1f}%")
+
+
+def _hold_row(r):
+    e = html.escape
+    tk = e(r["tk"])
+    val = f"${r['value']:,.0f}" if r.get("value") else "—"
+    left = f"<span class=hl><span class=htk>{tk}</span><span class=hv>{val}</span></span>"
+    if r["kind"] != "quote":   # a private or broker mark: no quote, no day change — say how it is valued
+        return (f"<a class='leaf hrow priv' data-route='{r['route']}' href='{r['route']}'>{left}"
+                f"<span class=hr><span class=hd>{e(r['tag'])}</span><span class=hp>{e(r['sub'])}</span></span></a>")
+    d = r["day_usd"]
+    cls = "" if d is None else (" up" if d >= 0 else " down")
+    usd = _usd_signed(d) if d is not None else "—"
+    pct = _pct_signed(r["day_pct"]) if r["day_pct"] is not None else ("at cost" if r["at_cost"] else "")
+    known = f" data-usd='{d:.2f}'" if d is not None else ""
+    return (f"<a class='leaf hrow' data-tk='{tk}' href='/ticker/{tk}' data-q='{tk}' data-sh='{r['shares']:g}' "
+            f"data-book='{e(r['book'])}'{known}>{left}"
+            f"<span class=hr><span class='hd{cls}'>{usd}</span><span class='hp{cls}'>{pct}</span></span></a>")
+
+
+def holdings_html():
+    # the market state rides the list (data-mkt): refreshSide() re-reads it, so the page's live
+    # timers learn the bell from the same render that re-lists what we own — and the owned set
+    # (data-held), so a name bought since the page loaded joins the owned tick
+    try:
+        mk = market_client()
+    except Exception:
+        mk = None
+    mattr = f" data-mkt='{html.escape(json.dumps(mk))}'" if mk else ""
+    try:
+        groups = holdings()
+    except Exception as ex:   # a bad file must never take the whole sidebar (and every page) down
+        # data-mkt still rides it: without one the page re-read the sidebar every minute, all night
+        return (f"<div class=hsec{mattr}><div class=hsec-h>Holdings</div><div class=sempty>Couldn't read the books: "
+                f"{html.escape(type(ex).__name__)}</div></div>")
+    try:
+        mattr += f" data-held='{html.escape(json.dumps(sorted(held_all())))}'"
+    except Exception:
+        pass
+    state = "" if mk is None else (" · live" if mk["open"] else " · market closed")
+    s = [f"<div class=hsec{mattr}><div class=hsec-h>Holdings <span class=hint>today, on our position{state}</span></div>"]
+    for g in groups:
+        d = g["day_usd"]
+        cls = "" if d is None else (" up" if d >= 0 else " down")
+        s.append(f"<div class=hgrp><span>{html.escape(g['label'])}</span>"
+                 f"<span class='hday{cls}' data-hday='{g['slug']}'>{_usd_signed(d) if d is not None else ''}</span></div>")
+        s.extend(_hold_row(r) for r in g["rows"])
+    if not groups:
+        s.append("<div class=sempty>Nothing held in any book.</div>")
+    s.append("</div>")
+    return "".join(s)
+
+
+def _learn_link(icon):
+    link = ""
+    lp = globals().get("learn_page")
+    if lp is not None:
+        try:
+            link = lp.sidebar_link(icon)
+        except Exception:
+            link = ""
+    if not link:   # learn_page.py not loaded: the glossary is the Learn surface that exists
+        link = f"<a class='leaf navtop' data-route='/primer' href='/primer'>{icon}<span>Learn</span></a>"
+    # the Library's "waiting on you" count (HBS-library pulls David owes the desk) was a badge on
+    # its own sidebar link; Library now sits under Learn, so the count rides the Learn row
+    try:
+        n = lookups_page.open_count()
+    except Exception:
+        n = 0
+    # "5 waiting" landed on Guides with nothing saying what waited (review 2026-09-22): the badge
+    # names the thing, and the Library seg under Learn carries the same count
+    if n and link.endswith("</a>"):
+        link = link[:-4] + f"<span class=lheld>{n} library pull{'' if n == 1 else 's'}</span></a>"
+    return link
+
+
+def sidebar(route=None):
+    """The left navigation. `route` = (path, view_path) of a full page render, so the right item
+    is lit before any script runs; setActive() keeps it right across SPA navigation."""
+    key = nav_key(*route) if route else ""
+
+    def ni(k, link):
+        return f"<div class='ni{' on' if k == key else ''}' data-nav='{k}'>{link}</div>"
+    links = {
+        "personal": f"<a class='leaf navtop' data-home href='/'>{I_BOOK}<span>Personal book</span></a>",
+        "dip": dip_page.sidebar_link(I_BANK),
+        "agent": f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>",
+        "research": f"<a class='leaf navtop' data-route='/research' href='/research'>{I_LENS}<span>Research</span></a>",
+        "learn": _learn_link(I_LEARN)}
     s = [f"<div class=sidetop><a class='brand' href='/' data-home>{I_LOGO}<span>Stocks</span></a></div>",
          "<form class=search onsubmit='return doSearch(event)'>" + I_SEARCH +
-         "<input id=q placeholder='Search ticker or company' autocomplete=off spellcheck=false>"
+         "<input id=q placeholder='Search ticker or company' autocomplete=off spellcheck=false aria-label='Search'>"
          "<kbd class=skey>/</kbd><div id=sresults class=sresults></div></form>",
-         # 2026-08-13 (David): the sidebar is the BOOKS shelf (L1) — each portfolio
-         # gets an entry and follows the same seg-section grammar inside (L2);
-         # detail pages inherit their book's bar (L3, see pfseg).
-         "<div class=ngrp style='padding:0 10px'>Books</div>",
-         f"<a class='leaf navtop' data-home href='/'>{I_HOME}<span>J.P. Morgan</span></a>",
-         f"<a class='leaf navtop' data-route='/brokera' href='/brokera'>{I_DOC}<span>David brief</span></a>",
-         # /dip — the DIP Venture book: Waffle private stake + cash for strategic holds (module: dip_page.py)
-         dip_page.sidebar_link(I_HOME),
-         f"<a class='leaf navtop' data-route='/advised' href='/advised'>{I_SPARK}<span>Justin's book</span></a>",
-         # 2026-08-13 (David): single flat link — the /agent page's five panes now carry
-         # Mandate/journal/sessions/memos themselves; the sidebar subtree was redundant.
-         f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>",
-         # /lookups — David's HBS-library upload desk (module: lookups_page.py)
-         lookups_page.sidebar_link(I_DOC),
-         # /primer — finance terms with desk applications (module: primer_page.py)
-         primer_page.sidebar_link(I_DOC)]
-    s.append("<details open><summary>Watchlist</summary>")
-    for t in wl:
-        tag = "<span class=lheld>held</span>" if t in held else ""
-        s.append(f"<a class='leaf tkleaf' data-tk='{t}' href='/ticker/{t}'><span class=ltk>{t}</span>{tag}"
-                 f"<span class=lchg data-sidechg='{t}'></span>"
-                 f"<button class=srm title='remove from watchlist' onclick='removeWatch(event,\"{t}\")'>×</button></a>")
-    if not wl:
-        s.append("<div class=sempty>Empty — search a ticker to start</div>")
-    s.append("</details><details open><summary>Research</summary>")
-    cos = companies()
-    grouped = {"Held": [], "Watching": [], "Researched": []}
-    for c in cos:
-        tk, nm = company_display(c)
-        g = "Held" if tk in held else ("Watching" if tk in wl else "Researched")
-        grouped[g].append((tk, nm, c))
-    for g, items in grouped.items():
-        if not items:
-            continue
-        s.append(f"<div class=ngrp>{g}</div>")
-        for tk, nm, c in items:
-            ov = lenses_overall(c)
-            dot = f"<span class='vdot {sig_cls(ov)}' title='{html.escape(ov)}'></span>" if ov else "<span class=vdot></span>"
-            # name -> the ticker page, whose Overview leads with the thesis card
-            namelink = f"<a class=coname data-tk='{tk}' href='/ticker/{tk}' title='thesis card & overview'>{html.escape(nm)}</a>"
-            arch = ("" if tk in held else
-                    f"<button class=srm title='archive this research' onclick='archiveResearch(event,\"{tk}\")'>×</button>")
-            s.append(f"<details class=codet data-co='{tk}'><summary>{dot}{namelink}"
-                     f"<a class=cotk data-tk='{tk}' href='/ticker/{tk}' title='live ticker page'>{tk}</a>{arch}</summary>")
-            # essentials only — everything else lives in the ticker page's Research library
-            picks = [(c / "analysis" / "FINAL-REPORT.md", "Final report"),
-                     (c / "analysis" / "trade-playbook.md", "Trade playbook")]
-            ups = sorted((c / "analysis" / "updates").glob("update-*.md"), reverse=True) if (c / "analysis" / "updates").exists() else []
-            if ups:
-                picks.append((ups[0], f"Latest update · {ups[0].stem.replace('update-','')}"))
-            for f, lab in picks:
-                if f.exists():
-                    rel = f.relative_to(ROOT)
-                    s.append(f"<a class='leaf sub' data-path='{rel}' href='/view?path={rel}'><span>{lab}</span></a>")
-            s.append(f"<a class='leaf sub subtk' data-tk='{tk}' href='/ticker/{tk}'><span>Live ticker · filings · news</span></a>")
-            s.append("</details>")
-    if not cos:
-        s.append("<div class=sempty>No dossiers yet — run ✦ Research on a ticker</div>")
-    s.append("</details><details><summary>Candidate boards</summary>")
-    s.append(f"<a class='leaf action' onclick='boardRefresh();return false' href='#'>{I_REFRESH}<span>New board scan</span></a>")
-    for b in boards():
-        rel = b.relative_to(ROOT)
-        s.append(f"<a class='leaf' data-path='{rel}' href='/view?path={rel}'>{I_DOC}<span>Board · {b.stem.replace('board_','')}</span></a>")
-    s.append("</details><details><summary>System</summary>")
-    for f in sysdocs():
-        rel = f.relative_to(ROOT)
-        s.append(f"<a class='leaf' data-path='{rel}' href='/view?path={rel}'>{I_DOC}<span>{html.escape(label(f))}</span></a>")
-    s.append("</details>")
+         "<nav class=snav>" + "".join(ni(k, links[k]) for k, _ in NAV) + "</nav>",
+         holdings_html(),
+         # Justin's book is a paused project: out of the list, one quiet link keeps the route
+         "<div class=sfoot>" + ni("paused", f"<a class='leaf navtop' data-route='/advised' href='/advised'>"
+                                           f"{I_PAUSE}<span>Paused · Justin's book</span></a>") + "</div>"]
     return "".join(s)
 
 # ---------- financials (flags) ----------
@@ -542,6 +1108,9 @@ def render_file(p):
             return m.group(0)
         return f"href=\"/view?path={tgt}\" data-path=\"{tgt}\""
     body = _re.sub(r'href="(?!(?:[a-z][a-z0-9+.-]*:|/|#))([^"]+)"', _fix, body)
+    # a markdown table is as wide as its widest row: the weekly digest's tables made /recommendation
+    # 680px wide on every phone. Each one scrolls inside its own box instead of the page.
+    body = _re.sub(r"<table(\s|>)", r"<div class=tablewrap><table\1", body).replace("</table>", "</table></div>")
     return body, getattr(md, "toc_tokens", [])
 
 # ---------- thesis card (the one-page state summary; analysis/card.json) ----------
@@ -615,11 +1184,20 @@ def sig_cls(s):
     return "neu"
 
 def lenses_overall(cdir):
+    """The verdict line ('Buy below $36.15'). The price in it is the report's own buy_below
+    number, not the rounded one the signal text may carry: VSNT's signal said $36 while its
+    buy_below, the Brief and the teardown guide said $36.15 (review 2026-09-22)."""
     f = cdir / "analysis" / "lenses.json"
     try:
-        return json.loads(f.read_text()).get("overall", {}).get("signal", "") if f.exists() else ""
+        o = json.loads(f.read_text()).get("overall", {}) if f.exists() else {}
     except Exception:
         return ""
+    sig = str(o.get("signal") or "")
+    bb = o.get("buy_below")
+    if isinstance(bb, (int, float)) and not isinstance(bb, bool) and bb > 0 and "$" in sig:
+        px = f"${bb:,.0f}" if abs(bb - round(bb)) < 0.005 else f"${bb:,.2f}"
+        sig = re.sub(r"\$[\d,]+(?:\.\d+)?", lambda _m: px, sig, count=1)
+    return sig
 
 def render_lenses(cdir):
     f = cdir / "analysis" / "lenses.json"
@@ -709,48 +1287,83 @@ FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox
            "%3Crect x='8.5' y='7.5' width='3' height='9.5' rx='1' fill='white'/%3E"
            "%3Crect x='13.5' y='3' width='3' height='14' rx='1' fill='white'/%3E%3C/svg%3E")
 
-# Portfolio-section seg bar (David sign-off 2026-08-13): Today/Advice/Journal/
-# Research consolidate visually into Portfolio as sticky segs. Each seg is still
-# its own route (all existing widgets/loaders untouched — enhance() reruns per
-# SPA nav); the bar rides the global [data-route] interception. Injected in
-# wrap() BEFORE the partial return so SPA swaps carry the bar too.
-PF_SEGS = [("/", "Book"), ("/today", "Today"), ("/recommendation", "Advice"),
-           ("/journal", "Journal"), ("/research", "Research")]
+# Seg bars (David sign-off 2026-08-13): each section of a book is its own route, shown as a
+# sticky bar of segs; the bar rides the global [data-route] interception, and wrap() injects it
+# BEFORE the partial return so SPA swaps carry it too. 2026-09-22 redesign: the book is the
+# "Personal book", its brief (/brokera, was "David brief") joins the bar, and Research left it to
+# become a top-level page with its own bar (Watchlist · Companies · Boards).
+PF_SEGS = [("/", "Book"), ("/brokera", "Brief"), ("/today", "Today"),
+           ("/recommendation", "Advice"), ("/journal", "Journal")]
+RS_SEGS = [("/research", "Watchlist"), ("/research/companies", "Companies"),
+           ("/research/boards", "Boards")]
+
+
+def _segbar(segs, active, back=False):
+    b = ""
+    if back:   # standard detail-page affordance: back chevron (history-aware) + the lit section
+        home = active or segs[0][0]
+        b = ("<a class='pfseg pfback' href='#' onclick='history.length>1?history.back():"
+             f"nav(\"{home}\",true);return false' title='Back' aria-label='Back'>‹</a>")
+    return ("<div class=pfnav>" + b + "".join(
+        f"<a class='pfseg{' on' if active == p else ''}' data-route='{p}' href='{p}'>{lab}</a>"
+        for p, lab in segs) + "</div>")
+
+
+_BACK = ("<a class='pfseg pfback' href='#' onclick='history.length>1?history.back():"
+         "nav(\"{home}\",true);return false' title='Back' aria-label='Back'>‹</a>")
+
+
+def _agent_backbar():
+    """The BrokerB agent has its own tabs inside /agent: its documents and the names it holds
+    get a back chevron and one link home."""
+    return ("<div class=pfnav>" + _BACK.format(home="/agent")
+            + "<a class=pfseg data-route='/agent' href='/agent'>BrokerB agent</a></div>")
 
 
 def pfseg():
-    """L2 nav (sections of the BROKERA book) — and L3 INHERITANCE (David, 2026-08-13):
-    detail pages reached FROM a section keep that section's bar lit, so clicking
-    around research never strands you without navigation. Agent-owned documents
-    get a back-bar to /agent instead (that book has its own segs)."""
+    """L2 nav (sections of a book) — and L3 INHERITANCE (David, 2026-08-13): a detail page keeps
+    the bar of the place it belongs to, with a back chevron, so clicking around never strands
+    you. The owner matches nav_key(): ticker pages → the Personal book bar; dossiers, boards and
+    system docs → Research; agent documents → a back-bar to /agent (that book has its own tabs)."""
     from flask import request as _rq
-    path, active = _rq.path, None
-    if path == "/dip" or path.startswith("/dip/"):   # DIP Venture: Book + Options (2026-09-19); other BROKERA tabs still David's call
+    path = _rq.path
+    if _under(path, "/dip"):   # DIP Venture: Book · Options · Industries · PE · Judgements
         return dip_page.pfseg(path)
+    lp = globals().get("learn_page")
+    if lp is not None and (_under(path, "/learn") or path in ("/primer", "/lookups")):
+        try:
+            return lp.seg(path)   # Learn: Guides · Glossary · Library
+        except Exception:
+            return ""
     if path in {p for p, _ in PF_SEGS}:
-        active = path
-    back = ""
-    if path.startswith("/ticker/") or path.startswith("/company/"):
-        active = "/research"          # ticker pages are the research surface
-        back = True
-    elif path == "/view":
+        return _segbar(PF_SEGS, path)
+    if path in {p for p, _ in RS_SEGS}:
+        return _segbar(RS_SEGS, path)
+    if path.startswith("/ticker/"):
+        # the bar of the book that holds the name (nav_key): Personal → its bar; the agent → a
+        # back-bar to /agent; DIP → its bar; held nowhere → Research's
+        own = nav_key(path)
+        if own == "agent":
+            return _agent_backbar()
+        if own == "dip":
+            return dip_page.pfseg(path).replace("<div class=pfnav>", "<div class=pfnav>" + _BACK.format(home="/dip"), 1)
+        if own == "research":
+            return _segbar(RS_SEGS, None, back=True)
+        return _segbar(PF_SEGS, None, back=True)
+    if path.startswith("/company/"):
+        return _segbar(RS_SEGS, "/research/companies", back=True)
+    if path == "/view":
         vp = _rq.args.get("path", "")
         if vp.startswith("_engine/agent"):
-            return ("<div class=pfnav><a class='pfseg pfback' href='#' onclick='history.length>1?"
-                    "history.back():nav(\"/agent\",true);return false'>‹</a>"
-                    "<a class=pfseg data-route='/agent' href='/agent'>BrokerB agent</a></div>")
-        active = ("/recommendation" if vp.startswith("_engine/recommendations")
-                  else "/journal" if "journal" in vp.split("/")[0:2]
-                  else "/research")
-        back = True
-    if active is None:
-        return ""
-    if back:  # standard detail-page affordance: back chevron (history-aware) + lit section
-        back = ("<a class='pfseg pfback' href='#' onclick='history.length>1?history.back():"
-                f"nav(\"{active}\",true);return false' title='Back'>‹</a>")
-    return ("<div class=pfnav>" + (back or "") + "".join(
-        f"<a class='pfseg{' on' if active == p else ''}' data-route='{p}' href='{p}'>{lab}</a>"
-        for p, lab in PF_SEGS) + "</div>")
+            return _agent_backbar()
+        if vp.startswith("_engine/recommendations"):
+            return _segbar(PF_SEGS, "/recommendation", back=True)
+        if "journal" in vp.split("/")[0:2]:
+            return _segbar(PF_SEGS, "/journal", back=True)
+        if vp.startswith("_engine"):   # candidate boards and the system docs
+            return _segbar(RS_SEGS, "/research/boards", back=True)
+        return _segbar(RS_SEGS, "/research/companies", back=True)   # a company's dossier
+    return ""
 
 
 def wrap(title, inner, partial):
@@ -759,18 +1372,21 @@ def wrap(title, inner, partial):
         return inner
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'>
+<meta name=color-scheme content='light dark'>
+<meta name=theme-color content='#ffffff' media='(prefers-color-scheme: light)'>
+<meta name=theme-color content='#15181d' media='(prefers-color-scheme: dark)'>
 <title>{html.escape(title)} · Stocks</title>
 <link rel=icon href="{FAVICON}">
 <link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel=stylesheet>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>{CSS}</style></head><body>
-<script>var WATCH={json.dumps(watchlist())},HELD={json.dumps([t for t, m in read_positions().items() if (m.get("shares") or 0) > 0])},APPV='{BOOT}',SYNCED={read_account().get("as_of_epoch", 0)};</script>
+<script>var WATCH={json.dumps(watchlist())},HELD={json.dumps(sorted(held_all()))},OWN={json.dumps(ticker_owners(), sort_keys=True)},APPV='{BOOT}',SYNCED={read_account().get("as_of_epoch", 0)},MKT={json.dumps(market_client())};</script>
 <input type=checkbox id=nav hidden>
 <div class=mobilebar><label for=nav class=burger aria-label=Menu><svg viewBox='0 0 16 16' width=18 height=18 fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round'><path d='M2 4h12M2 8h12M2 12h12'/></svg></label>
 <a class='brand mbrand' href='/' data-home>{I_LOGO}<span>Stocks</span></a></div>
 <label for=nav class=scrim></label>
-<aside class=side>{sidebar()}</aside>
+<aside class=side>{sidebar((request.path, request.args.get('path', '')))}</aside>
 <main id=main>{inner}</main><script>{JS}</script></body></html>"""
 
 def pos_row(tk, meta, holding=False):
@@ -816,6 +1432,8 @@ def home_inner():
     grammar, because the capital in every human-traded book asks the same questions."""
     bk = _book(); is_jpm = bk == "brokera"
     blabel = _books.load()[bk]["label"]
+    if is_jpm:            # books.json still calls it "J.P. Morgan"; the page and the nav say Personal book
+        blabel = "Personal book"
     bhome = "/" if is_jpm else f"/{bk}"
     pos = read_positions(); wl = watchlist(); acct = read_account()
     acct_ok = bool(acct)  # account.json missing/unreadable renders as {} — don't let $0 masquerade as a real balance
@@ -824,15 +1442,16 @@ def home_inner():
     watch = [t for t in dict.fromkeys(list(wl) + list(pos.keys())) if t not in held]  # names you track but don't own
 
     asof = str(acct.get("as_of", "")) or "never"
-    head = (f"<div class=pagehead><div><h1>{'Portfolio' if is_jpm else html.escape(blabel)}</h1>"
+    # 2026-09-22: the BROKERA book reads as "Personal book" (David); the watchlist's Add box moved to
+    # /research with the watchlist itself
+    head = (f"<div class=pagehead><div><h1>{'Personal book' if is_jpm else html.escape(blabel)}</h1>"
             f"<p class=muted>Live quotes · brokerage synced <b>{html.escape(asof)}</b> <span id=syncnote class=hint></span></p></div>"
             "<div class=headactions>"
-            + ("<form class=addbar onsubmit='return doAdd(event)'><input id=addtk placeholder='Add ticker…' autocomplete=off spellcheck=false><button type=submit>Add</button></form>" if is_jpm else "")
             + f"<button class=connectbtn onclick='syncBrokerage()'>{I_REFRESH}<span>Sync {html.escape(blabel)}</span></button></div></div>"
             # book context for the page JS: every /api/ fetch carries book=<slug> while this is on screen
             + f"<span id=bookctx data-book='{bk}' data-home='{bhome}' hidden></span>")
     kpi = ("<div class=kpirow>"
-           "<div class='kpi hero'><div class=kk>Account value</div><div class=kv id=kv-val>—</div></div>"
+           "<div class='kpi hero'><div class=kk>Account value <span class=ksub>live quotes</span></div><div class=kv id=kv-val>—</div></div>"
            "<div class=kpi><div class=kk>Today</div><div class=kv id=kv-day>—</div></div>"
            "<div class=kpi><div class=kk>Unrealized P&amp;L</div><div class=kv id=kv-ret>—</div></div>"
            "<div class=kpi><div class=kk>Lifetime P&amp;L <span class='hint' id=kv-lifesub></span></div><div class=kv id=kv-life>—</div></div>"
@@ -854,7 +1473,7 @@ def home_inner():
                   f"<tbody>{rows}</tbody></table></div></div>")
     else:
         hold_w = ("<div class=widget><div class=whead><span class=wtitle>Holdings</span></div>"
-                  + ("<div class=pfempty2>No holdings tracked yet — use Sync J.P. Morgan (top right).</div></div>" if is_jpm else
+                  + ("<div class=pfempty2>No holdings tracked yet — use Sync Personal book (top right).</div></div>" if is_jpm else
                      "<div class=pfempty2>No public positions yet — the cash is the position until a name earns it.</div></div>"))
     if not is_jpm:
         hold_w += dip_page.private_widget(priv)   # the book's hand-marked private stakes (Waffle)
@@ -900,7 +1519,7 @@ def home_inner():
                "withdrawals and transfers removed. Dashed line is SPY given the same capital on the same dates.'>Return</button>"
                "<button class=rbtn data-pfmode='hold' title='Unrealized P&amp;L on the equity book alone — cost basis "
                "vs daily closes. Ignores cash, money market and the note.'>Stock P&amp;L</button></div>")
-    pf_w = ("<div class=widget><div class=whead><span class=wtitle>Portfolio</span>"
+    pf_w = ("<div class=widget><div class='whead wrapx'><span class=wtitle>Portfolio</span>"
             f"<div style='display:flex;gap:14px;flex-wrap:wrap;align-items:center'>{pfmodes}<div class=ranges>{pfranges}</div></div></div>"
             "<div class='wbody pad'><div id=pfsum class=pfsum2></div>"
             "<div class=chartbox style='height:300px'><canvas id=pfchart></canvas></div></div></div>")
@@ -935,8 +1554,8 @@ def home_inner():
                     "<span class=hint>— trigger engine, held names</span></span>"
                     f"<span class=wcount>{len(pal)}</span></div><div class=feed>" + arows + "</div></div>")
     # Book = portfolio only (David 2026-08-13): chart+holdings+transactions main,
-    # alerts+allocation+account rail. Watchlist lives in the sidebar; calendar +
-    # what's-new moved to the Research seg (their loaders find the ids there).
+    # alerts+allocation+account rail. The watchlist, calendar and what's-new live on
+    # /research (their loaders find the ids there).
     rail = alerts_w + alloc_w + acct_w
     return (head + acctdata + kpi + "<div class=homegrid><div class=homemain>" + pf_w + hold_w + tx_w +
             "</div><div class=homerail>" + rail + "</div></div>")
@@ -986,7 +1605,7 @@ def rec_inner():
     today = dt.date.today().isoformat()
     have_today = any(r.stem == f"rec_{today}" for r in recs)
     btn = "" if have_today else "<button class='btn primary' onclick='genRec()'>✦ Generate new digest</button>"
-    head = ("<div class=pagehead><div><h1>Claude recommendation</h1>"
+    head = ("<div class=pagehead><div><h1>Advice</h1>"
             "<p class=muted>A strategist's weekly digest on the portfolio against your goals — "
             "generated on the Spark by a headless Claude session (Mondays 8:00 ET, or on demand).</p></div>"
             f"<div class=headactions>{btn}</div></div>")
@@ -1275,7 +1894,7 @@ def ticker_inner(sym):
 
 @app.route("/")
 def home():
-    return wrap("Portfolio", home_inner(), request.args.get("partial"))
+    return wrap("Personal book", home_inner(), request.args.get("partial"))
 
 @app.route("/company/<name>")
 def company(name):
@@ -1296,27 +1915,48 @@ def ticker(sym):
 
 @app.route("/recommendation")
 def recommendation():
-    return wrap("Claude recommendation", rec_inner(), request.args.get("partial"))
+    return wrap("Advice", rec_inner(), request.args.get("partial"))
 
 @app.route("/journal")
 def journal():
     return wrap("Journal", journal_inner(), request.args.get("partial"))
 
 _QCACHE = {}
-_QMETA = {}   # market cap + 52-week range: slow-moving, so refreshed every 6h, not every price tick
+_QMETA = {}   # market cap + 52-week range: slow-moving, so refreshed every meta_s, not every price tick
+
+# .renew on a price-warmer thread: whether THIS fetch may renew cap/52-week (the budget had room
+# for it this tick). Unset on a page's request thread.
+_WARMING = threading.local()
+
+def _meta_due(t):
+    """Past meta_s — plain, not _ttl(): off-market _ttl() would make the post-close pass renew every
+    name's range, and the open expire all of them again 17.5 h later."""
+    return not (t in _QMETA and time.time() - _QMETA[t][0] < LIVE["meta_s"])
 
 def _quote_meta(t, key):
+    """Market cap + 52-week range: two Finnhub calls. The price warmer renews a tracked name's when
+    it is due AND the budget has room after every due price (_quotes_affordable); until then the
+    old range stands, and a name that has none waits for one. A page's own fetch reuses what is on
+    hand, however old, for a tracked name (so a page opened at 9:30 does not triple its quote
+    calls), and fetches it for an untracked name that has none or one past meta_s — nothing else
+    would ever renew that one."""
     now = time.time()
-    if t in _QMETA and now - _QMETA[t][0] < 6 * 3600:
-        return _QMETA[t][1]
+    renew = getattr(_WARMING, "renew", None)
+    if renew is None:
+        if t in _QMETA and (not _meta_due(t) or t in _sets()[1]):
+            return _QMETA[t][1]
+    elif not (renew and _meta_due(t)):
+        return _QMETA.get(t, (0.0, {}))[1]
     d = {}
     try:
+        _fh_note("meta")
         p2 = requests.get("https://finnhub.io/api/v1/stock/profile2", params={"symbol": t, "token": key}, timeout=10).json()
         if p2.get("marketCapitalization"):
             d["cap"] = p2["marketCapitalization"] * 1e6
     except Exception:
         pass
     try:
+        _fh_note("meta")
         m = requests.get("https://finnhub.io/api/v1/stock/metric", params={"symbol": t, "metric": "price", "token": key}, timeout=10).json().get("metric", {})
         d["yhi"], d["ylo"] = m.get("52WeekHigh"), m.get("52WeekLow")
     except Exception:
@@ -1325,10 +1965,11 @@ def _quote_meta(t, key):
         _QMETA[t] = (now, d)
     return d
 def research_inner():
-    """/research — the intel surface (David 2026-08-13 v2): what's-new digest +
-    coming-up calendar. Companies/boards/system docs returned to the sidebar
-    tree; watchlist lives in the sidebar. The #digest/#calendar loaders run on
-    any page — the widgets moved here, their JS followed."""
+    """/research — top-level since 2026-09-22 (David: "we don't need all the watchlist/research
+    stuff in left hand side, these should be embedded somewhere, maybe a dedicated research tab").
+    This seg is the Watchlist: the bench of watched and written-up names we don't own, with add /
+    remove, plus What's new and Coming up. Companies and Boards are its sibling segs. The
+    #digest/#calendar loaders run on any page — the widgets live here, their JS followed."""
     skel = "<span class=skel style='width:60%'></span>"
     digest_filters = ("<div class=ffilters><button class='fbtn on' data-ff=all>All</button>"
                       "<button class=fbtn data-ff=filing>Filings</button>"
@@ -1338,25 +1979,36 @@ def research_inner():
              f"<div id=calendar class=feed><div class=fitem style='padding:14px 18px'>{skel}</div></div></div>")
     dig_w = (f"<div class=widget><div class=whead><span class=wtitle>What's new</span>{digest_filters}</div>"
              f"<div id=digest class=feed><div class=fitem style='padding:14px 18px'>{skel}</div></div></div>")
-    return ("<div class=pagehead><div><h1>Research</h1><p class=muted>The bench — names we watch or have "
-            "written up but don't own — with how each has actually traded, plus what's new and what's "
-            "coming. Owned names are in the Book. Boards and doctrine live in the sidebar tree; "
-            "tickers open into full evidence pages.</p></div></div>"
+    add = ("<form class=addbar onsubmit='return doAdd(event)'><input id=addtk placeholder='Add ticker…' "
+           "autocomplete=off spellcheck=false aria-label='Add a ticker to the watchlist'>"
+           "<button type=submit>Add</button></form>")
+    return ("<div class=pagehead><div><h1>Research</h1><p class=muted>Names we watch or have written up "
+            "but don't own, how each has traded, and what's new. The watchlist also feeds What's new "
+            "and the Brief. What we own is under Holdings.</p></div>"
+            f"<div class=headactions>{add}</div></div>"
             "<div class=homegrid><div class=homemain>" + names_w() + dig_w +
             "</div><div class=homerail>" + cal_w + "</div></div>")
 
 
+def _writeup(cf):
+    """The best write-up link for a research folder, or '' (FINAL-REPORT, else the dossier)."""
+    if cf:
+        for pref in ("analysis/FINAL-REPORT.md", "analysis/soft-research-dossier.md"):
+            if (cf / pref).exists():
+                rel = html.escape(str((cf / pref).relative_to(ROOT)))
+                return f"<a class=doclink data-path='{rel}' href='/view?path={rel}'>Dossier</a>"
+    return ""
+
+
 def names_w():
     """The tracked-names table (David 2026-08-13: "research tab should have the watchlist
-    stocks and their performance along with research stocks"). One row per name, whether
-    it got there by being owned, watched, or researched — the point is seeing them
-    together. Prices and returns arrive from the single /api/perf batch."""
+    stocks and their performance along with research stocks"). One row per name we watch or
+    have researched but do NOT own in any book — owned names live under Holdings. × stops
+    watching a name; + Watch adds a researched one to the watchlist feed. Prices and returns
+    arrive from the single /api/perf batch."""
     pos = read_positions()
-    held = {t for t, m in pos.items() if (m.get("shares") or 0) > 0}
-    wl = set(watchlist())
-    # Held names live in the Book, where cost basis, P&L and weight make them mean
-    # something (David 2026-08-13: "separate out the stocks that we have held or just
-    # not put the held stocks there"). Research is the candidate bench.
+    held = held_all()
+    wl = watchlist()
     names = [t for t in tracked_tickers() if t not in held]
     rows = ""
     for tk in names:
@@ -1367,32 +2019,132 @@ def names_w():
         nm = html.escape(pos.get(tk, {}).get("name") or ticker_names().get(tk)
                          or (cf.name.rsplit("-", 1)[0].replace("_", " ") if cf else ""))
         tag = "<span class=tag>Watching</span>" if tk in wl else "<span class='tag res'>Research</span>"
-        doc = ""
-        if cf:
-            for pref in ("analysis/FINAL-REPORT.md", "analysis/soft-research-dossier.md"):
-                if (cf / pref).exists():
-                    rel = html.escape(str((cf / pref).relative_to(ROOT)))
-                    doc = f"<a class=doclink data-path='{rel}' href='/view?path={rel}'>Dossier</a>"
-                    break
+        # one toggle per row under a "Watch" header: ✓ = on the watchlist feed (tap to stop), + = add.
+        # A bare "+" beside "×" buttons in an unlabelled column read as two unrelated actions on a phone.
+        act = (f"<button class='wbtn on' title='Stop watching {tk}' aria-label='Watching {tk}: tap to stop' "
+               f"aria-pressed=true onclick='rsUnwatch(event,\"{tk}\")'>✓<span class=wl> Watching</span></button>"
+               if tk in wl else
+               f"<button class=wbtn title='Watch {tk}' aria-label='Watch {tk}' aria-pressed=false "
+               f"onclick='rsWatch(event,\"{tk}\")'>+<span class=wl> Watch</span></button>")
         rows += (f"<tr class=nrow data-tk='{tk}'>"
                  f"<td><a class=tklink data-tk='{tk}' href='/ticker/{tk}'>{tk}</a>{tag}"
                  f"<div class=subname>{nm}</div></td>"
-                 f"<td class='num p-price'>·</td><td class='num p-d1'></td><td class='num p-m1 c-wide'></td>"
-                 f"<td class='num p-m6'></td><td class='num p-ytd c-wide'></td>"
-                 f"<td>{verdict}</td><td class=c-wide>{doc or '<span class=muted>—</span>'}</td></tr>")
-    return ("<div class=widget><div class=whead><span class=wtitle>The bench "
-            "<span class=hint>— watched and written up, not owned. Held names live in "
-            "<a data-home href='/'>Book</a>.</span></span>"
+                 f"<td class='num p-price c-px'>·</td><td class='num p-d1 c-d1'></td><td class='num p-m1 c-wide'></td>"
+                 f"<td class='num p-m6 c-mid'></td><td class='num p-ytd c-wide'></td>"
+                 f"<td class=c-mid>{verdict}</td><td class=c-wide>{_writeup(cf) or '<span class=muted>—</span>'}</td>"
+                 f"<td class=rmc>{act}</td></tr>")
+    # owned names that are still on the watchlist file keep feeding What's new and the Brief;
+    # the old sidebar let you drop them, so this line still does
+    owned = [t for t in wl if t in held]
+    foot = ("<div class=wfoot>Owned and still on the watchlist feed: " + " ".join(
+        f"<span class=wchip><a data-tk='{t}' href='/ticker/{t}'>{t}</a><button class=rm title='Stop watching {t}' "
+        f"aria-label='Stop watching {t}' onclick='rsUnwatch(event,\"{t}\")'>×</button></span>" for t in owned)
+        + "</div>") if owned else ""
+    empty = ("" if names else "<div class=pfempty2>Nothing on the bench — add a ticker above, or open one "
+             "from a candidate board.</div>")
+    return ("<div class=widget><div class=whead><span class=wtitle>Watchlist "
+            "<span class=hint>— watched and written up, not owned</span></span>"
             f"<span class=wcount>{len(names)}</span></div><div class=wbody>"
-            "<table class=dt id=nametable><thead><tr><th>Name</th><th class=num>Price</th>"
-            "<th class=num>Day</th><th class='num c-wide'>1M</th><th class=num>6M</th>"
-            "<th class='num c-wide'>YTD</th><th>Verdict</th><th class=c-wide>Write-up</th>"
-            f"</tr></thead><tbody>{rows}</tbody></table></div></div>")
+            "<table class=dt id=nametable><thead><tr><th>Name</th><th class='num c-px'>Price</th>"
+            "<th class='num c-d1'>Day</th><th class='num c-wide'>1M</th><th class='num c-mid'>6M</th>"
+            "<th class='num c-wide'>YTD</th><th class=c-mid>Verdict</th><th class=c-wide>Write-up</th>"
+            "<th class=rmc>Watch</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>{empty}{foot}</div></div>")
+
+
+def research_companies_inner():
+    """/research/companies — every research folder (what the sidebar's Research tree was):
+    grouped Held / Watching / Researched, the verdict dot, the report / playbook / latest update,
+    the live ticker, and archive (never for a name any book owns)."""
+    held = held_all(); wl = set(watchlist()); pos = read_positions()
+    groups = {"Held": [], "Watching": [], "Researched": []}
+    for c in companies():
+        tk = ticker_of(c)
+        nm = (pos.get(tk, {}).get("name") or ticker_names().get(tk)
+              or c.name.rsplit("-", 1)[0].replace("_", " "))
+        groups["Held" if tk in held else ("Watching" if tk in wl else "Researched")].append((tk, nm, c))
+    out = []
+    for g, items in groups.items():
+        if not items:
+            continue
+        out.append(f"<div class=rgrp-h>{g} <span class=hint>{len(items)}</span></div><div class=rco-list>")
+        for tk, nm, c in items:
+            ov = lenses_overall(c)
+            dot = f"<span class='vdot {sig_cls(ov)}'></span>" if ov else "<span class=vdot></span>"
+            verdict = html.escape(ov) if ov else "No verdict yet"
+            arch = ("" if tk in held else
+                    f"<button class='rm rco-x' title='Archive this research' aria-label='Archive the {tk} research' "
+                    f"onclick='archiveResearch(event,\"{tk}\")'>×</button>")
+            picks = [(c / "analysis" / "FINAL-REPORT.md", "Report"),
+                     (c / "analysis" / "trade-playbook.md", "Playbook")]
+            ud = c / "analysis" / "updates"
+            ups = sorted(ud.glob("update-*.md"), reverse=True) if ud.exists() else []
+            if ups:
+                picks.append((ups[0], f"Update · {ups[0].stem.replace('update-', '')}"))
+            links = "".join(
+                f"<a class=rlink data-path='{html.escape(str(f.relative_to(ROOT)))}' "
+                f"href='/view?path={html.escape(str(f.relative_to(ROOT)))}'>{html.escape(lab)}</a>"
+                for f, lab in picks if f.exists())
+            links += f"<a class=rlink data-tk='{tk}' href='/ticker/{tk}'>Live ticker</a>"
+            out.append(f"<div class=rco data-co='{tk}'><div class=rco-top>{dot}"
+                       f"<a class=rco-nm data-tk='{tk}' href='/ticker/{tk}'>{html.escape(nm)}</a>"
+                       f"<span class=rco-tk>{tk}</span>{arch}</div>"
+                       f"<div class=rco-v>{verdict}</div><div class=rco-links>{links}</div></div>")
+        out.append("</div>")
+    if not out:
+        out.append("<div class=pfempty2>No dossiers yet — open a ticker and run ✦ Research.</div>")
+    return ("<div class=pagehead><div><h1>Companies</h1><p class=muted>Every company with a research "
+            "folder. The dot is the verdict: green buy, amber buy-below or caution, red pass. "
+            "× archives a folder (it moves to _archive/, reversible).</p></div></div>" + "".join(out))
+
+
+def research_boards_inner():
+    """/research/boards — the candidate boards (the weekly sourcing scan, newest first), a new
+    scan on demand, and the system docs folded underneath."""
+    rows = []
+    for b in boards():
+        rel = html.escape(str(b.relative_to(ROOT)))
+        rows.append(f"<a class=docrow data-path='{rel}' href='/view?path={rel}'>{I_DOC}"
+                    f"<span class=dlabel>Board · {html.escape(b.stem.replace('board_', ''))}</span></a>")
+    lst = (f"<div class=doclist>{''.join(rows)}</div>" if rows else
+           "<div class=pfempty2>No boards yet — New board scan runs one now.</div>")
+    docs = "".join(
+        f"<a class=docrow data-path='{html.escape(str(f.relative_to(ROOT)))}' "
+        f"href='/view?path={html.escape(str(f.relative_to(ROOT)))}'>{I_DOC}"
+        f"<span class=dlabel>{html.escape(label(f))}</span></a>" for f in sysdocs())
+    sysw = (f"<details class=fold><summary>System docs <span class=hint>({len(sysdocs())}) — how the "
+            f"desk works</span></summary><div class=doclist>{docs}</div></details>") if docs else ""
+    return ("<div class=pagehead><div><h1>Candidate boards</h1><p class=muted>The weekly list of names "
+            "being sold for reasons other than value (Mondays, 6:45am ET). Open one to read it; "
+            "+ watch on a row adds the name to the watchlist.</p></div>"
+            f"<div class=headactions><button class=btn onclick='boardRefresh()'>{I_REFRESH}"
+            "<span>New board scan</span></button></div></div>" + lst + sysw)
 
 
 @app.route("/research")
 def research_home():
     return wrap("Research", research_inner(), request.args.get("partial"))
+
+
+@app.route("/research/companies")
+def research_companies():
+    return wrap("Companies", research_companies_inner(), request.args.get("partial"))
+
+
+@app.route("/research/boards")
+def research_boards():
+    return wrap("Candidate boards", research_boards_inner(), request.args.get("partial"))
+
+
+@app.route("/research/<sym>")
+def research_ticker(sym):
+    """/research/<TK> was linked (the industries Companies table) but never existed: send it to
+    the ticker page, keeping ?partial so an SPA fetch still gets a partial."""
+    from flask import redirect
+    if not re.fullmatch(r"[A-Za-z0-9.\-]{1,12}", sym):
+        abort(404)
+    qs = request.query_string.decode()
+    return redirect(f"/ticker/{sym.upper()}" + (f"?{qs}" if qs else ""))
 
 
 @app.route("/api/quotes")
@@ -1412,56 +2164,165 @@ def quotes():
 def quote():
     return jsonify(_quote(request.args.get("ticker", "").upper()))
 
+_QBG = set()          # names with a background refresh in flight
+_QBG_LOCK = threading.Lock()
+
+_QRETRY = {}          # name -> epoch before which a quote Finnhub refused is not asked for again
+
+def _quote_window(t, now=None):
+    """(fresh_s, oldest_s) for a price asked for now, by the live-data policy (LIVE). Younger than
+    fresh_s it is served as is; up to oldest_s it is served at once while one background fetch
+    refreshes it (stale-while-revalidate: on the slow link a Finnhub call takes 0.5-3s); older, the
+    caller waits for a fresh one. oldest_s None = any age, because the market is closed.
+      market hours  owned: fresh a tick past owned_every() (the warmer re-quotes it on that beat),
+                    never older than owned_max_s. Anything else: fresh until the warmer's turn
+                    (other_s − other_lead_s, plus a tick), never older than other_s.
+      off-market    fresh iff fetched since the settle point (the post-close pass). An older price
+                    is still served at once, and fetched once behind it — never again till the open."""
+    m = market(now)
+    if m["open"]:
+        if t in _sets()[0]:
+            every = owned_every()
+            return every + LIVE["tick_s"], max(LIVE["owned_max_s"], 2 * every)
+        return LIVE["other_s"] - LIVE["other_lead_s"] + LIVE["tick_s"], LIVE["other_s"]
+    if not m["settled"]:
+        return LIVE["other_s"], None
+    return m["now"] - m["settled"], None
+
 def _quote(t):
-    if t in _QCACHE and time.time() - _QCACHE[t][0] < 120:
-        return _QCACHE[t][1]
+    """A price by the live-data policy (_quote_window): the page waits only for a name never
+    fetched, or one past its oldest_s in market hours. A name Finnhub refused a moment ago keeps
+    its last price until its retry falls due — except an owned name in market hours, which is
+    never served past oldest_s for it: _quote_fetch prices that one from Yahoo meanwhile."""
+    c = _QCACHE.get(t)
+    fresh, oldest = _quote_window(t)
+    if c:
+        age = time.time() - c[0]
+        if age < fresh:
+            return c[1]
+        if c[1].get("price"):
+            waiting = time.time() < _QRETRY.get(t, 0)
+            if oldest is None or age < oldest:
+                if not waiting:
+                    _quote_bg(t)
+                return c[1]
+            if waiting and t not in _sets()[0]:
+                return c[1]
     with _cache_lock(f"q:{t}"):   # single-flight: the warmer and a page open share one fetch
-        if t in _QCACHE and time.time() - _QCACHE[t][0] < 120:
-            return _QCACHE[t][1]
+        c = _QCACHE.get(t)
+        if c and time.time() - c[0] < fresh:
+            return c[1]
         return _quote_fetch(t)
 
-def _quote_fetch(t):
-    now = time.time()
-    key = load_key("finnhub"); d = {}
-    if key:
+def _quote_bg(t):
+    with _QBG_LOCK:
+        if t in _QBG:
+            return
+        _QBG.add(t)
+
+    def run():
         try:
-            q = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": t, "token": key}, timeout=10).json()
-            if q.get("c"):
-                d = {"price": q.get("c"), "prev": q.get("pc"), "dhi": q.get("h"), "dlo": q.get("l")}
-                d.update(_quote_meta(t, key))   # one price call per refresh, not three
+            with _cache_lock(f"q:{t}"):
+                c = _QCACHE.get(t)
+                if not (c and time.time() - c[0] < _quote_window(t)[0]):
+                    _quote_fetch(t)
         except Exception:
-            d = {}
-    if not d.get("price") and t in _QCACHE and _QCACHE[t][1].get("price"):
-        # Finnhub refused (rate limit, blip): keep the last good price for another
-        # 120s rather than stall on the Yahoo fallback, which throttles bursts hard
-        _QCACHE[t] = (now, _QCACHE[t][1])
-        return _QCACHE[t][1]
+            pass
+        finally:
+            with _QBG_LOCK:
+                _QBG.discard(t)
+    threading.Thread(target=run, daemon=True).start()
+
+_QFAILS = {}          # name -> failed quote fetches in a row (the backoff's exponent)
+
+def _quote_backoff(t, now):
+    """A quote Finnhub refused, or that neither source priced: not asked for again before retry_s,
+    doubling, retry_tries times in a row — then, off-market, not before the next open (the close
+    is as good as tonight gets), and in market hours at the longest of those waits. An owned name
+    in market hours always waits just retry_s: Finnhub's window is a minute, and it is our money."""
+    n = _QFAILS.get(t, 0) + 1
+    _QFAILS[t] = n
+    m = market()
+    if m["open"] and t in _sets()[0]:
+        _QRETRY[t] = now + LIVE["retry_s"]
+    elif n > LIVE["retry_tries"] and not m["open"]:
+        _QRETRY[t] = m["next"]
+    else:
+        _QRETRY[t] = now + LIVE["retry_s"] * 2 ** (min(n, LIVE["retry_tries"]) - 1)
+
+def _quote_fetch(t):
+    """Finnhub first (cap/52-week from _quote_meta); Yahoo for a symbol Finnhub does not price. A
+    refusal (rate limit, blip) keeps the last good price, at its own age, and backs the name off
+    (_quote_backoff) rather than stall on Yahoo, which throttles bursts hard — except an owned name
+    in market hours whose price is past its oldest_s, which Yahoo prices rather than let it get
+    older still (Finnhub is not asked again inside its backoff). A fetch that finds no price
+    anywhere never overwrites one we had."""
+    now = time.time()
+    old = _QCACHE.get(t)
+    had = bool(old and old[1].get("price"))
+    key = load_key("finnhub"); d = {}
+    waiting = now < _QRETRY.get(t, 0)       # inside a refusal's backoff: Finnhub is not asked
+    refused = waiting
+    if key and not waiting:
+        try:
+            _fh_note("quote", t)
+            r = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": t, "token": key}, timeout=10)
+            q = r.json()
+            if q.get("c"):
+                d = {"price": q.get("c"), "prev": q.get("pc"), "dhi": q.get("h"), "dlo": q.get("l"), "at": round(now)}
+                d.update(_quote_meta(t, key))   # one price call per refresh, not three
+            else:   # a 200 with c=0 is a symbol Finnhub does not price: that one goes to Yahoo
+                refused = r.status_code != 200 or "error" in q
+        except Exception:
+            d = {}; refused = True
+    if refused and had:
+        oldest = _quote_window(t)[1]
+        overdue = oldest is not None and t in _sets()[0] and now - old[0] >= oldest
+        if not overdue:
+            if not waiting:
+                _quote_backoff(t, now)
+            return old[1]
     if not d.get("price"):
+        _up("yahoo:quote")
         try:
             import yfinance as yf
             fi = yf.Ticker(t).fast_info
             d = {"price": getattr(fi, "last_price", None), "prev": getattr(fi, "previous_close", None),
-                 "cap": getattr(fi, "market_cap", None), "yhi": getattr(fi, "year_high", None), "ylo": getattr(fi, "year_low", None)}
+                 "cap": getattr(fi, "market_cap", None), "yhi": getattr(fi, "year_high", None), "ylo": getattr(fi, "year_low", None),
+                 "at": round(now)}
         except Exception:
             d = {}
-    _QCACHE[t] = (now, d)
+    if d.get("price") and not refused:
+        _QRETRY.pop(t, None); _QFAILS.pop(t, None)
+    elif not waiting:
+        _quote_backoff(t, now)
+    if not d.get("price") and had:
+        return old[1]           # neither source priced it: the last good price stands, at its own age
+    _QCACHE[t] = (now, d)   # a name nothing has ever priced is remembered too, so no page re-asks
     return d
 
 @app.route("/api/spark")
 def spark():
     t = request.args.get("ticker", "").upper()
     def fetch():
+        _up("yahoo:spark")
         try:
             import yfinance as yf
             h = yf.Ticker(t).history(period="3mo")["Close"].dropna().tolist()
             return [round(x, 4) for x in h[-60:]]
         except Exception:
-            return []
-    return jsonify(cached(f"spark:{t}", 1800, fetch))
+            return _Failed()
+    return jsonify(cached(f"spark:{t}", _ttl(LIVE["chart_s"]), fetch))
 
-@app.route("/api/watchlist")
+@app.route("/api/watchlist", methods=["GET", "POST"])
 def wl_api():
-    action = request.args.get("action"); tk = request.args.get("ticker", "").upper().strip()
+    # GET only lists; add/remove are POST (same-origin via _net_guard) — the watchlist is the
+    # BROKERA feed universe, and one <img src> could edit it on a GET (PLUMB-8, 2026-09-22)
+    action = tk = ""
+    if request.method == "POST":
+        b = request.get_json(silent=True) or {}
+        action = b.get("action") or request.args.get("action", "")
+        tk = str(b.get("ticker") or request.args.get("ticker", "")).upper().strip()
     f = CONF / "watchlist.txt"
     if action == "add" and tk and tk not in watchlist():
         txt = f.read_text() if f.exists() else ""
@@ -1612,9 +2473,17 @@ def _sync_accounts(st, qp, accts, bdir, watch):
     for tk, h in holdings.items():
         m = cur.get(tk, {})
         m.update({"shares": round(h["shares"], 4), "cost_basis": round(h["cost_basis"], 4), "status": "Held"})
+        m.pop("sold", None)
         if not m.get("name"):
             m["name"] = h["name"]
         cur[tk] = m
+    # a Held name the broker no longer reports was sold out (brokera-5, 2026-09-22): zero it and
+    # mark it Sold, keeping the row's thesis/catalyst notes. An EMPTY reply is never read as
+    # a full liquidation — one bad AggregatorA answer must not wipe the book.
+    if holdings:
+        for tk, m in cur.items():
+            if tk not in holdings and m.get("status") == "Held":
+                m.update({"shares": 0, "status": "Sold", "sold": dt.date.today().isoformat()})
     (bdir / "positions.json").write_text(json.dumps(cur, indent=2))
     if watch:
         wl = set(watchlist())
@@ -1639,6 +2508,13 @@ def st_sync():
     # cooldown: auto-sync on page open shouldn't hammer AggregatorA; manual button passes force=1
     if not request.args.get("force") and time.time() - _LAST_SYNC[0] < 300:
         return jsonify({"ok": True, "skipped": True, "msg": "Synced moments ago."})
+    # off-market (LIVE): the automatic sync runs only when the snapshot predates the last close —
+    # nothing at the broker moves overnight. The page's autoSync() asks the same; this holds it for
+    # a tab running yesterday's script. The Sync button (force=1) always goes.
+    if not request.args.get("force"):
+        m = market()
+        if not m["open"] and float(_json("account.json", {}).get("as_of_epoch") or 0) >= m["close"]:
+            return jsonify({"ok": True, "skipped": True, "msg": "Market closed — synced since the close."})
     _LAST_SYNC[0] = time.time()
     try:
         u = _st_user(st)
@@ -1680,15 +2556,22 @@ def st_sync():
 
 def _digest_items():
     """Filings + news across the watchlist. One ticker per worker: serially this was
-    EDGAR + Finnhub for each of fourteen names, 42s cold (measured 2026-09-03)."""
+    EDGAR + Finnhub for each of fourteen names, 42s cold (measured 2026-09-03). A source that
+    failed for any name marks the digest failed too, so it is rebuilt once that name is retried."""
+    failed = []
     def one(tk):
         items = []
         cik = cik_of(tk)
         if cik:
-            for f in edgar_filings(cik, 8):
+            fl = edgar_filings(cik, 8)
+            if isinstance(fl, _Failed):
+                failed.append(tk)
+            for f in fl:
                 items.append({"tk": tk, "date": f["date"], "kind": "filing", "label": f["form"],
                               "earn": f["earnings"], "mat": f["material"], "desc": f["desc"] or f["form"], "url": f["url"]})
         nw = finnhub_news(tk)
+        if isinstance(nw, _Failed):
+            failed.append(tk)
         if nw:
             for n in nw[:4]:
                 d = dt.datetime.fromtimestamp(n.get("datetime", 0), dt.timezone.utc).strftime("%Y-%m-%d") if n.get("datetime") else ""
@@ -1704,23 +2587,17 @@ def _digest_items():
             for chunk in ex.map(one, wl):
                 items.extend(chunk)
     items.sort(key=lambda x: x["date"], reverse=True)
-    return items[:22]
+    return _Failed(items[:22]) if failed else items[:22]
 
 @app.route("/api/digest")
 def digest():
     # stale=True: an expired digest is shown at once and refreshed behind it
-    return jsonify(cached("digest", 600, _digest_items, stale=True))
+    return jsonify(cached("digest", _ttl(LIVE["news_s"]), _digest_items, stale=True))
 
 def tracked_tickers():
-    """Every name the operation follows: owned, watched, or with a research folder."""
-    held = set()
-    for slug in _books.slugs():   # every book's held names, not just the one on screen
-        try:
-            pos = json.loads((_books.book_dir(slug) / "positions.json").read_text())
-        except Exception:
-            pos = {}
-        held |= {t for t, m in pos.items() if (m.get("shares") or 0) > 0}
-    return sorted(held | set(watchlist()) | {ticker_of(c) for c in companies()})
+    """Every name the operation follows: owned in any book (the BrokerB agent's positions
+    too, so the sidebar's Holdings quotes are pre-warmed), watched, or with a research folder."""
+    return sorted(held_all() | set(watchlist()) | {ticker_of(c) for c in companies()})
 
 @app.route("/api/sidebar")
 def api_sidebar():
@@ -1733,6 +2610,20 @@ def api_sidebar():
     appeared on sync) just went quietly stale. One refresh path replaces all of it."""
     return sidebar()
 
+@app.route("/api/live")
+def api_live():
+    """The live-data policy as this process sees it now (read-only): the market state and cadences
+    the page runs on (MKT), the LIVE table, the Finnhub arithmetic for the current owned + tracked
+    set, and every upstream call made since start, by kind."""
+    owned, tracked = _sets()
+    n_o, n_x = len(owned), len(tracked - owned)
+    return jsonify({**market_client(), "live": LIVE, "owned": sorted(owned), "tracked": len(tracked),
+                    "finnhub": {"last_min": fh_last_minute(), "owned_last_min": fh_last_minute(owned=True),
+                                "owned_beat": owned_beat(), "room": fh_room(), "cap": LIVE["finnhub_cap"],
+                                "budget": LIVE["finnhub_budget"],
+                                "steady_per_min": round(finnhub_per_min(owned_every(n_o, n_x), n_o, n_x), 1)},
+                    "upstream": dict(sorted(_UPSTREAM.items()))})
+
 def _perf_data():
     """Batch performance for every tracked name. One yfinance download covers the whole
     list (~0.3s for ten) — the per-row /api/quote fan-out this replaces was one request
@@ -1740,12 +2631,14 @@ def _perf_data():
     tks = tracked_tickers()
     if not tks:
         return {}
+    _up("yahoo:perf")
+    prev = ((_CACHE.get("perf") or (0, None))[1]) or {}
     try:
         import yfinance as yf
         df = yf.download(tks, period="1y", interval="1d", progress=False,
                          auto_adjust=True, threads=True)["Close"]
     except Exception:
-        return {}
+        return _FailedDict(prev)
     today = dt.date.today(); out = {}
     for tk in tks:
         try:
@@ -1768,14 +2661,26 @@ def _perf_data():
                    "ytd": pct(float(jan.iloc[-1])) if len(jan) else None,
                    "y1": pct(float(s.iloc[0])),
                    "lo": round(float(s.min()), 2), "hi": round(float(s.max()), 2)}
+    return _perf_merge(tks, out, prev)
+
+def _perf_merge(tks, out, prev):
+    """On the slow link Yahoo answers part of a 30-name download with "possibly delisted". A name
+    it dropped keeps its last row, and the gap marks the table failed so cached() retries it (a
+    name Yahoo has never priced is not a gap, or one bad ticker would retry forever)."""
+    missed = [tk for tk in tks if tk not in out and (tk in prev or not prev)]
+    if missed:
+        return _FailedDict({**{t: prev[t] for t in missed if t in prev}, **out})
     return out
 
 @app.route("/api/perf")
 def api_perf():
-    return jsonify(cached("perf", 900, _perf_data))
+    # stale=True: a 1y returns table is minutes-old by nature, and on the slow link a cold
+    # rebuild is ~14s of yfinance; the pane warmer keeps it within other_s in market hours
+    return jsonify(cached("perf", _ttl(LIVE["other_s"]), _perf_data, stale=True))
 
 def _hist_data(t, rng):
     def fetch():
+        _up("yahoo:history")
         try:
             import yfinance as yf
             # daily all the way out to 5y (~1200 points, 0.2s) — the client slices one
@@ -1783,8 +2688,8 @@ def _hist_data(t, rng):
             cl = yf.Ticker(t).history(period=rng, interval="1d")["Close"].dropna()
             return {"dates": [d.strftime("%Y-%m-%d") for d in cl.index], "closes": [round(float(x), 2) for x in cl.tolist()]}
         except Exception:
-            return {"dates": [], "closes": []}
-    return cached(f"hist:{t}:{rng}", 1800, fetch)
+            return _FailedDict(dates=[], closes=[])
+    return cached(f"hist:{t}:{rng}", _ttl(LIVE["chart_s"]), fetch)
 
 @app.route("/api/history")
 def api_history():
@@ -1795,11 +2700,23 @@ def _st_activities(st):
     /api/lots — each used to make its own two AggregatorA round trips (3–6s) for the
     same rows."""
     def fetch():
-        u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
-        aid = _book_aid(st)
-        act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
-        return act if isinstance(act, list) else act.get("data", [])
-    return cached(f"st_activities:{_book()}", 600, fetch)
+        _up("aggregatora:activities")
+        try:
+            u = _st_user(st); qp = {"userId": u["userId"], "userSecret": u["userSecret"]}
+            aid = _book_aid(st)
+            act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
+            return act if isinstance(act, list) else act.get("data", [])
+        except Exception:
+            # marked, not raised out of cached(): the key then gets the bounded retry (1, 2, 4 min,
+            # then its TTL) — a raise stored nothing, so the pane warmer re-asked AggregatorA every
+            # 30 s, overnight too, while a broken connection stayed broken
+            return _Failed()
+    v = cached(f"st_activities:{_book()}", _ttl(LIVE["activity_s"]), fetch)
+    if isinstance(v, _Failed):
+        # the callers (transactions, lots, lifetime P&L, the portfolio chart) treat a raise as their
+        # own failure; an empty list would read as "no activity" — lifetime net deposits of zero
+        raise RuntimeError("AggregatorA activities unavailable (retried on the _Failed schedule)")
+    return v
 
 @app.route("/api/transactions")
 def api_tx():
@@ -1824,8 +2741,8 @@ def api_tx():
             out.sort(key=lambda x: x["date"], reverse=True)
             return out[:60]
         except Exception:
-            return []
-    return jsonify(cached(f"tx:{_book()}", 600, fetch))
+            return _Failed()
+    return jsonify(cached(f"tx:{_book()}", _ttl(LIVE["activity_s"]), fetch))
 
 def _pf_flows(rows):
     """External cash flows by date, from account activities: deposits/withdrawals,
@@ -1951,6 +2868,7 @@ def _equity_series(rows, skip=()):
         return {}
     import yfinance as yf
     tks = sorted({t for evs in ev.values() for t, _, _ in evs})
+    _up("yahoo:pfhistory")
     px = yf.download(tks, start=min(ev), auto_adjust=False, progress=False)["Close"]
     if not hasattr(px, "columns"):
         px = px.to_frame(name=tks[0])
@@ -2004,8 +2922,8 @@ def api_lifetime():
             return {"net_deposits": round(flows + prior, 2), "from_activity": round(flows, 2),
                     "prior": prior, "since": earliest, "flows": detail}
         except Exception:
-            return {}
-    return jsonify(cached(f"lifetime:{_book()}", 3600, fetch))
+            return _FailedDict()
+    return jsonify(cached(f"lifetime:{_book()}", _ttl(LIVE["slow_s"]), fetch))
 
 @app.route("/api/pfhistory")
 def api_pfhist():
@@ -2072,7 +2990,7 @@ def api_pfhist():
             except Exception:
                 pass
         return _bjson("pf_history.json", [])  # snapshot fallback (grows on each sync)
-    return jsonify(cached(f"pfhist:{_book()}", 1800, fetch))
+    return jsonify(cached(f"pfhist:{_book()}", _ttl(LIVE["chart_s"]), fetch))
 
 @app.route("/api/research", methods=["POST"])
 def api_research():
@@ -2248,14 +3166,14 @@ def api_feedback():
     except Exception:
         items = []
     if request.method == "POST":
-        msg = (request.get_json(silent=True) or {}).get("msg", "").strip()
-        if msg:
+        b = request.get_json(silent=True) or {}
+        msg = (b.get("msg") or "").strip()
+        if b.get("action") == "remove":  # POST-only since PLUMB-8 (2026-09-22) — a GET just lists
+            items = [e for e in items if str(e.get("id")) != str(b.get("id", ""))]
+            FEEDBACK.write_text(json.dumps(items, indent=2))
+        elif msg:
             items.append({"id": int(time.time() * 1000), "date": dt.date.today().isoformat(), "msg": msg[:1000]})
             FEEDBACK.write_text(json.dumps(items, indent=2))
-    elif request.args.get("action") == "remove":
-        rid = request.args.get("id", "")
-        items = [e for e in items if str(e.get("id")) != rid]
-        FEEDBACK.write_text(json.dumps(items, indent=2))
     return jsonify(items)
 
 @app.route("/api/research/archive", methods=["POST"])
@@ -2310,8 +3228,8 @@ def api_lots():
                     best[key] = {"date": d, "type": typ, "units": units, "price": price, "amount": a.get("amount")}
             return sorted(best.values(), key=lambda x: x["date"])
         except Exception:
-            return []
-    return jsonify(cached(f"lots:{_book()}:{tk}", 600, fetch))
+            return _Failed()
+    return jsonify(cached(f"lots:{_book()}:{tk}", _ttl(LIVE["activity_s"]), fetch))
 
 @app.route("/api/calendar")
 def api_calendar():
@@ -2335,7 +3253,7 @@ def api_calendar():
         # a quiet horizon is a real answer, not a stale widget — say which names simply
         # have no date on the wire so an empty-looking calendar reads as "nothing due".
         return {"events": out[:24], "undated": undated, "as_of": today}
-    return jsonify(cached("cal", 3600, fetch))
+    return jsonify(cached("cal", LIVE["slow_s"], fetch))   # local: re-reads next_earnings()' cache
 
 # ---------- David's journal: dated notes + decision log (the learning loop) ----------
 JDIR = ROOT / "_engine" / "journal"
@@ -2356,13 +3274,13 @@ def api_jnotes():
     if request.method == "POST":
         b = request.get_json(silent=True) or {}
         msg = (b.get("msg") or "").strip()
-        if msg:
+        if b.get("action") == "remove":  # POST-only since PLUMB-8 (2026-09-22) — a GET just lists
+            items = [e for e in items if str(e.get("id")) != str(b.get("id", ""))]
+            _jwrite("notes.json", items)
+        elif msg:
             items.append({"id": int(time.time() * 1000), "date": dt.date.today().isoformat(),
                           "tk": (b.get("tk") or "").upper().strip()[:8], "msg": msg[:4000]})
             _jwrite("notes.json", items)
-    elif request.args.get("action") == "remove":
-        items = [e for e in items if str(e.get("id")) != request.args.get("id", "")]
-        _jwrite("notes.json", items)
     return jsonify(items)
 
 @app.route("/api/journal/decisions", methods=["GET", "POST"])
@@ -2392,7 +3310,7 @@ def api_search():
     q = request.args.get("q", "").strip().upper()
     if not q or len(q) > 40:
         return jsonify([])
-    names = ticker_names(); wl = set(watchlist()); pos = read_positions()
+    names = ticker_names(); wl = set(watchlist()); held = held_all()   # owned in ANY book, not the one on screen
     researched = {ticker_of(c) for c in companies()}
     scored = []
     for tk, nm in names.items():
@@ -2402,7 +3320,7 @@ def api_search():
             scored.append((2, tk))
     scored.sort(key=lambda x: (x[0], len(x[1]), x[1]))
     out = [{"tk": tk, "name": names.get(tk, ""),
-            "held": (pos.get(tk, {}).get("shares") or 0) > 0,
+            "held": tk in held,
             "watch": tk in wl, "research": tk in researched}
            for _, tk in scored[:8]]
     return jsonify(out)
@@ -2457,24 +3375,13 @@ font-size:14px;cursor:pointer;transition:background .1s;min-width:0}
 .leaf .ic{color:var(--fade)}.leaf.on .ic{color:var(--acc)}
 .leaf.action{color:var(--acc);font-weight:500}.leaf.action .ic{color:var(--acc)}
 .leaf>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tkleaf .ltk{font-weight:600;font-size:13.5px}
 .lheld{font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--pos);
 background:color-mix(in srgb,var(--pos) 10%,var(--panel));border:1px solid color-mix(in srgb,var(--pos) 45%,var(--line));
 border-radius:5px;padding:1px 6px;flex-shrink:0}
-.lchg{margin-left:auto;font-size:12.5px;font-weight:500;font-variant-numeric:tabular-nums;color:var(--mut)}
-.lchg.up{color:var(--pos)}.lchg.down{color:var(--neg)}
-.coleaf .coname{flex:1}
-.cotk{margin-left:auto;font-size:12px;color:var(--mut);font-weight:600;flex-shrink:0}
-.codet>summary{text-transform:none;letter-spacing:0;font-size:14px;font-weight:500;color:var(--fg);
-padding:6.5px 10px 6.5px 8px;border-radius:7px;gap:8px}
-.codet>summary:hover{background:var(--bg)}
-.codet>summary::before{margin-right:1px}
 .vdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex-shrink:0}
 .vdot.buy{background:var(--grn)}.vdot.sell{background:var(--red)}.vdot.warn{background:var(--yel)}.vdot.neu{background:var(--fade)}
-.codet .coname{flex:1;min-width:0;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.codet .coname:hover{color:var(--acc);text-decoration:none}
-.codet .coname.on{color:var(--acc);font-weight:600}
-.codet.hasactive>summary .coname{font-weight:600}
+/* a deep-linked item (/dip/options#aci) scrolls to just under the sticky seg bar, not beneath it */
+#main [id]{scroll-margin-top:76px}
 .pfnav{position:sticky;top:0;z-index:30;background:var(--bg);display:flex;gap:4px;
 padding:10px 0 10px;margin:0 0 16px;border-bottom:1px solid var(--line)}
 .pfback{flex:0 0 auto!important;padding:11px 14px;font-size:16px}
@@ -2483,22 +3390,60 @@ font-weight:600;color:var(--mut);min-height:44px;display:flex;align-items:center
 justify-content:center;text-decoration:none}
 .pfseg:hover{background:var(--panel);text-decoration:none}
 .pfseg.on{background:var(--accbg);color:var(--acc)}
-.agentnav{margin:0 0 4px}
-.agentnav>summary{padding:6.5px 10px 6.5px 8px;font-weight:500}
-.agentnav .coname{display:flex;align-items:center}
-.agentnav .coname .ic{color:var(--fade)}
-.agentnav .coname.on .ic,.agentnav .coname:hover .ic{color:var(--acc)}
-.codet .cotk:hover{color:var(--acc);text-decoration:none}
-.leaf.sub{padding:5.5px 10px 5.5px 32px;font-size:13px;color:var(--mut)}
-.leaf.sub:hover{color:var(--fg)}.leaf.sub.on{color:var(--acc)}
-.leaf.subtk{color:var(--acc);font-size:12.5px}
 .sempty{font-size:13px;color:var(--mut);padding:4px 10px 8px;line-height:1.5}
-.srm{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex-shrink:0;margin-left:2px;
-border:1px solid var(--line);background:var(--panel);color:var(--mut);font-size:13px;line-height:1;cursor:pointer;
-border-radius:50%;opacity:.55;transition:opacity .1s,color .1s,border-color .1s}
-.leaf:hover .srm,.codet>summary:hover .srm{opacity:1}
-.srm:hover{color:var(--red);border-color:var(--red)}
-@media(hover:none){.srm{opacity:1}}
+/* (the old sidebar's .tkleaf/.codet/.srm/.lchg rules went with the tree, 2026-09-22) */
+/* ---- sidebar, 2026-09-22 redesign: five destinations, then Holdings (HBS grouped-list idiom
+   in this shell's tokens: 9px rows, one tint for what you can tap, sentence-case group labels,
+   tabular numbers). Exactly one .ni is .on — setActive()/nav_key() decide which. ---- */
+.snav{display:flex;flex-direction:column;gap:2px;margin:2px 0 4px}
+.snav .leaf,.sfoot .leaf{min-height:40px;padding:0 10px;margin:0;border-radius:9px;gap:11px;font-size:15px;font-weight:500}
+.snav .leaf .ic{width:18px;height:18px;color:var(--acc)}
+.ni.on>.leaf{background:var(--accbg);color:var(--acc);font-weight:600}
+.snav .leaf .lheld{margin-left:auto;text-transform:none;letter-spacing:0;font-size:12px;color:var(--yel);
+background:color-mix(in srgb,var(--yel) 12%,var(--panel));border-color:color-mix(in srgb,var(--yel) 40%,var(--line))}
+.hsec{margin-top:16px}
+.hsec-h{font-size:15px;font-weight:600;color:var(--fg);padding:4px 10px 0;display:flex;align-items:baseline;gap:6px}
+.hgrp{display:flex;align-items:baseline;gap:8px;padding:12px 10px 3px;font-size:13px;font-weight:600;color:var(--mut)}
+.hday{margin-left:auto;font-variant-numeric:tabular-nums}.hday.up{color:var(--pos)}.hday.down{color:var(--neg)}
+.leaf.hrow{min-height:44px;padding:4px 10px;gap:10px;margin:0;border-radius:9px}
+.leaf.hrow>span{display:flex;flex-direction:column;line-height:1.25;min-width:0;overflow:visible}
+.hrow .hr{margin-left:auto;align-items:flex-end;text-align:right}
+.hrow .htk{font-weight:600;font-size:14px;color:var(--fg)}
+.hrow .hv{font-size:12px;color:var(--fade);font-variant-numeric:tabular-nums}
+.hrow .hd{font-size:13.5px;font-weight:600;color:var(--mut);font-variant-numeric:tabular-nums}
+.hrow .hp{font-size:12px;color:var(--fade);font-variant-numeric:tabular-nums}
+.hrow .hd.up,.hrow .hp.up{color:var(--pos)}.hrow .hd.down,.hrow .hp.down{color:var(--neg)}
+.hrow.priv .hd{font-size:12px;font-weight:500;color:var(--fade)}
+.leaf.hrow.cur{background:var(--bg);box-shadow:inset 3px 0 0 var(--acc)}
+.sfoot{margin-top:18px;padding-top:8px;border-top:1px solid var(--line)}
+.sfoot .leaf{font-size:13px;color:var(--fade);font-weight:500}.sfoot .leaf .ic{color:var(--fade)}
+@media(max-width:820px){.snav .leaf,.sfoot .leaf{min-height:44px}form.search input,form.addbar input{font-size:16px}
+.mobilebar .burger{width:44px;height:44px}.search .skey{display:none}
+form.search input,form.addbar input,form.addbar button,.headactions .connectbtn{min-height:44px}
+.fhead .ftk{padding:12px 0;margin:-12px 0}}
+/* ---- /research (Watchlist · Companies · Boards) ---- */
+.wfoot{padding:12px 16px;border-top:1px solid var(--line);font-size:13px;color:var(--mut);display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.wchip{display:inline-flex;align-items:center;gap:4px;font-weight:600}
+.dt .rmc .wbtn{height:32px;padding:0 11px;font-size:12.5px}
+.rgrp-h{font-size:13px;font-weight:600;color:var(--mut);margin:22px 4px 8px}
+.rco-list{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.rco{padding:10px 14px 12px;border-top:1px solid var(--line);min-width:0}.rco:first-child{border-top:none}
+.rco-top{display:flex;align-items:center;gap:9px;min-height:36px;min-width:0}
+.rco-nm{font-weight:600;font-size:15.5px;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rco-tk{font-size:12.5px;font-weight:600;color:var(--fade);flex-shrink:0}
+.rco-x{margin-left:auto}
+.rco-v{font-size:13px;color:var(--mut);margin:0 0 6px 17px}
+.rco-links{display:flex;flex-wrap:wrap;gap:6px;margin-left:17px}
+.rlink{display:inline-flex;align-items:center;min-height:34px;padding:0 12px;border-radius:9px;background:var(--bg);
+border:1px solid var(--line);font-size:13.5px;font-weight:500;color:var(--acc)}
+.rlink:hover{border-color:var(--acc);text-decoration:none}
+@media(max-width:820px){.rlink{min-height:44px}.rco .rm,.wchip .rm,.dt .rmc .rm{width:44px;height:44px}.dt .rmc .wbtn{height:44px}
+.rco-top{min-height:44px}.rco-nm{padding:10px 0;margin:-10px 0}.wchip a{padding:12px 2px;margin:-12px 0}.fbtn{min-height:44px}
+.rco-v,.rco-links{margin-left:0}}
+@media(max-width:640px){#nametable .c-mid,#nametable .tag,.dt .rmc .wl{display:none}.dt .rmc .wbtn{width:44px;padding:0}
+#nametable th,#nametable td{padding-left:8px;padding-right:8px}}
+.dt .rmc .wbtn.on{background:var(--accbg);border-color:transparent;color:var(--acc)}
+#nametable th.rmc{font-size:12px;text-align:center}
 /* WIDTH SYSTEM (2026-08-31, David: "nothing hard coded — adjusting accordingly,
    sizing flexible based on screen size"). The frame is FLUID: no pixel cap, padding
    scales with the viewport. Each content type carries its own INTRINSIC constraint
@@ -2517,7 +3462,7 @@ article{max-width:min(100%,100ch);font-size:clamp(15px,.32vw + 11.5px,19px);line
 .kpirow{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:18px;margin-bottom:28px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:24px 26px;box-shadow:var(--shadow)}
 .kpi.hero{grid-column:span 2}
-.kk{font-size:13px;color:var(--mut);margin-bottom:12px;font-weight:500}
+.kk{font-size:13px;color:var(--mut);margin-bottom:12px;font-weight:500}.kk .ksub{font-weight:400;color:var(--fade)}
 .kv{font-size:clamp(26px,1.3vw + 18px,38px);font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.025em;line-height:1.05}
 .kpi.hero .kv{font-size:clamp(34px,2vw + 22px,52px)}.kv.up{color:var(--pos)}.kv.down{color:var(--neg)}
 .homegrid{display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,28vw,430px);gap:26px;align-items:start}
@@ -2548,6 +3493,26 @@ span.subname{white-space:normal;overflow:visible;max-width:none}
    pushes it out of its own track on a narrow phone. These two are the home layout's columns.
    Long unbreakable strings (paths, tickers in <code>) break instead of overflowing. */
 .homegrid>*,.homemain,.homerail,.whead>*{min-width:0}
+/* a head whose controls outgrow the row wraps them under the title (the Portfolio chart's
+   mode + range buttons slid over its title on phones) */
+.whead.wrapx{flex-wrap:wrap}.whead.wrapx>.wtitle{flex-shrink:0}
+/* the watchlist table sits in the half-width column beside Coming up on /research: size its
+   columns to the card, not the window, so the secondary ones drop before it has to scroll */
+.homemain{container-type:inline-size}
+@container (max-width:720px){#nametable .c-wide,#nametable .tag,.dt .rmc .wl{display:none}
+#nametable th,#nametable td{padding-left:12px;padding-right:12px}#nametable .pill{white-space:normal}#nametable .subname{max-width:140px}
+.dt .rmc .wbtn{width:44px;padding:0}}
+@container (max-width:520px){#nametable .c-mid{display:none}
+/* a phone-width card: the Name cell gives way (width:100% + max-width:0 takes whatever is left
+   and its sub-name ellipsises) so Price, Day and the Watch toggle always fit — the table was
+   373px in a 356px card at 390 and 300 in 286 at 320, cutting the toggle off (2026-09-22 review).
+   Not table-layout:fixed: Chrome still counts the display:none columns there and split the
+   spare width between them and Name, leaving Name 28px. */
+#nametable{width:100%}
+#nametable th:first-child,#nametable td:first-child{width:100%;max-width:0;overflow:hidden;padding-left:12px}
+#nametable .c-px,#nametable .c-d1,#nametable .rmc{white-space:nowrap}
+#nametable th,#nametable td{padding-left:5px;padding-right:5px}
+#nametable .subname{max-width:100%}#nametable .tklink{display:inline-block;padding:10px 0;margin:-10px 0}}
 code{overflow-wrap:anywhere}
 .dt .pnl.up{color:var(--pos)}.dt .pnl.down{color:var(--neg)}.dt .pnl{font-weight:600}.dt .pnl .pct{font-weight:400;opacity:.8}
 .arow{display:flex;justify-content:space-between;align-items:baseline;padding:11px 0;border-bottom:1px solid var(--line);font-size:15px}
@@ -2627,7 +3592,7 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .fdate{font-size:12.5px;color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:84px}
 .fsrc{font-size:12.5px;color:var(--mut);white-space:nowrap;max-width:92px;overflow:hidden;text-overflow:ellipsis}
 .ftk{font-size:12.5px;font-weight:600;color:var(--acc);white-space:nowrap;min-width:46px}
-.fdesc{flex:1}
+.fdesc{flex:1 1 12rem;min-width:0;overflow-wrap:anywhere}
 .fbody{max-height:0;overflow:hidden;transition:max-height .22s ease;padding:0 18px}
 .fitem.open .fbody{max-height:420px;padding:2px 18px 15px 114px}
 .fsum{font-size:14px;color:var(--mut);line-height:1.55;margin-bottom:9px}
@@ -2690,8 +3655,11 @@ border-radius:12px;padding:14px 18px;margin:.4em 0 1.1em}
 .refresh{color:var(--acc)!important;font-weight:500}
 .navtop{font-weight:500;margin:2px 0 6px;padding-left:10px}
 .thead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.addbar{display:flex;gap:8px;margin:.2em 0 .4em}
-.addbar input{flex:1;max-width:280px;height:36px;padding:0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--fg);font-size:14px;font-family:inherit}
+.addbar{display:flex;gap:8px;margin:.2em 0 .4em;min-width:0;max-width:100%}
+/* /research carries the Add form in its header: at 320px it pushed the page 22px sideways
+   (form right edge at 342px). The header row, its actions and the form may all shrink. */
+.pagehead>*,.headactions,.headactions>form{min-width:0}.headactions{flex-wrap:wrap}
+.addbar input{flex:1 1 0;width:100%;min-width:0;max-width:280px;height:36px;padding:0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--fg);font-size:14px;font-family:inherit}
 .addbar input:focus{outline:none;border-color:var(--acc)}
 .pfsum{display:flex;gap:22px;flex-wrap:wrap;margin:.2em 0 .2em}.pfsum:empty{display:none}
 .pfstat .pfk{font-size:12px;color:var(--mut)}.pfstat .pfv{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -2732,6 +3700,7 @@ body{flex-direction:column}
 main{padding:16px 16px 60px;max-width:100%}
 .pagehead h1{font-size:28px}
 .stat.wide{grid-column:span 1}.fitem.open .fbody{padding-left:18px}
+.fhead{flex-wrap:wrap;row-gap:4px}
 .kpirow{grid-template-columns:repeat(2,1fr);gap:10px}
 .kpi{padding:14px 16px;border-radius:14px}.kk{font-size:11.5px;margin-bottom:6px}
 .kv{font-size:21px}.kpi.hero{grid-column:span 2}.kpi.hero .kv{font-size:32px}
@@ -2740,6 +3709,17 @@ main{padding:16px 16px 60px;max-width:100%}
 .whead{padding:14px 16px}.wtitle{font-size:15px}.wbody.pad{padding:14px 14px}
 .widget{border-radius:14px}.chips{gap:5px}
 .headactions{width:100%}.headactions .btn,.headactions .connectbtn{flex:1;justify-content:center}}
+/* phone leftovers from the 2026-09-22 audit: 44px taps, 16px inputs (iOS zooms on anything
+   smaller and stays zoomed), a drawer whose scroll never carries through to the page, and KPI
+   tiles that shrink instead of pushing / 1px wider than a 320px screen */
+/* (body-prefixed: the base rules for these sit further down the sheet and would win a tie) */
+@media(max-width:820px){
+body .btn,body .wbtn,body .rbtn2,body .connectbtn,body .rbtn,body .rfr{min-height:44px}body .rbtn{padding:0 12px}
+body .fbform textarea,body .fbform input,body .jtk,body .jform select,body .jform .jnum,body .jform textarea,
+body .jform input,body .jform #jd-source{font-size:16px}
+body .jtk,body .jform select,body .jform .jnum,body .jform #jd-source{height:44px}
+.side{overscroll-behavior:contain}
+.kpirow{grid-template-columns:repeat(2,minmax(0,1fr))}.kpirow>*{min-width:0}.kv{overflow-wrap:anywhere}}
 /* ---- key stats grid ---- */
 .statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(178px,100%),1fr));gap:1px;background:var(--line);
 border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:0 0 22px}
@@ -2917,7 +3897,7 @@ function renderMarketHead(el,d){
  var h='<span class=mtk>'+el.dataset.ticker+'</span><span class=mprice>$'+d.price.toFixed(2)+'</span>';
  h+='<span class="mchg '+(up?'up':'down')+'">'+(up?'▲':'▼')+' '+Math.abs(chg).toFixed(2)+' ('+Math.abs(pct).toFixed(1)+'%)</span>';
  if(d.cap)meta.push('Mkt cap '+fmtCap(d.cap));if(d.ylo&&d.yhi)meta.push('52wk $'+d.ylo.toFixed(2)+'–$'+d.yhi.toFixed(2));
- meta.push('as of '+new Date().toLocaleTimeString());
+ meta.push('as of '+new Date(d.at?d.at*1000:Date.now()).toLocaleTimeString());   /* the price's own time (d.at, the server's fetch) */
  el.innerHTML=h+'<span class=mmeta>'+meta.join(' · ')+'</span>';}
 function drawSpark(el,vals){
  if(!vals||vals.length<2)return;var w=104,h=30,mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals),rng=(mx-mn)||1;
@@ -2940,33 +3920,64 @@ function batchQuotes(tks,cb){
  if(!tks.length){cb({});return;}
  fetch('/api/quotes?tickers='+encodeURIComponent(tks.join(','))).then(function(r){return r.json()})
   .then(function(d){cb(d||{})}).catch(function(){cb({})});}
-function fillPositions(){
+/* Sidebar Holdings (2026-09-22): today's $ on OUR position and the % move, per row and per book.
+   The server renders each row with its last known value; the live numbers ride the page's one
+   quote batch below — on a page render for rows that are new, and on the live tick (liveTick,
+   every MKT.owned_s in market hours) for all of them. */
+var _holdAt=0;
+function holdDay(sh,d){ /* shares × (price − prev close): the same arithmetic as app.day_change() */
+ sh=parseFloat(sh)||0;if(!d||!d.price||!d.prev||!sh)return null;
+ return {usd:sh*(d.price-d.prev),pct:(d.price-d.prev)/d.prev*100,value:sh*d.price};}
+function fillHoldings(hold,quotes){
+ hold.forEach(function(el){el.dataset.done='1';var x=holdDay(el.dataset.sh,quotes[el.dataset.q]);
+  if(!x)return;   /* no quote: the server-rendered last known value stays — never a blank row */
+  var up=x.usd>=0,c=up?' up':' down',v=el.querySelector('.hv'),hd=el.querySelector('.hd'),hp=el.querySelector('.hp');
+  el.dataset.usd=x.usd.toFixed(2);
+  if(v)v.textContent=money(x.value);
+  if(hd){hd.textContent=signed(x.usd);hd.className='hd'+c;}
+  if(hp){var ap=Math.abs(x.pct);hp.textContent=(up?'+':'−')+ap.toFixed(ap>0&&ap<0.1?2:1)+'%';hp.className='hp'+c;}});
+ document.querySelectorAll('[data-hday]').forEach(function(h){var t=0,n=0;
+  document.querySelectorAll('.hrow[data-book="'+h.dataset.hday+'"][data-usd]').forEach(function(r){t+=parseFloat(r.dataset.usd)||0;n++;});
+  if(n){h.textContent=signed(t);h.className='hday '+(t>=0?'up':'down');}});}
+/* tier: none = a page render (every quote on the page; Holdings rows that are new, or all of them
+   once older than the owned beat while the market is open); 'owned' = the live tick for what we
+   own — Holdings, the Book's held rows, an owned name's header and stats — and nothing else;
+   'all' = the slower live tick, every quote on screen. */
+function fillPositions(tier){
+ var own=tier==='owned'?function(tk){return HELD.indexOf(tk)>=0;}:null;
  var ac=document.getElementById('acct');
  var cash=ac?parseFloat(ac.dataset.cash)||0:0,mmf=ac?parseFloat(ac.dataset.mmf)||0:0;
  var rows=Array.prototype.slice.call(document.querySelectorAll('.posrow[data-tk]'));
- var side=Array.prototype.slice.call(document.querySelectorAll('[data-sidechg]:not([data-done])'));
+ if(own)rows=rows.filter(function(r){return parseFloat(r.dataset.shares)>0;});
  var mkt=Array.prototype.slice.call(document.querySelectorAll('.mbody[data-ticker]'));
+ var stg=tier?Array.prototype.slice.call(document.querySelectorAll('.statgrid[data-stats]')):[];   /* a render has loadStats() */
+ if(own){mkt=mkt.filter(function(e){return own(e.dataset.ticker)});stg=stg.filter(function(e){return own(e.dataset.stats)});}
+ var all=tier||(MKT.open&&Date.now()-_holdAt>MKT.owned_s*1000);
+ var hold=Array.prototype.slice.call(document.querySelectorAll(all?'.hrow[data-q]':'.hrow[data-q]:not([data-done])'));
  /* a book with no public rows yet (DIP Venture, all cash) still has an account to total and an allocation to draw */
- if(ac&&!rows.length)computeAccount([],{},cash,mmf);
- if(!rows.length&&!side.length&&!mkt.length)return;
+ if(ac&&!rows.length&&!tier)computeAccount([],{},cash,mmf);
+ if(!rows.length&&!mkt.length&&!hold.length&&!stg.length)return;
+ if(hold.length)_holdAt=Date.now();
  var tks=rows.map(function(r){return r.dataset.tk})
-   .concat(side.map(function(e){return e.dataset.sidechg}))
-   .concat(mkt.map(function(e){return e.dataset.ticker}));
+   .concat(mkt.map(function(e){return e.dataset.ticker}))
+   .concat(stg.map(function(e){return e.dataset.stats}))
+   .concat(hold.map(function(e){return e.dataset.q}));
  batchQuotes(tks,function(quotes){
+  if(hold.length)fillHoldings(hold,quotes);
   rows.forEach(function(row){
    var d=quotes[row.dataset.tk],p=row.querySelector('.price'),c=row.querySelector('.chg');
    if(d&&d.price){if(p)p.textContent='$'+d.price.toFixed(2);
     if(c){var chg=d.prev?(d.price-d.prev):0,pct=d.prev?chg/d.prev*100:0,up=chg>=0;c.textContent=(up?'+':'')+pct.toFixed(1)+'%';c.className='num chg '+(up?'up':'down');}
    }else if(p)p.textContent='—';
   });
-  side.forEach(function(el){el.dataset.done='1';var d=quotes[el.dataset.sidechg];
-   if(d&&d.price&&d.prev){var pct=(d.price-d.prev)/d.prev*100,up=pct>=0;
-    el.textContent=(up?'+':'')+pct.toFixed(1)+'%';el.className='lchg '+(up?'up':'down');}});
   mkt.forEach(function(el){renderMarketHead(el,quotes[el.dataset.ticker])});
-  if(rows.length)computeAccount(rows,quotes,cash,mmf);
+  stg.forEach(function(g){renderStats(g,quotes[g.dataset.stats])});
+  if(rows.length)computeAccount(rows,quotes,cash,mmf,tier==='owned');
  });
 }
-function computeAccount(rows,quotes,cash,mmf){
+/* quiet: the owned tick re-totals the Book without redrawing the allocation doughnut (and
+   re-fetching /api/external) every few seconds — the slower tick and a page render draw it */
+function computeAccount(rows,quotes,cash,mmf,quiet){
  var ac=document.getElementById('acct'),note=ac?parseFloat(ac.dataset.note)||0:0,priv=ac?parseFloat(ac.dataset.private)||0:0;
  var stocks=0,dayp=0,pnl=0,cost=0;
  rows.forEach(function(row){var sh=parseFloat(row.dataset.shares)||0,d=quotes[row.dataset.tk];
@@ -2989,7 +4000,7 @@ function computeAccount(rows,quotes,cash,mmf){
  var s=document.getElementById('ac-stocks');if(s)s.textContent=money(stocks);
  var t=document.getElementById('ac-total');if(t)t.textContent=money(acctVal);
  _acctVal=acctVal;_privVal=priv;updateLifetime();
- renderAlloc(stocks,cash,mmf,note);
+ if(!quiet)renderAlloc(stocks,cash,mmf,note);
 }
 var _netdep=null,_lifesince='',_acctVal=null,_privVal=0;
 function updateLifetime(){
@@ -3027,18 +4038,19 @@ function readBook(){var b=document.getElementById('bookctx');BOOK=b?(b.dataset.b
 (function(){var _f=window.fetch;window.fetch=function(u,o){
  if(typeof u==='string'&&u.indexOf('/api/')===0&&BOOK!=='brokera'&&u.indexOf('book=')<0)u+=(u.indexOf('?')>=0?'&':'?')+'book='+encodeURIComponent(BOOK);
  return _f.call(window,u,o);};})();
-function syncBrokerage(){toast('Syncing '+(BOOK==='brokera'?'J.P. Morgan':BOOK.toUpperCase())+'…');post('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
- if(d.ok){var got=(d.books&&d.books[BOOK])||d.synced;toast(d.warn?('⚠ '+d.warn):((got&&got.length)?('Synced '+got.join(', ')):(d.msg||'Synced')));nav(BOOK_HOME,false);}else{toast(d.msg||'sync failed');}}).catch(function(){toast('sync error');});}
-/* auto-sync: when the dashboard is opened and the brokerage snapshot is >15 min old,
-   sync once per tab in the background and refresh the numbers when done */
+function syncBrokerage(){toast('Syncing '+(BOOK==='brokera'?'the Personal book':BOOK.toUpperCase())+'…');post('/api/aggregatora/sync?force=1').then(function(r){return r.json()}).then(function(d){
+ if(d.ok){var got=(d.books&&d.books[BOOK])||d.synced;toast(d.warn?('⚠ '+d.warn):((got&&got.length)?('Synced '+got.join(', ')):(d.msg||'Synced')));nav(BOOK_HOME,false);refreshSide();}else{toast(d.msg||'sync failed');}}).catch(function(){toast('sync error');});}
+/* auto-sync: when the dashboard is opened, sync once per tab in the background and refresh the
+   numbers when done — in market hours if the brokerage snapshot is older than MKT.sync_s; after
+   the close only if it predates the close (the live-data rule; st_sync() holds the same line) */
 function autoSync(){
  if(typeof SYNCED==='undefined')return;
- if(Date.now()/1000-(SYNCED||0)<900)return;
+ if(MKT.open?Date.now()/1000-(SYNCED||0)<MKT.sync_s:(SYNCED||0)>=MKT.close)return;
  if(sessionStorage.getItem('autosynced'))return;
  sessionStorage.setItem('autosynced','1');
  var n=document.getElementById('syncnote');if(n)n.textContent='· syncing now…';
  post('/api/aggregatora/sync').then(function(r){return r.json()}).then(function(d){
-  if(d.ok&&!d.skipped){SYNCED=Date.now()/1000;toast('Brokerage synced');
+  if(d.ok&&!d.skipped){SYNCED=Date.now()/1000;toast('Brokerage synced');refreshSide();
    if(location.pathname==='/')nav('/',false);}
   else if(n)n.textContent='';
  }).catch(function(){if(n)n.textContent='';});}
@@ -3053,39 +4065,48 @@ function toast(msg){var t=document.createElement('div');t.className='toast';t.te
    once per full page load and never again. Every mutation therefore needed its own
    hand-written DOM surgery — remove and archive had some, add had none, and anything
    nobody wrote surgery for went silently stale until F5. One refresh path instead. */
+/* resolves true once the sidebar is re-rendered, false if it was not (the live tick reads the
+   market state off it only on true) */
 function refreshSide(){
- var side=document.querySelector('.side');if(!side)return Promise.resolve();
- return fetch('/api/sidebar').then(function(r){return r.text()}).then(function(h){
+ var side=document.querySelector('.side');if(!side)return Promise.resolve(false);
+ return fetch('/api/sidebar').then(function(r){if(!r.ok)throw r.status;return r.text()}).then(function(h){
   side.innerHTML=h;
   initSearch();                                   /* the search box was inside it */
   setActive(decodeURIComponent(location.pathname)+location.search);
-  fillPositions();                                /* re-fills the new % chips */
- }).catch(function(){});}
-function addWatch(tk,cb){fetch('/api/watchlist?action=add&ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
+  var hs=document.querySelector('[data-held]');   /* what we own now: a name bought since load joins the owned tick */
+  if(hs){try{HELD=JSON.parse(hs.dataset.held);}catch(_){}}
+  fillPositions();                                /* the new Holdings rows join one quote batch */
+  return true;
+ }).catch(function(){return false;});}
+/* The watchlist and the research tree left the sidebar for /research (2026-09-22), so a watch or
+   archive no longer re-renders the sidebar — the page that asked re-renders itself instead. */
+function addWatch(tk,cb){postJson('/api/watchlist',{action:'add',ticker:tk}).then(function(r){return r.json()}).then(function(d){
  if(WATCH.indexOf(tk)<0)WATCH.push(tk);
  document.querySelectorAll('.addbtn[data-wtk="'+tk+'"]').forEach(function(b){b.outerHTML='<span class="addbtn done">✓</span>';});
- toast(tk+' added to watchlist');refreshSide();if(cb)cb(d);});}
+ toast(tk+' added to watchlist');if(cb)cb(d);});}
 function boardAdd(e,tk){e.stopPropagation();e.preventDefault();addWatch(tk);}
-function removeWatch(e,tk){if(e){e.stopPropagation();e.preventDefault();}
- fetch('/api/watchlist?action=remove&ticker='+encodeURIComponent(tk)).then(function(){
+function removeWatch(e,tk,cb){if(e){e.stopPropagation();e.preventDefault();}
+ postJson('/api/watchlist',{action:'remove',ticker:tk}).then(function(){
   var i=WATCH.indexOf(tk);if(i>=0)WATCH.splice(i,1);
   if(e&&e.target){var tr=e.target.closest('tr');if(tr)tr.remove();}
   document.querySelectorAll('.pcard[data-tk="'+tk+'"]').forEach(function(x){x.remove();});
-  refreshSide();  /* was: hand-remove .tkleaf — the tree re-renders itself now */
-  toast(tk+' removed from watchlist');});}
-function archiveResearch(e,tk){e.stopPropagation();
+  toast(tk+' removed from watchlist');if(cb)cb();});}
+function here(){return location.pathname+location.search;}
+function rsWatch(e,tk){e.stopPropagation();e.preventDefault();addWatch(tk,function(){nav(here(),false);});}
+function rsUnwatch(e,tk){e.stopPropagation();e.preventDefault();removeWatch(null,tk,function(){nav(here(),false);});}
+function archiveResearch(e,tk){e.stopPropagation();e.preventDefault();
  if(!confirm('Archive the '+tk+' research folder? It moves to _archive/ (reversible by moving it back).'))return;
  post('/api/research/archive?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
-  toast(d.msg||'done');if(d.ok){refreshSide();nav('/ticker/'+tk,false);}
+  toast(d.msg||'done');if(d.ok)nav(location.pathname.indexOf('/research')===0?here():'/ticker/'+tk,false);
  }).catch(function(){toast('error');});}
 function fbSend(e){e.preventDefault();var t=document.getElementById('fbmsg'),v=t.value.trim();if(!v)return false;
  fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:v})})
   .then(function(){toast('Saved — every future digest will honor it');nav('/recommendation',false);}).catch(function(){toast('error');});
  return false;}
-function fbDel(id){fetch('/api/feedback?action=remove&id='+id).then(function(){toast('Note withdrawn');nav('/recommendation',false);});}
+function fbDel(id){postJson('/api/feedback',{action:'remove',id:id}).then(function(){toast('Note withdrawn');nav('/recommendation',false);});}
 function toggleWatch(e,tk){e.stopPropagation();var b=e.target,on=b.classList.contains('on'),act=on?'remove':'add';
- fetch('/api/watchlist?action='+act+'&ticker='+encodeURIComponent(tk)).then(function(){b.classList.toggle('on');b.textContent=on?'+ Watchlist':'✓ Watching';toast(tk+(on?' removed':' added'));});}
-function doAdd(e){e.preventDefault();var v=document.getElementById('addtk').value.trim().toUpperCase();if(v)addWatch(v,function(){nav('/',false);});return false;}
+ postJson('/api/watchlist',{action:act,ticker:tk}).then(function(){b.classList.toggle('on');b.textContent=on?'+ Watchlist':'✓ Watching';toast(tk+(on?' removed':' added'));});}
+function doAdd(e){e.preventDefault();var v=document.getElementById('addtk').value.trim().toUpperCase();if(v)addWatch(v,function(){nav(here(),false);});return false;}
 var _digest=null;
 function digestRank(it){return it.earn?0:it.mat?1:it.kind==='filing'?2:3;}
 function renderDigest(){var el=document.getElementById('digest');if(!el||!_digest)return;
@@ -3434,7 +4455,8 @@ function genResearch(e,tk){e.stopPropagation();toast('Launching research on '+tk
  post('/api/research?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){toast(d.msg||'started');
   var box=document.getElementById('research-status');if(box){box.style.display='';box.className='rstatus';box.innerHTML='<span class=spin></span> Researching '+esc(tk)+'…  <span class=rmsg>starting</span>';pollResearch(tk,box);}}).catch(function(){toast('error');});}
 function loadStats(){var g=document.querySelector('.statgrid[data-stats]');if(!g)return;
- fetch('/api/quote?ticker='+encodeURIComponent(g.dataset.stats)).then(function(r){return r.json()}).then(function(d){
+ fetch('/api/quote?ticker='+encodeURIComponent(g.dataset.stats)).then(function(r){return r.json()}).then(function(d){renderStats(g,d);}).catch(function(){});}
+function renderStats(g,d){
   if(!d)return;
   function set(id,v,cls){var e=document.getElementById(id);if(e){e.textContent=v;if(cls)e.className='stv '+cls;}}
   if(d.prev)set('st-prev','$'+d.prev.toFixed(2));
@@ -3450,8 +4472,7 @@ function loadStats(){var g=document.querySelector('.statgrid[data-stats]');if(!g
   if(d.price)document.querySelectorAll('.pld[data-lvl]').forEach(function(el){
    var lvl=parseFloat(el.dataset.lvl),pct=(lvl-d.price)/d.price*100;
    el.textContent=(pct>=0?'+':'')+pct.toFixed(1)+'% away (now '+fmtPrice(d.price)+')';
-   el.className='pld'+(Math.abs(pct)<2.5?' near':'');});
- }).catch(function(){});}
+   el.className='pld'+(Math.abs(pct)<2.5?' near':'');});}
 function daysAway(iso,today){var a=Date.parse(iso+'T00:00:00Z'),b=Date.parse(today+'T00:00:00Z');
  if(!isFinite(a)||!isFinite(b))return'';var n=Math.round((a-b)/86400000);
  return n<=0?'today':n===1?'tomorrow':n<45?('in '+n+'d'):n<730?('in '+Math.round(n/30.4)+' mo'):('in '+(n/365).toFixed(1)+' yr');}
@@ -3476,7 +4497,7 @@ function jnAdd(e){e.preventDefault();var m=document.getElementById('jn-msg').val
  fetch('/api/journal/notes',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({msg:m,tk:document.getElementById('jn-tk').value})})
   .then(function(){toast('Noted');nav('/journal',false);}).catch(function(){toast('error');});return false;}
-function jnDel(id){fetch('/api/journal/notes?action=remove&id='+id).then(function(){nav('/journal',false);});}
+function jnDel(id){postJson('/api/journal/notes',{action:'remove',id:id}).then(function(){nav('/journal',false);});}
 function jdAdd(e){e.preventDefault();
  var g=function(i){var el=document.getElementById(i);return el?el.value.trim():''};
  if(!g('jd-thesis')){toast('Thesis is required — that is the point');return false;}
@@ -3570,6 +4591,7 @@ function enhance(){fmtTables();loadStats();loadSparks();fillPositions();loadLife
    stale cash line, which is worse than 4ms. */
 var _pre={};
 function prefetch(route){
+ route=(route||'').split('#')[0];
  if(!route||_pre[route])return;
  /* the seg bar lives inside #main, so after a nav the cursor is sitting on the
     destination's own (now active) seg — without this it prefetches the page we are
@@ -3583,7 +4605,16 @@ document.addEventListener('pointerover',function(e){
  var el=e.target.closest('.pfseg[data-route],.leaf[data-route]');if(el)prefetch(el.dataset.route);});
 document.addEventListener('pointerdown',function(e){
  var el=e.target.closest('[data-route]');if(el)prefetch(el.dataset.route);});
+/* A deep link (/dip/options#ctek) lands ON its item: the #fragment comes off before ?partial=1
+   is added (fetch drops a fragment, so '/dip/options#ctek?partial=1' fetched the FULL page into
+   #main), rides the pushed URL, and after the swap the target is opened (a <details> fold) and
+   scrolled to instead of the top. */
+function goHash(hash){if(!hash||hash.length<2)return false;var id=decodeURIComponent(hash.slice(1));
+ if(document.querySelector('.tab[data-tab="'+id.replace(/"/g,'')+'"]'))return false;  /* a tab: restoreTab() owns it */
+ var el=document.getElementById(id);if(!el)return false;if(el.tagName==='DETAILS')el.open=true;
+ var d=el.closest&&el.closest('details');if(d)d.open=true;el.scrollIntoView({block:'start'});return true;}
 function nav(route,push){
+ var hi=route.indexOf('#'),hash=hi>=0?route.slice(hi):'';if(hi>=0)route=route.slice(0,hi);
  var url=route+(route.indexOf('?')>=0?'&':'?')+'partial=1';
  function live(){return fetch(url).then(function(r){
    return {ver:r.headers.get('X-App-Ver'),text:r.text()}});}
@@ -3598,8 +4629,9 @@ function nav(route,push){
   /* a page module's own <script data-run> (charts on /dip/industries, 2026-09-20): innerHTML never executes scripts, so re-create them */
   m.querySelectorAll('script[data-run]').forEach(function(s){var n=document.createElement('script');n.textContent=s.textContent;s.parentNode.replaceChild(n,s);});
   readBook();setActive(route);
-  if(push)history.pushState({route:route},'',route);
+  if(push)history.pushState({route:route+hash},'',route+hash);
   var nv=document.getElementById('nav');if(nv)nv.checked=false;window.scrollTo(0,0);setTitle();enhance();
+  if(hash)goHash(hash);
  });
 }
 /* ---- stale-tab self-heal (2026-08-31): nav() only version-checks on CLICK, so a tab
@@ -3612,6 +4644,45 @@ function checkVer(){var now=Date.now();if(now-_verChk<15000)return;_verChk=now;
   if(v&&typeof APPV!=='undefined'&&v!==APPV)location.reload();}).catch(function(){});}
 window.addEventListener('focus',checkVer);
 document.addEventListener('visibilitychange',function(){if(!document.hidden)checkVer();});
+/* ---- live data (2026-09-23; David: "for stocks i own ofcourse as real time as possible, but other
+   stuff ... every 5 min during market hours and off-market don't need to reload anything").
+   MKT is the server's market() plus the LIVE cadences — in the boot script, and as data-mkt on the
+   Holdings list, which refreshSide() re-renders. Market open: what we own re-quotes every
+   MKT.owned_s, everything on screen every MKT.other_s. At the bell the ticks stop; one last pass
+   runs after the server's post-close pass (MKT.pending until then); then nothing until the next
+   open, whose first tick refreshes everything. Only while the page is visible: a hidden tab runs
+   no timer at all, and on its return whatever fell due runs once. In words: INTERACTIVITY.md,
+   "Live data: what refreshes when". */
+var _mktAt=Date.now(),_ownAt=Date.now(),_othAt=Date.now(),_liveTo=null,
+ _mktRaw=(function(){var el=document.querySelector('[data-mkt]');return el?el.dataset.mkt:null;})();
+/* only a data-mkt this page has not read yet is news: a sidebar the re-render failed to replace
+   still carries the page-load state, and reading that at the bell kept MKT.open true all night */
+function readMkt(){var el=document.querySelector('[data-mkt]'),raw=el&&el.dataset.mkt,m=null;
+ if(!raw||raw===_mktRaw)return false;
+ try{m=JSON.parse(raw);}catch(_){return false;}
+ _mktRaw=raw;MKT=m;_mktAt=Date.now();return true;}
+function liveRun(tier){var now=Date.now();_ownAt=now;if(tier==='all'){_othAt=now;loadPerf();}fillPositions(tier);}
+function liveDue(){var due=_mktAt+MKT.next_s*1000;
+ if(MKT.open)due=Math.min(due,_ownAt+MKT.owned_s*1000,_othAt+MKT.other_s*1000);
+ return due-Date.now();}
+function liveArm(){clearTimeout(_liveTo);_liveTo=null;
+ if(document.visibilityState!=='visible')return;
+ _liveTo=setTimeout(liveTick,Math.min(Math.max(liveDue(),1000),2147483000));}
+function liveTick(){_liveTo=null;
+ if(document.visibilityState!=='visible')return;
+ var now=Date.now();
+ if(now>=_mktAt+MKT.next_s*1000){   /* the bell, the settled close, or the open: re-read the state */
+  refreshSide().then(function(ok){
+   if(!ok||!readMkt()){           /* the re-render failed: ask again in a minute — and an open market's */
+    if(MKT.open){MKT.open=false;MKT.pending=true;}   /* timer fell due at the bell, so its ticks stop */
+    _mktAt=Date.now();MKT.next_s=60;}
+   else if(!MKT.pending)liveRun('all');                /* the close's final pass, or the open's first */
+   liveArm();});
+  return;}
+ if(MKT.open)liveRun(now-_othAt>=MKT.other_s*1000-500?'all':'owned');
+ liveArm();}
+document.addEventListener('visibilitychange',function(){
+ if(document.visibilityState==='visible')liveArm();else{clearTimeout(_liveTo);_liveTo=null;}});
 /* ---- search typeahead ---- */
 var _sr=[],_si=-1,_sq=null,_searchGlobals=0;
 function srender(){var box=document.getElementById('sresults');if(!box)return;
@@ -3672,36 +4743,39 @@ document.addEventListener('click',function(e){
 document.addEventListener('click',function(e){var fh=e.target.closest('.fhead');if(fh)fh.parentNode.classList.toggle('open');});
 window.addEventListener('popstate',function(e){var r=(e.state&&e.state.route)||(location.pathname+location.search);
  nav(r.replace('&partial=1','').replace('?partial=1',''),false);});
-/* exactly ONE sidebar element is highlighted for the current page; ancestors get
-   a subtle 'hasactive' marker (bold, not blue). Priority per route type:
-   doc -> its leaf (else the company name that links to it)
-   ticker -> watchlist row, else research 'live ticker' sub-link, else company name
-   top-level -> its nav item */
+/* Exactly ONE nav item is lit for the current page (2026-09-22 redesign). navKey() is the
+   route → item table, the same as app.nav_key() (tests/test_dashboard_nav.py runs both over
+   every route): the Personal book owns /, its segs and the tickers it holds; DIP owns /dip*; the
+   agent /agent*, its documents and the tickers only it holds (OWN, from ticker_owners()); a
+   ticker no book holds, and /research*, dossiers, boards and system docs, are Research's;
+   Learn /learn*, /primer and /lookups. On a ticker page the matching Holdings row is marked too. */
+function navKey(route){
+ var p=route.split('?')[0],q=route.split('?')[1]||'',v;
+ function under(r){return p===r||p.indexOf(r+'/')===0;}
+ if(under('/dip'))return 'dip';
+ if(under('/agent'))return 'agent';
+ if(under('/research')||p.indexOf('/company/')===0)return 'research';
+ if(under('/learn')||p==='/primer'||p==='/lookups')return 'learn';
+ if(p==='/advised')return 'paused';
+ if(p==='/view'){v=(q.match(/(?:^|&)path=([^&#]*)/)||[])[1]||'';
+  try{v=decodeURIComponent(v.replace(/\+/g,' '));}catch(_){}
+  if(v.indexOf('_engine/agent')===0)return 'agent';
+  if(v.indexOf('_engine/recommendations')===0||v.split('/').slice(0,2).indexOf('journal')>=0)return 'personal';
+  return 'research';}
+ if(p.indexOf('/ticker/')===0){var t=p.slice(8).split('/')[0].toUpperCase();
+  return (typeof OWN!=='undefined'&&OWN[t])||'research';}
+ if(p==='/'||p===''||p==='/today'||p==='/recommendation'||p==='/journal'||p==='/brokera')return 'personal';
+ return '';}
 function setActive(route){
  var side=document.querySelector('.side');if(!side)return;
- side.querySelectorAll('.on').forEach(function(x){x.classList.remove('on')});
- side.querySelectorAll('.hasactive').forEach(function(x){x.classList.remove('hasactive')});
- var el=null,m;
- if((m=route.match(/^\/view\?path=(.*)$/))){
-  var p=decodeURIComponent(m[1]);
-  side.querySelectorAll('.leaf[data-path]').forEach(function(l){if(!el&&l.dataset.path===p)el=l;});
-  if(!el)side.querySelectorAll('.coname[data-path]').forEach(function(l){if(!el&&l.dataset.path===p)el=l;});
- }else if((m=route.match(/^\/ticker\/([A-Za-z.\-]+)/))){
-  var tk=m[1].toUpperCase();
-  el=side.querySelector('.tkleaf[data-tk="'+tk+'"]')||side.querySelector('.leaf.subtk[data-tk="'+tk+'"]')
-    ||side.querySelector('.coname[data-tk="'+tk+'"]');
- }else{
-  side.querySelectorAll('.leaf[data-route],.coname[data-route]').forEach(function(l){if(!el&&l.dataset.route===route)el=l;});
-  if(!el&&(route==='/'||route===''))el=side.querySelector('.leaf.navtop[data-home]');
- }
- if(!el)return;
- el.classList.add('on');
- var d=el.closest('details');
- while(d){d.open=true;d.classList.add('hasactive');d=d.parentElement?d.parentElement.closest('details'):null;}
- if(el.scrollIntoView)el.scrollIntoView({block:'nearest'});}
+ var k=navKey(route),m=route.match(/^\/ticker\/([A-Za-z0-9.\-]+)/),tk=m?m[1].toUpperCase():'';
+ side.querySelectorAll('.ni').forEach(function(x){x.classList.toggle('on',!!k&&x.dataset.nav===k);});
+ side.querySelectorAll('.hrow').forEach(function(x){x.classList.toggle('cur',!!tk&&x.dataset.tk===tk);});}
 setActive(decodeURIComponent(location.pathname)+location.search);
-readBook();enhance();
+readBook();enhance();if(location.hash)goHash(location.hash);
+window.addEventListener('hashchange',function(){goHash(location.hash);});   /* an in-page #link opens its fold too */
 autoSync();
+liveArm();
 """
 
 import agent_page  # /agent page + APIs for the BrokerB agentic account (kept in its own module)
@@ -3711,6 +4785,8 @@ strategies_page.register(app, wrap)
 
 import today_page  # /today — same-day read on the companies we own (own module; owns its JS/CSS)
 today_page.register(app, wrap)
+if getattr(today_page, "QUOTE", None) is None:
+    today_page.QUOTE = _quote   # /today reads the warmed quote cache (LIVE), not a second Finnhub loop
 CSS += today_page.CSS
 
 import jpm_page  # /brokera — PM brief + decision desk for the BROKERA book (own module)
@@ -3732,72 +4808,202 @@ import primer_page  # /primer — David's finance primer (terms + desk applicati
 primer_page.register(app, wrap)
 JS += today_page.JS
 
+# /learn — guides built on live numbers from the desk, plus the glossary (/primer) and the library
+# (/lookups) under one Learn bar (2026-09-22). Guarded: if the module is missing or broken the
+# dashboard still starts, and the sidebar's Learn link falls back to the glossary.
+try:
+    import learn_page
+except Exception as _ex:   # noqa: BLE001 — any import failure, not only ImportError, must not stop the app
+    learn_page = None
+    print(f"learn_page not loaded ({type(_ex).__name__}: {_ex}) — /learn is off; Learn links to /primer",
+          file=sys.stderr)
+if learn_page is not None:
+    try:
+        learn_page.register(app, wrap)
+        CSS += learn_page.CSS
+        JS += learn_page.JS
+    except Exception as _ex:   # noqa: BLE001
+        print(f"learn_page.register failed ({type(_ex).__name__}: {_ex}) — /learn is off", file=sys.stderr)
+        learn_page = None
+
 def _fresh(k, ttl):
-    hit = _CACHE.get(k)
-    return bool(hit) and time.time() - hit[0] < ttl
+    return _fresh_hit(k, _CACHE.get(k), ttl)
 
 def _warm_ticker(t):
     """The EDGAR filing list, Finnhub news and next earnings date behind /ticker/<t>
     (2–5s together cold, measured 2026-09-04 03:59Z — David clicking between watchlist
     names late evening, when every 10–30 min TTL had long expired). Paced: only an
-    expired entry is fetched, and each Finnhub call is followed by a pause, because a
-    fan-out over 16 names blew through Finnhub's 60/min cap and pushed every quote onto
-    the Yahoo fallback (measured 2026-09-04 04:17Z)."""
+    expired entry is fetched, a Finnhub call first waits for room under the budget
+    (_fh_wait) and is followed by a pause, because a fan-out over 16 names blew through
+    Finnhub's 60/min cap and pushed every quote onto the Yahoo fallback (measured
+    2026-09-04 04:17Z)."""
     cik = cik_of(t)
-    if cik and not _fresh(f"edgar:{cik}", 600):
+    if cik and not _fresh(f"edgar:{cik}", _ttl(LIVE["news_s"])):
         edgar_filings(cik)
-    if not _fresh(f"news:{t}", 600):
+    if not _fresh(f"news:{t}", _ttl(LIVE["news_s"])) and _fh_wait():
         finnhub_news(t); time.sleep(1.0)
-    if not _fresh(f"earn:{t}", 86400):
+    if not _fresh(f"earn:{t}", _ttl(LIVE["earn_s"])) and _fh_wait():
         next_earnings(t); time.sleep(1.0)
 
 def _warm_yahoo(t):
     """The two yfinance calls a ticker page needs: the company profile (name, sector)
     and the 5y close series. Yahoo answers a burst with 429s and long backoffs, so these
     run one at a time with a pause after each real fetch."""
-    if not _fresh(f"prof:{t}", 3600):
+    if not _fresh(f"prof:{t}", _ttl(LIVE["slow_s"])):
         profile(t); time.sleep(1.5)
-    if not _fresh(f"hist:{t}:5y", 1800):
+    if not _fresh(f"hist:{t}:5y", _ttl(LIVE["chart_s"])):
         _hist_data(t, "5y"); time.sleep(1.5)
 
-def _warm_loop():
-    """Keeps every pane a page open touches hot, so no click pays for a fetch:
-    prices for every tracked name (every 100s in US market hours, every 10 min outside
-    — the 120s TTL otherwise leaves the whole row cold by evening), the per-ticker
-    filings/news/earnings/history behind /ticker/<t>, the digest and the 1y perf table on
-    their own TTLs. Each cached() call returns at once while fresh, so a tick costs
-    nothing until something expires. Steady state ≈ 9 Finnhub calls/min in market hours,
-    ~4/min outside, against the 60/min cap."""
-    tick = 0
+def _warm_perf():
+    cached("perf", _ttl(LIVE["other_s"]), _perf_data)   # 1y yfinance batch, ~5s cold (14s on the slow link)
+
+# ---------- the warmers: the LIVE policy, run (2026-09-23) ----------
+# Two threads. The PRICE warmer wakes every tick_s and fetches only what _quotes_due() names and
+# the budget affords, so the owned names keep their beat whatever else is loading; the PANE warmer
+# (perf, filings, news, the digest, profiles, charts, broker activity) walks slower, paced for
+# Finnhub and Yahoo. Both ask market(): in market hours they keep the LIVE cadences; after the
+# close each runs exactly one pass once the closing prints settle, then finds nothing due until
+# the next open.
+
+def _quote_due(tk, m, owned):
+    """Whether the price warmer owes `tk` a fetch now (m = market()):
+      market hours  owned once owned_every() has passed (to the nearest tick), anything else once
+                    other_s − other_lead_s has
+      off-market    only while its price predates the settle point: the one post-close pass (or,
+                    after a start off-market, the boot pass) — then nothing until the open
+    A name Finnhub refused, or nothing priced, waits out its backoff first (_quote_backoff)."""
+    if m["now"] < _QRETRY.get(tk, 0):
+        return False
+    c = _QCACHE.get(tk)
+    ts = c[0] if c else 0.0
+    if m["open"]:
+        every = owned_every() if tk in owned else LIVE["other_s"] - LIVE["other_lead_s"]
+        return m["now"] - ts >= every - LIVE["tick_s"] / 2
+    return bool(m["settled"]) and ts < m["settled"]
+
+def _quotes_due(now=None):
+    """Every tracked name the price warmer owes a fetch now, owned first."""
+    m = market(now)
+    owned, tracked = _sets()
+    return [tk for tk in sorted(owned) + sorted(tracked - owned) if _quote_due(tk, m, owned)]
+
+def _quotes_affordable(due, owned, m=None, pool=()):
+    """(take, renew): the due names this tick pays for, and the names whose cap/52-week range it
+    renews. Owned names always go — in market hours their re-quotes are the reservation fh_room()
+    holds back; off-market they are charged like anything else. The rest take what is left, in
+    order: one call per quote, then two per renewal that is due — the names priced this tick
+    first, then (market hours only) any other name in `pool`, owned first. Renewals come last and
+    leave the pane warmer its news share (one call per name per news_s): a range is good for hours,
+    the news is not. A quote that does not fit waits for a later tick; a renewal that does not fit
+    keeps the old range on the page — rather than a thread that sleeps while the owned names miss
+    their beat."""
+    m = m or market()
+    room = fh_room(m)
+    take = []
+    for tk in due:
+        if tk in owned:
+            take.append(tk)
+            room -= 0 if m["open"] else 1
+        elif room >= 1:
+            take.append(tk)
+            room -= 1
+    renew = set()
+    keep = math.ceil(len(pool) * 60 / LIVE["news_s"]) if m["open"] else 0
+    for tk in take + ([t for t in pool if t not in take] if m["open"] else []):
+        if room < 2 + keep:
+            break
+        if _meta_due(tk):
+            renew.add(tk)
+            room -= 2
+    return take, renew
+
+def _warm_quote(t, renew=False):
+    """One name, re-checked under its lock: a page may have just fetched it. `renew`: whether the
+    budget paid for its cap/52-week range this tick (_quote_meta reads it off the thread)."""
+    _WARMING.renew = renew
+    with _cache_lock(f"q:{t}"):
+        if _quote_due(t, market(), _sets()[0]):
+            _quote_fetch(t)
+
+def _warm_meta(t):
+    """A cap/52-week renewal on its own, in market hours, for a name whose price is not due this
+    tick: merged into the cached quote, which keeps its own age."""
+    _WARMING.renew = True
+    key = load_key("finnhub")
+    d = _quote_meta(t, key) if key else {}
+    if d:
+        with _cache_lock(f"q:{t}"):
+            c = _QCACHE.get(t)
+            if c and c[1].get("price"):
+                _QCACHE[t] = (c[0], {**c[1], **d})
+
+def _warm_quotes_pass(now=None):
+    m = market(now)
+    owned, tracked = _sets()
+    take, renew = _quotes_affordable(_quotes_due(now), owned, m, sorted(owned) + sorted(tracked - owned))
+    jobs = [(_warm_quote, t, t in renew) for t in take] + [(_warm_meta, t) for t in renew if t not in take]
+    if jobs:
+        with ThreadPoolExecutor(min(16, len(jobs))) as ex:
+            list(ex.map(lambda j: j[0](*j[1:]), jobs))
+    return take
+
+def _warm_panes_pass():
+    """One pass of the pane warmer: the 1y perf table; per name (owned first) the filings, news and
+    earnings date behind /ticker/<t>; the digest over them; the profile and 5y history; the
+    broker's activity. Each is a cached() read that returns at once while fresh, and off-market
+    _ttl() makes fresh mean "fetched since the post-close pass" — so after that pass a tick costs
+    nothing until the open."""
+    owned, tracked = _sets()
+    tks = sorted(owned) + sorted(tracked - owned)
+    _warm_perf()
+    for t in tks:
+        _warm_ticker(t)
+        _warm_perf()            # a pass can outlast other_s; the table's prices keep their beat
+    cached("digest", _ttl(LIVE["news_s"]), _digest_items)
+    for t in tks:
+        _warm_yahoo(t)
+        _warm_perf()
+    if not _fresh("st_activities:brokera", _ttl(LIVE["activity_s"])):
+        st = _st()
+        if st:
+            _st_activities(st)   # transactions + lots: one AggregatorA fetch per activity_s
+
+def _wlog(msg):
+    print(f"{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ} warm: {msg}", file=sys.stderr, flush=True)
+
+def _warm_quotes():
+    was_open = None
     while True:
         try:
-            nowu = dt.datetime.now(dt.timezone.utc)
-            # coo-065: from asof.market_open (America/New_York), not a hardcoded UTC
-            # window — the old 13:30-20:00Z window was EDT-only and ran an hour early
-            # for the four EST months.
-            sys.path.insert(0, str(ROOT / "_engine" / "agent"))
-            import asof as _asof
-            market = _asof.market_open(nowu)
-            tks = tracked_tickers()
-            if tks and (tick == 0 or market or tick % 6 == 0):
-                with ThreadPoolExecutor(min(16, len(tks))) as ex:
-                    list(ex.map(_quote, tks))
-            cached("digest", 600, _digest_items, stale=True)
-            if tks and tick >= 1:   # not on the boot tick: the quote pass + digest already spend ~55 Finnhub calls
-                for t in tks:
-                    _warm_ticker(t)
-                for t in tks:
-                    _warm_yahoo(t)
-            cached("perf", 900, _perf_data)   # 1y yfinance batch, ~5s cold
-            st = _st()
-            if st:
-                _st_activities(st)   # transactions + lots, one AggregatorA fetch per 10 min
-        except Exception:
-            pass
-        tick += 1
-        time.sleep(100)
+            m = market()
+            due = _warm_quotes_pass()
+            # logged only where the policy turns: an off-market pass (there should be one per
+            # close, plus a retry for any name Finnhub refused) and the first pass of a session
+            if due and not m["open"]:
+                _wlog(f"off-market pass — {len(due)} prices: {', '.join(due[:12])}{' …' if len(due) > 12 else ''}")
+            elif m["open"] and was_open is False:
+                _wlog(f"market open — first pass, {len(due)} prices")
+            was_open = m["open"]
+        except Exception as ex:   # noqa: BLE001 — the warmer must outlive any one bad tick
+            _wlog(f"price warmer: {type(ex).__name__}: {ex}")
+        time.sleep(LIVE["tick_s"])
+
+def _warm_panes():
+    while True:
+        try:
+            _warm_panes_pass()
+        except Exception as ex:   # noqa: BLE001
+            _wlog(f"pane warmer: {type(ex).__name__}: {ex}")
+        time.sleep(LIVE["panes_tick_s"])
+
+def start_warmers():
+    """Both warm threads, once per process (serve.sh runs this file as __main__, which calls it)."""
+    if any(th.name == "warm-quotes" for th in threading.enumerate()):
+        return
+    threading.Thread(target=_warm_quotes, name="warm-quotes", daemon=True).start()
+    threading.Thread(target=_warm_panes, name="warm-panes", daemon=True).start()
 
 if __name__ == "__main__":
     print(f"Stocks dashboard -> http://<host-ip>:{PORT}")
-    threading.Thread(target=_warm_loop, name="warm", daemon=True).start()
+    start_warmers()
     app.run(host="0.0.0.0", port=PORT, debug=False)

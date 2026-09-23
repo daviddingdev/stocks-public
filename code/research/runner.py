@@ -119,12 +119,14 @@ def job_models(role=None):
     """ORDERED model list for a headless session; the launcher tries them in turn.
 
     David 2026-08-04: research and recommendation sessions are always Opus, tracking the
-    most recent release (the `opus` alias). David 2026-09-01: ONLY the PM runs on the best
-    model available (`best` tier = Fable 5.1 today); everything else stays on the best Opus
-    or Sonnet. Tiers live in agent/roster.py CLAUDE_TIERS — one place to edit when a newer
+    most recent release (the `opus` alias). David 2026-09-22: every Claude job runs Opus 5.5
+    (the PM's `best` tier included — Fable 5.1 left it); the effort differs, see job_effort().
+    Tiers live in agent/roster.py CLAUDE_TIERS — one place to edit when a newer
     model lands; a role's tier comes from the ORG CHART (roster `model` field) because
     cost/capability belongs next to purpose and charter. keys.json `claude_model` still
-    overrides everything, globally."""
+    overrides everything, globally. No role = the `opus` tier. Either way the list comes through
+    roster.claude_models(), which drops a pinned id the installed CLI cannot run — launch() uses
+    the first entry and has no fallback, so the first entry must be runnable."""
     try:
         override = json.loads((CONF / "keys.json").read_text()).get("claude_model")
     except Exception:
@@ -135,7 +137,7 @@ def job_models(role=None):
         import sys as _s
         _s.path.insert(0, str(ENGINE / "agent"))
         import roster
-        return roster.claude_models(role) if role else list(roster.CLAUDE_TIERS["opus"])
+        return roster.claude_models(role)     # role None → the default `opus` tier
     except Exception:
         return ["opus"]
 
@@ -145,12 +147,94 @@ def job_model(role=None):
     return job_models(role)[0]
 
 
+def job_effort(role=None):
+    """The CLI --effort for a headless session (David 2026-09-22: the PM at max, every other
+    Claude job at high). From the org chart like the model — roster.claude_effort(); no role =
+    the default, which is what every kind launch() starts runs at. If the org chart cannot be
+    read, a named role gets `max` (never quietly below what the PM was given) and no role `high`."""
+    try:
+        import sys as _s
+        _s.path.insert(0, str(ENGINE / "agent"))
+        import roster
+        return roster.claude_effort(role)
+    except Exception:
+        return "max" if role else "high"
+
+
 _CHILDREN = {}   # pid -> Popen, so this process reaps what it spawned
 
 # Wall-clock cap per kind, ~1.7x claudeq's est_min (research 90/finish 25/update 15) so a
 # hung session dies instead of holding the queue slot — RDI ran 1,585 min against a 90-min
 # estimate and stopped the queue for 12 other jobs across 19h (2026-09-07).
 CAP_MIN = {"research": 150, "finish": 45, "update": 25}
+
+
+# ---------- MCP scope: which sessions see the broker (brokera-1, 2026-09-22) ----------
+# Until this existed every session launch() started inherited the user-scope MCP set, and
+# ~/.claude.json registers brokerb-trading for ~/Stocks: research, both weekly digests, the
+# board, the primer, PE, one-pagers and the industry analyst all held the live agentic-account
+# order tools from 09-12 to 09-22, with only prompt text between a BROKERA-book "BUY" in the digest
+# and an order on the BrokerB account — no pre-trade memo, no safety.py, no gateway intent.
+# Now every session is --strict-mcp-config. The kinds that really READ the broker (transcripts:
+# quotes, historicals, fundamentals, news, preview_scan) get the agent's config with every write
+# tool denied (agent/broker_tools.py — the list loop.py denies too, so the two cannot drift);
+# every other kind gets ops.py's no-server config. The default is NO broker: a new caller, or
+# one that forgets its kind, gets nothing. Contract C36 proves this stays armed.
+# Note "brief" (the daily portfolio brief) is listed and "briefs" (industry_briefs.py) is not.
+BROKER_KINDS = {"research", "finish", "update", "rec", "brief", "board"}
+BROKER_MCP = CONF / "agent_mcp.json"      # brokerb-trading only (loop.MCP_RESTRICT's file)
+NO_MCP = CONF / "ops_mcp.json"            # no servers (ops.py's NO_MCP)
+
+
+def mcp_args(broker):
+    """The MCP flags for a session: broker read access with every write tool denied, or no MCP
+    server at all. Both are --strict-mcp-config, so the user-scope set never loads."""
+    if broker:
+        sys.path.insert(0, str(ENGINE / "agent"))
+        from broker_tools import ALL_WRITE_TOOLS, PREVIEW_TOOLS, disallowed_arg
+        return ["--strict-mcp-config", "--mcp-config", str(BROKER_MCP),
+                "--disallowedTools", disallowed_arg(ALL_WRITE_TOOLS + PREVIEW_TOOLS)]
+    return ["--strict-mcp-config", "--mcp-config", str(NO_MCP)]
+
+
+def _ensure_no_mcp():
+    """ops.py's idiom: the no-server config is gitignored, so recreate it rather than let a
+    missing file kill the session."""
+    if not NO_MCP.exists():
+        NO_MCP.parent.mkdir(parents=True, exist_ok=True)
+        NO_MCP.write_text(json.dumps({"_doc": "ops sessions get NO MCP servers — no broker, "
+                                              "no external tools beyond the box", "mcpServers": {}}, indent=1))
+
+
+def _utc():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _slot_skip(job, kind, msg):
+    """A fixed-time cron job (company cards, industry analyst, PE, industry briefs, primer, board)
+    that did not get the Claude slot. These jobs are invisible to the queue — claudeq cannot keep
+    their start time free — so a teardown that runs to its 150-min cap can hold the slot through
+    their whole wait, and nothing re-files them (09-22: the 04:30Z one-pagers gave up at 05:30:00,
+    five seconds before research:COO released). The proper fix is queue kinds for these jobs in
+    Mission Control's claudeq.py; until then a skip is said out loud, once: a line in the cron log
+    and one push (actionable; lean mode routes it to the evening digest)."""
+    line = f"[runner.py] {_utc()} SKIPPED {job} ({kind or job}): {msg} — it did not run and nothing re-files it"
+    print(line, flush=True)
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import notify
+        try:                                   # a person reads this: ET first, UTC alongside
+            sys.path.insert(0, str(ENGINE / "agent"))
+            import asof
+            when = asof.fmt()
+        except Exception:
+            when = _utc()
+        notify.push(f"Stocks · Claude job skipped: {job}",
+                    f"{when} — {job} did not get the Claude slot ({msg}); it did not run and nothing re-files it",
+                    tier="actionable", kind=None)
+    except Exception:
+        pass
+    return {"ok": False, "msg": msg}
 
 
 def pid_file(log_path):
@@ -174,6 +258,24 @@ def _watchdog(pid, log_path, cap_min):
         pass
 
 
+def _kill_group(p):
+    """TERM the session's whole process group (start_new_session: pgid == pid, so the
+    claude-headless cap watcher goes with it), KILL after 10s, and reap it."""
+    import signal
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except Exception:
+        return
+    try:
+        p.wait(timeout=10)
+    except Exception:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=5)
+        except Exception:
+            pass
+
+
 def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s=0):
     """Spawn ONE headless Claude session. `prompt` may be a string or a CALLABLE — a callable is
     resolved after the slot is acquired, so a queued job picks its work when it starts. ONE AT A TIME (claudeq, David 2026-09-04): a
@@ -181,7 +283,10 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
     wait_s for the Claude slot and then holds it; a caller that does not is being
     dispatched by claudeq.tick(), which already holds the slot for it. Either way a
     detached watcher ticks the queue when the session exits, so the next job starts
-    within seconds instead of at the next cron minute."""
+    within seconds instead of at the next cron minute.
+
+    MCP scope: `kind` in BROKER_KINDS gets broker reads with every write tool denied; anything
+    else — no kind included — gets no MCP server at all (see mcp_args)."""
     ok, msg = auth_check()
     if not ok:
         return {"ok": False, "msg": msg}
@@ -189,7 +294,7 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
         import claudeq
         if not claudeq.wait_free(wait_s):
             h = claudeq._read(claudeq.HOLDER) or {}
-            return {"ok": False, "msg": f"Claude slot busy after {wait_s}s: {h.get('job', '?')} still running"}
+            return _slot_skip(job, kind, f"Claude slot busy after {wait_s}s: {h.get('job', '?')} still running")
     # A job that WAITED for the slot must choose its work now, not when it was filed. Pass a
     # callable and it is resolved here, after the wait. Three one-pager sessions chained on
     # 2026-09-21 each computed their ten names up front, so the second rewrote six the first had
@@ -198,11 +303,27 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
         prompt = prompt()
     if not prompt:
         return {"ok": False, "msg": "nothing to do: the prompt builder returned empty"}
+    # a missing broker config degrades to no broker (the session still runs, on yfinance/EDGAR),
+    # never to the user-scope MCP set
+    broker = kind in BROKER_KINDS and BROKER_MCP.exists()
+    if not broker:
+        _ensure_no_mcp()
+    model = job_model()
+    effort = job_effort()      # every kind here is a non-PM job: `high` (roster.CLAUDE_EFFORT)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = open(log_path, "w")
+    # Truncate, write the header, then hand the child an APPEND descriptor. With plain "w" the
+    # child's descriptor sat at offset 0 without O_APPEND: the watchdog appended its TIMEOUT
+    # marker with >>, and claude -p then flushed its final text from offset 0 over it — no log
+    # anywhere held the marker, so log_error could never report a cap kill (VRRM and COO were
+    # both killed at exactly 150 min on 09-19/22 and read as clean finishes). The header line is
+    # the model and effort the session actually ran on, which nothing recorded before.
+    log_path.write_text(f"[runner.py] {_utc()} model {model} · effort {effort} · "
+                        f"{'broker read-only (writes denied)' if broker else 'no MCP servers'} · "
+                        f"{kind or job or 'session'}\n")
+    log = open(log_path, "a")
     try:
         p = subprocess.Popen([CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
-                              "--model", job_model()],
+                              "--model", model, "--effort", effort] + mcp_args(broker),
                              cwd=str(ROOT), stdout=log, stderr=log,
                              start_new_session=True, env=clean_env())
     except Exception as e:
@@ -215,13 +336,32 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
         pid_file(log_path).write_text(str(p.pid))
     except Exception:
         pass
+    took, why = True, ""
     try:
         import claudeq
         if job:
-            claudeq.take(job, p.pid, kind or job, sub, est_min, log_path)
-        claudeq.watcher(p.pid)
+            took, why = claudeq.take(job, p.pid, kind or job, sub, est_min, log_path)
+        if took:
+            claudeq.watcher(p.pid)
     except Exception:
         pass
+    if not took:
+        # PLUMB-4: wait_free() only SAW a free slot, it did not claim it. Between that and take()
+        # the tick (or another waiter) started its own session, and take() said so. Two sessions
+        # on the one credential is the thing the queue exists to prevent, so ours goes — before
+        # it has done any work — and the skip is reported like a timeout.
+        _kill_group(p)
+        _CHILDREN.pop(p.pid, None)
+        try:
+            pid_file(log_path).unlink()
+        except Exception:
+            pass
+        try:
+            with open(log_path, "a") as fh:
+                fh.write(f"[runner.py] {_utc()} killed at launch: lost the Claude slot ({why})\n")
+        except Exception:
+            pass
+        return _slot_skip(job, kind, f"lost the Claude slot at launch — {why}")
     if kind in CAP_MIN:
         _watchdog(p.pid, log_path, CAP_MIN[kind])
     return {"ok": True, "pid": p.pid, "log": str(log_path)}
@@ -348,7 +488,11 @@ def research_prompt(tk):
         f"named failed gate, nothing else; plus analysis/card.json "
         f"(the one-page thesis card, same schema as OmniAB-OABI/analysis/card.json — thesis sentence, state, "
         f"now/later actions, milestones, ladder, kill triggers; 2-4 items per list). Be honest, argue both "
-        f"sides, and report gaps plainly — this informs David's decision, it is not a pitch."
+        f"sides, and report gaps plainly — this informs David's decision, it is not a pitch. "
+        f"BEFORE YOUR FINAL MESSAGE: stop every background agent still running (a pillar agent left "
+        f"running after the synthesis is written burns the one box-wide Claude slot for nothing — VRRM's "
+        f"ran 43 minutes past the answer on 2026-09-19 until the wall-clock cap killed the session), and "
+        f"name in FINAL-REPORT.md's gaps any agent whose output you did not wait for."
     )
 
 
@@ -506,7 +650,13 @@ def launch_research(tk, now=False, full=False):
     reason = gate_check(tk)
     if reason:
         return {"ok": False, "msg": reason}
-    _record_teardown_filed(tk)
+    # Count a teardown ONCE, when it is filed. The queue dispatches it later as
+    # launch_research(tk, now=True), which used to record it again — every teardown showed twice
+    # against FUNNEL_QUOTA['teardown:filed'] (VRRM 09-18 + 09-19, COO 09-21 + 09-22) and the
+    # second row reset the pending timestamp to the dispatch time. A --now launch that was never
+    # filed still counts once.
+    if not (now and tk in _load_pending_teardowns()):
+        _record_teardown_filed(tk)
     if not full and finish_applicable(tk):
         return launch_finish(tk, now=now)
     if not now:
@@ -717,7 +867,10 @@ def rec_prompt():
         f"digest, register EVERY actionable numbered recommendation from section 3 as a decision row via "
         f"`python3 ~/Stocks/_engine/research/brokera.py propose --source digest --ticker TK --ask '<one sentence>' "
         f"--options 'A (recommended): ... / B: ...' --default '<what happens if David does nothing>' "
-        f"--valid-until YYYY-MM-DD` (match the rec's validity window; do-nothing recs need no row). In section 6, "
+        f"--valid-until YYYY-MM-DD` (match the rec's validity window; do-nothing recs need no row). If a rec "
+        f"re-prices, resizes or replaces a row that is still OPEN for the same ticker, add `--supersedes <old id>` "
+        f"so the old row closes as superseded — never leave David two open asks on one name (09-21: VSNT $36.00 "
+        f"and $35.25 both open). In section 6, "
         f"score prior weeks from `python3 ~/Stocks/_engine/research/brokera.py list` — taken/declined/noted/expired "
         f"are David's ACTUAL calls: engage with a decline's note instead of silently re-recommending, and treat "
         f"an expiry as the default action having stood, not as silence.\n"
@@ -770,7 +923,7 @@ def launch_rec(now=False):
     if not now:
         import claudeq
         return claudeq.enqueue("rec", {}, by="runner")
-    return launch(rec_prompt(), rec_log())
+    return launch(rec_prompt(), rec_log(), kind="rec")      # kind: the digest reads broker quotes
 
 
 # ---------- daily brief: what happened TODAY to the companies we own ----------
@@ -866,7 +1019,7 @@ def launch_brief(force=False, now=False):
     if force and p.exists():
         p.unlink()
     BRIEF_DIR.mkdir(parents=True, exist_ok=True)
-    r = launch(brief_prompt(), lg)
+    r = launch(brief_prompt(), lg, kind="brief")            # kind: the brief reads broker quotes
     if r.get("ok"):
         r["msg"] = "Writing today's brief — Claude is reading the day's events against every thesis (a few minutes)."
     return r
@@ -885,7 +1038,9 @@ def save_token_interactive():
     kf.write_text(json.dumps(keys, indent=2))
     os.chmod(kf, 0o600)
     print("Saved to _engine/config/keys.json. Verifying with a live headless call…")
-    r = subprocess.run([CLAUDE_BIN, "-p", "Reply with exactly: AUTH-OK"],
+    _ensure_no_mcp()
+    r = subprocess.run([CLAUDE_BIN, "-p", "Reply with exactly: AUTH-OK",
+                        "--model", job_model(), "--effort", job_effort()] + mcp_args(False),
                        env=clean_env(), capture_output=True, text=True, timeout=120)
     out = (r.stdout + r.stderr).strip()
     if "AUTH-OK" in out:

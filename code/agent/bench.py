@@ -1244,6 +1244,15 @@ if __name__ == "__main__":
                 sys.exit(f"REFUSED: schema booleans {bools} do not include claim_key "
                          f"{ck!r} — pass --claim-key naming the boolean the gate should read")
         q["claim_key"] = ck
+        # 2026-09-22: channel 11 was set with a new schema while amount_key ('shares_or_pct') and
+        # quote_fields (['holder','shares_or_pct']) kept channel 13's names. Neither is a key of
+        # the channel-11 schema, so no claim could pass the gate and the night read for nothing.
+        # Every gate field must name a key of the schema on file.
+        keys = set(re.findall(r'"(\w+)":', q.get("schema") or ""))
+        stale = [k for k in [q.get("amount_key")] + list(q.get("quote_fields") or []) if k and k not in keys]
+        if stale:
+            sys.exit(f"REFUSED: gate field(s) {stale} are not keys of the schema {sorted(keys)} — "
+                     f"pass --amount-key and --quote-fields naming this question's fields (blank clears)")
         # bench.py: `set_by` was hard-coded "PM" on every write, so the field recorded who the
         # author was ASSUMED to be, not who ran the command — and "set_by PM" then got read back
         # as evidence the PM had chosen this question. It is not evidence. --by names the caller;

@@ -45,15 +45,9 @@ MCP_RESTRICT = ["--strict-mcp-config", "--mcp-config", str(ENGINE / "config" / "
 # the gateway runs in SHADOW (config/exec.json mode=shadow: the PM files an intent, places
 # itself with ref_id=<intent_id>, links the broker id); at cut-over (mode=live) it closes
 # too and execute.py is the only writer. Sync/fallback sessions never hold any write tool.
-_RH = "mcp__brokerb-trading__"
-WRITE_TOOLS_EQUITY = [_RH + t for t in ("place_equity_order", "cancel_equity_order")]
-WRITE_TOOLS_OTHER = [_RH + t for t in (
-    "place_option_order", "review_option_order", "cancel_option_order", "exercise_option",
-    "cancel_option_exercise", "place_crypto_order", "preview_crypto_order", "cancel_crypto_order",
-    "create_alert", "update_alert", "delete_alert", "mark_alerts_read",
-    "create_scan", "update_scan_config", "update_scan_filters",
-    "create_watchlist", "update_watchlist", "add_to_watchlist", "remove_from_watchlist",
-    "add_option_to_watchlist", "remove_option_from_watchlist", "follow_watchlist", "unfollow_watchlist")]
+# The lists themselves live in broker_tools.py (2026-09-22) — one copy for every launcher
+# that attaches the broker, so research/runner.py cannot drift from this one.
+from broker_tools import WRITE_TOOLS_EQUITY, WRITE_TOOLS_OTHER, disallowed_arg  # noqa: E402
 
 
 def gateway_mode():
@@ -69,7 +63,7 @@ def tool_denylist(mode):
     deny = list(WRITE_TOOLS_OTHER)
     if mode != "trade" or gateway_mode() == "live":
         deny += WRITE_TOOLS_EQUITY
-    return ["--disallowedTools", ",".join(deny)]
+    return ["--disallowedTools", disallowed_arg(deny)]
 
 SYNC_PROMPT = f"""READ-ONLY sync of the BrokerB AGENTIC account (the account with agentic=Yes; never any other).
 Do NOT place, modify, or cancel any orders. Using the brokerb-trading MCP tools:
@@ -274,7 +268,6 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
         except Exception:
             pass
     log = open(LOGS / f"agent_{mode}.log", "w")
-    # trade sessions think on Opus (David, 2026-08-04); syncs are mechanical — default model
     if mode == "strategy":
         # no broker: the strategy arc reads the synced portfolio.json and places nothing
         nomcp = ENGINE / "config" / "ops_mcp.json"
@@ -282,12 +275,18 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
     else:
         mcp = MCP_RESTRICT
     cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"] + mcp + tool_denylist(mode)
-    models = runner.job_models("pm")
-    if mode in ("trade", "strategy"):
-        # the org chart's tier for the PM (roster CLAUDE_TIERS["best"]); _launch_guard falls
-        # back to the next entry if the installed CLI cannot run this one. Appended ONCE —
-        # this block emitted `--model` twice for a trade session until 2026-09-21.
-        cmd += ["--model", models[min(model_idx, len(models) - 1)]]
+    # Model and effort from the org chart. Trade (daily, weekly, event, finish) and strategy are
+    # the PM: roster CLAUDE_TIERS["best"] at the PM's effort (`max`, David 2026-09-22; the strategy
+    # session asks by its own kind, so roster.EFFORT_KINDS can give it ultracode alone). A sync is
+    # mechanical — the default tier and effort (`high`); it ran on the CLI's default model, with
+    # no --model at all, until 2026-09-22 ("move all auto claude jobs to opus 5.5").
+    # _launch_guard falls back to the next model if the installed CLI cannot run this one.
+    # Appended ONCE — this block emitted `--model` twice for a trade session until 2026-09-21.
+    role = "pm" if mode in ("trade", "strategy") else None
+    models = runner.job_models(role)
+    model = models[min(model_idx, len(models) - 1)]
+    effort = runner.job_effort("strategy" if mode == "strategy" else role)
+    cmd += ["--model", model, "--effort", effort]
     # ONE CLAUDE SESSION AT A TIME (claudeq, David 2026-09-04). The TRADE session never
     # waits: it takes the slot over whatever is running (the queue's fit rule keeps the
     # 09:05–14:05Z band clear, so a collision is a bug and gets paged). A sync waits.
@@ -302,8 +301,8 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
         claudeq = None
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,
                             start_new_session=True, env=runner.clean_env())
-    if mode in ("trade", "strategy"):   # the `launched` event: model, hashes of what it read, data freshness
-        runlog.launched(run_id, mode, models[min(model_idx, len(models) - 1)], cmd, prompt, pid=proc.pid)
+    if mode in ("trade", "strategy"):   # the `launched` event: model + effort, hashes of what it read, data freshness
+        runlog.launched(run_id, mode, model, cmd, prompt, pid=proc.pid, effort=effort)
     if claudeq is not None:
         try:
             if mode != "strategy":     # a strategy session is dispatched BY the queue, which holds the slot for it
@@ -343,14 +342,23 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
                           f"python3 {HERE}/loop.py reconcile >> {LOGS}/agent_reconcile.log 2>&1"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if mode == "trade":
-        died = _launch_guard(proc, attempt, model_idx, models)
+        died = _launch_guard(proc, attempt, model_idx, models, run_id=run_id)
         if died:
             return died
-    return {"ok": True, "msg": f"agent {mode} launched on {models[min(model_idx, len(models) - 1)]}",
+    return {"ok": True, "msg": f"agent {mode} launched on {model} · effort {effort}",
             "pid": proc.pid, "log": str(LOGS / f"agent_{mode}.log")}
 
 
-def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
+def _launch_death(run_id):
+    """The marker _launch_guard leaves when it takes ownership of a run's death (it paged, and
+    it relaunches or re-files). finish_guard reads it instead of guessing from the log text."""
+    return DATA / f"launch_death_{run_id}"
+
+
+_LAUNCH_WATCH_S = 90    # _launch_guard watches the first 90 s: 18 polls × 5 s
+
+
+def _launch_guard(proc, attempt, model_idx=0, models=("opus",), run_id=None):
     """THE TRADE SESSION NEVER DIES QUIETLY (David, 2026-08-31: "the trade session
     should never die"). That day's 14:05 launch lasted 1 second — "You've hit your
     session limit · resets 2:40pm (UTC)" — and the desk stayed dark until a human
@@ -358,7 +366,8 @@ def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
     critical page AND one detached relaunch just after the stated reset (≤3 attempts,
     never after 19:30 UTC — a session that opens in the last half hour of the market
     day can't do its job). A death that isn't the limit belongs to auth_check and the
-    reconcile watcher, not this guard."""
+    reconcile watcher, not this guard. A death it DOES handle is marked for `run_id`
+    (_launch_death), so finish_guard stands down on exactly those and no others."""
     import re
     import time as _t
     for _ in range(18):
@@ -371,10 +380,19 @@ def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
         tail = (LOGS / "agent_trade.log").read_text()[-600:]
     except Exception:
         tail = ""
+
+    def _own():   # before any push or relaunch: finish_guard may be reading right behind us
+        if run_id:
+            try:
+                _launch_death(run_id).write_text(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} "
+                                                 f"attempt {attempt}: {tail.strip()[-160:]}")
+            except Exception:
+                pass
     # (0) the model itself: "Claude Code X does not support this model" — the tier named a
     # model the installed CLI cannot run. Relaunch NOW on the next entry; never let a
     # version skew kill the trade session (2026-09-01: 2.1.236 refused claude-fable-5-1).
     if "does not support this model" in tail.lower() or "invalid model" in tail.lower():
+        _own()
         nxt = model_idx + 1
         if nxt < len(models):
             try:
@@ -386,9 +404,19 @@ def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
             except Exception:
                 pass
             return launch("trade", attempt=attempt, model_idx=nxt)
+        # owned above, so finish_guard stands down — which makes this page the only one
+        try:
+            sys.path.insert(0, str(ENGINE))
+            import notify as _n
+            _n.push("Agent trade session FAILED: no model runs",
+                    f"no model in {list(models)} runs on this CLI ({tail.strip()[-100:]}). NO retry — "
+                    "run `claude install latest` on the box, then `loop.py trade`.", tier="critical")
+        except Exception:
+            pass
         return {"ok": False, "msg": f"trade died: no model in {list(models)} runs on this CLI — needs eyes"}
     if "limit" not in tail.lower():
         return None
+    _own()
     now = dt.datetime.now(dt.timezone.utc)
     delay = 3600
     m = re.search(r"resets (\d{1,2}):(\d{2})\s*(am|pm)\s*\(UTC\)", tail, re.I)
@@ -421,6 +449,32 @@ def _launch_guard(proc, attempt, model_idx=0, models=("opus",)):
     return {"ok": False, "msg": "trade died on usage limit; no retry scheduled — needs eyes"}
 
 
+def _launched_at(run_id):
+    """The run's `launched` time (aware UTC) from journal/runs/<run_id>.jsonl, or None when the
+    run has no record (then finish_guard falls back to any session log dated today)."""
+    try:
+        for line in (JOURNAL / "runs" / f"{run_id}.jsonl").read_text().splitlines():
+            e = json.loads(line) if line.strip() else {}
+            if e.get("ev") == "launched" and e.get("ts"):
+                return dt.datetime.fromisoformat(str(e["ts"]).replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+
+def _limit_reset(tail):
+    """The CLI's usage-limit line in `tail` → its reset instant, else None. The queue's own
+    parser (claudeq.limit_reset), so this guard and the queue never disagree about the line;
+    if the queue will not import, the same three phrases (True: a limit, reset unknown)."""
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import claudeq
+        return claudeq.limit_reset(tail)
+    except Exception:
+        low = (tail or "").lower()
+        return True if any(p in low for p in ("session limit", "usage limit", "hit your limit")) else None
+
+
 def finish_guard(run_id="unrecorded"):
     """A TRADE SESSION THAT LEFT NO SESSION LOG DID NOT FINISH — relaunch it once.
 
@@ -433,31 +487,58 @@ def finish_guard(run_id="unrecorded"):
     Runs from the detached watcher launch() already starts, after `reconcile` — so the pid is
     long gone and the log, if there is one, is final. Guards against every way this could go
     wrong on its own:
-      · one relaunch a day, ever (the marker file), so a session that keeps dying cannot loop
-      · nothing when the LAUNCH died (usage limit, model refused) — _launch_guard owns those
-        and re-files them; a second relaunch here would race it
+      · only a log written AFTER this run launched counts (journal/runs/<run_id>.jsonl): an
+        event session's 13:35Z log is not proof the 14:05Z run finished (2026-09-18's shape)
+      · one relaunch a day, ever (the marker file), so a session that keeps dying cannot loop —
+        and when that relaunch is spent, David is paged, not just logged
+      · nothing when the LAUNCH died (usage limit, model refused) — _launch_guard owns those,
+        pages, re-files them, and marks the run (_launch_death); a second relaunch would race
+        it. The marker decides, not the log text: the PM's last words mention "limit" whenever
+        it placed a limit order, and that text alone once stood this guard down
+      · a usage-limit death AFTER _launch_guard's 90 s is this guard's: paged with the reset
+        time, relaunched once (the relaunch's own _launch_guard re-files it past the reset)
       · nothing after 19:30Z, the same cutoff _launch_guard uses: a session opening in the
         last half hour of the market day cannot do its job
       · the relaunch reads prompts/_finish_guard.md first, so it FINISHES the dead session
         instead of re-deciding the day
     """
     today = dt.date.today().isoformat()
+    launched = _launched_at(run_id)
     sessions = sorted((JOURNAL / "sessions").glob(f"{today}T*_session.md"))
+    if launched is not None:
+        sessions = [s for s in sessions if s.stat().st_mtime >= launched.timestamp()]
     if sessions:
         return {"ok": True, "msg": f"session log present ({sessions[-1].name}) — nothing to finish"}
 
+    # a LAUNCH death belongs to _launch_guard. It decides within its watch, so never judge one
+    # before that watch is over (the reconcile ahead of this call is normally far longer).
+    if launched is not None:
+        import time as _t
+        wait = (launched + dt.timedelta(seconds=_LAUNCH_WATCH_S + 15) - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        if wait > 0:
+            _t.sleep(wait)
+    if _launch_death(run_id).exists():
+        return {"ok": False, "msg": "launch-time death (usage limit / model) — _launch_guard owns the retry"}
+
     marker = DATA / f"finish_guard_{today}"
     if marker.exists():
+        try:
+            sys.path.insert(0, str(ENGINE))
+            import notify as _n
+            _n.push("Agent trade session FAILED to finish — relaunch spent",
+                    f"run {run_id} left no session log for {today}, and today's one finish relaunch is already "
+                    f"spent ({marker.read_text()[:80]}). No further relaunch — needs eyes.",
+                    tier="critical")   # money-book; never held, never capped (notify_policy.json)
+        except Exception:
+            pass
         return {"ok": False, "msg": f"no session log for {today} and the one relaunch is spent "
-                                    f"({marker.read_text()[:80]}) — needs eyes"}
+                                    f"({marker.read_text()[:80]}) — paged, needs eyes"}
 
-    # a LAUNCH death belongs to _launch_guard, which pages and re-files on the stated reset
     try:
-        tail = (LOGS / "agent_trade.log").read_text()[-600:].lower()
+        tail = (LOGS / "agent_trade.log").read_text()[-600:]
     except Exception:
         tail = ""
-    if "limit" in tail or "does not support this model" in tail or "invalid model" in tail:
-        return {"ok": False, "msg": "launch-time death (usage limit / model) — _launch_guard owns the retry"}
+    reset = _limit_reset(tail)   # the usage limit, hit after _launch_guard stood down
 
     now = dt.datetime.now(dt.timezone.utc)
     missing = "it wrote no session log"
@@ -473,10 +554,15 @@ def finish_guard(run_id="unrecorded"):
     try:
         sys.path.insert(0, str(ENGINE))
         import notify as _n
-        _n.push("Agent trade session FAILED to finish — no session log",
-                f"run {run_id} left no session log for {today}. "
+        limit = ""
+        if reset is not None:
+            limit = (f"It died MID-SESSION on the usage limit (resets "
+                     f"{reset:%H:%M}Z). " if hasattr(reset, "hour") else "It died MID-SESSION on the usage limit. ")
+        _n.push("Agent trade session FAILED to finish — " + ("usage limit mid-session" if limit else "no session log"),
+                f"run {run_id} left no session log for {today}. " + limit
                 + ("NO relaunch (past 19:30Z, too late in the market day) — needs eyes."
-                   if late else "Relaunching once to finish it (prompts/_finish_guard.md)."),
+                   if late else "Relaunching once to finish it (prompts/_finish_guard.md)"
+                   + ("; if the limit still holds, its launch guard re-files it after the reset." if limit else ".")),
                 tier="critical")   # money-book; never held, never capped (notify_policy.json)
     except Exception:
         pass
@@ -529,7 +615,12 @@ def reconcile():
         sys.path.insert(0, str(ENGINE))
         import claudeq
         with claudeq.slot("agent sync (reconcile fallback)", "sync", timeout_s=900):
-            subprocess.run([runner.CLAUDE_BIN, "-p", SYNC_PROMPT, "--dangerously-skip-permissions"] + MCP_RESTRICT,
+            # + tool_denylist: this session ran on 09-21 holding every broker write tool, with
+            # only the prompt's "read-only" between it and them (contract C29 now checks it).
+            # Model + effort: the default tier at `high`, like launch("sync") (2026-09-22).
+            subprocess.run([runner.CLAUDE_BIN, "-p", SYNC_PROMPT, "--dangerously-skip-permissions",
+                            "--model", runner.job_model(), "--effort", runner.job_effort()] + MCP_RESTRICT
+                           + tool_denylist("sync"),
                            cwd=str(ROOT), env=runner.clean_env(), timeout=600,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rows = _load_trades()

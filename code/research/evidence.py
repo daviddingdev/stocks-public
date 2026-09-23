@@ -56,6 +56,14 @@ FACT_MAP = {
 # hunt ask evidence.py-164) — reserve slots for FY 10-K rows separately from the rest.
 FY_KEEP = 12
 OTHER_KEEP = 16
+# a duration fact counts as a year only at 350-380 days and as a quarter only at 80-100
+# (52/53-week years and 13/14-week quarters included). SEC stamps every fact with its
+# FILING's fp/form, so a 10-K's Q4-only column is also fp=FY/10-K and a 10-Q's year-to-date
+# column shares the quarter's fp — keyed on (end, fp) alone, the quarter overwrote the year
+# (RDI FY2020 revenue 15.0M, the real figure 77.9M; every COLL "FY" row; brokera-3 2026-09-22).
+# Instant facts (cash, debt, equity, shares outstanding) carry no start and pass as before.
+FY_DAYS = (350, 380)
+Q_DAYS = (80, 100)
 ITEM_RE = re.compile(r"(?im)^\s*(item\s+(?:1a?|2|3|5|7a?|8|9a?)\.?[^\n]{0,80})$")
 
 
@@ -82,6 +90,45 @@ def strip_html(raw):
     txt = htmllib.unescape(txt)
     txt = re.sub(r"[ \t\xa0]+", " ", txt)
     return re.sub(r"\n\s*\n+", "\n\n", txt).strip()
+
+
+def pick_series(gaap, tags):
+    """(tag, series) for the first-listed of `tags` whose series runs LATEST, or None. The first tag
+    with any rows used to win even when it was dead: HALO's 'Revenues' stops at 2020-12-31 while
+    RevenueFromContractWithCustomerExcludingAssessedTax runs to 2026 (ETD's stops at 2018)."""
+    best = None
+    for tag in tags:
+        units = gaap.get(tag, {}).get("units", {})
+        series = tidy_series(units.get("USD") or units.get("shares") or [])
+        if series and (best is None or series[-1]["end"] > best[1][-1]["end"]):
+            best = (tag, series)
+    return best
+
+
+def tidy_series(vals):
+    """One tag's companyfacts rows -> the facts.json series: a 10-K duration row only when
+    it spans a full year, a 10-Q duration row only when it spans one quarter, deduped on
+    (start, end, fp) so no period can overwrite another that shares its end date."""
+    seen = {}
+    for v in vals:
+        if v.get("form") not in ("10-K", "10-Q") or not v.get("end"):
+            continue
+        if v.get("start"):
+            try:
+                days = (dt.date.fromisoformat(v["end"]) - dt.date.fromisoformat(v["start"])).days
+            except ValueError:
+                continue
+            lo, hi = FY_DAYS if v["form"] == "10-K" else Q_DAYS
+            if not lo <= days <= hi:
+                continue
+        key = (v.get("start"), v["end"], v.get("fp", ""))
+        seen[key] = {"start": v.get("start"), "end": v["end"], "val": v["val"], "fy": v.get("fy"),
+                     "fp": v.get("fp"), "form": v.get("form"), "filed": v.get("filed")}
+    fy10k = sorted((r for r in seen.values() if r["fp"] == "FY" and r["form"] == "10-K"),
+                   key=lambda x: x["end"])[-FY_KEEP:]
+    other = sorted((r for r in seen.values() if not (r["fp"] == "FY" and r["form"] == "10-K")),
+                   key=lambda x: x["end"])[-OTHER_KEEP:]
+    return sorted(fy10k + other, key=lambda x: x["end"])
 
 
 def build(tk, skip_local=False):
@@ -143,22 +190,9 @@ def build(tk, skip_local=False):
         cf = json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"))
         gaap = cf.get("facts", {}).get("us-gaap", {})
         for concept, tags in FACT_MAP.items():
-            for tag in tags:
-                units = gaap.get(tag, {}).get("units", {})
-                vals = units.get("USD") or units.get("shares") or []
-                rows = [v for v in vals if v.get("form") in ("10-K", "10-Q") and v.get("end")]
-                if rows:
-                    seen = {}
-                    for v in rows:
-                        key = (v["end"], v.get("fp", ""))
-                        seen[key] = {"end": v["end"], "val": v["val"], "fy": v.get("fy"),
-                                     "fp": v.get("fp"), "form": v.get("form"), "filed": v.get("filed")}
-                    fy10k = sorted((r for r in seen.values() if r["fp"] == "FY" and r["form"] == "10-K"),
-                                   key=lambda x: x["end"])[-FY_KEEP:]
-                    other = sorted((r for r in seen.values() if not (r["fp"] == "FY" and r["form"] == "10-K")),
-                                   key=lambda x: x["end"])[-OTHER_KEEP:]
-                    facts_out[concept] = {"tag": tag, "series": sorted(fy10k + other, key=lambda x: x["end"])}
-                    break
+            best = pick_series(gaap, tags)
+            if best:
+                facts_out[concept] = {"tag": best[0], "series": best[1]}
     except Exception as e:
         facts_out["_error"] = str(e)[:120]
 

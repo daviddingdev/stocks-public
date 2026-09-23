@@ -20,7 +20,9 @@ fincard.json:
   derived   net cash, EV, FCF, margins, returns, leverage, dilution, yields —
             every value ships WITH its formula and inputs inline.
   valuation MECHANICAL ruler: reverse-DCF implied growth + DCF/share grid at
-            fixed assumptions (10y, 10% discount, 2.5% terminal). Never a thesis.
+            fixed assumptions (10y, the 9% house WACC, 2.5% terminal) on UNLEVERED
+            FCF, net debt subtracted once (2026-09-22; `ruler` carries the inputs —
+            see THE MECHANICAL RULER below). Never a thesis.
   cross_checks  computed market cap vs Finnhub's (catches share-class/unit
             errors — multi-class issuers under-report dei shares); flagged >10%.
   flags     everything missing, mixed-period, or upper-bound — part of the number.
@@ -2605,7 +2607,19 @@ def build(tk, cik_override=None):
                 f"op_income {opi:,.0f} x (1-21% tax) / (equity+debt-cash {ic:,.0f})", "rough approximation")
     ie = ttm_vals.get("interest_expense")
     if opi is not None and ie:
-        put("interest_coverage", opi / ie, f"op_income {opi:,.0f} / interest_expense {ie:,.0f}")
+        # a single YTD interest figure is part of a year: TDG's 1,472M is nine months, and a TTM
+        # op_income over it printed 3.1x coverage for a name at ~2.4x (2026-09-22). Annualised by
+        # its own day-count and said so, the rule ev_over_fcf and pe already follow (fincard.py-045/068).
+        _ie_days = _partial_period_days(F.get("interest_expense"))
+        if _ie_days:
+            _ann_ie = ie * 365.0 / _ie_days
+            put("interest_coverage", opi / _ann_ie,
+                f"op_income {opi:,.0f} / interest_expense(annualized) {_ann_ie:,.0f} "
+                f"(interest_expense {ie:,.0f} over {_ie_days}d x 365/{_ie_days})",
+                "interest is a partial-period (YTD) figure, annualized by day-count before "
+                "dividing a full year of op_income by it")
+        else:
+            put("interest_coverage", opi / ie, f"op_income {opi:,.0f} / interest_expense {ie:,.0f}")
     eb = (D.get("ebitda_approx") or {}).get("value")
     td = (D.get("total_debt") or {}).get("value")
     # debt_over_ebitda suppressed for depositories too (fincard.py-072) — total_debt
@@ -2910,34 +2924,15 @@ def build(tk, cik_override=None):
         if dv:
             put("dividend_yield_pct", dv / mc * 100, f"dividends_paid {dv:,.0f} / market_cap {mc:,.0f}")
 
-        fcf = (D.get("fcf") or {}).get("value")
-        nc0 = (D.get("net_cash") or {}).get("value") or 0
         # REORG SUPPRESSION continued (fincard.py-235): net_cash is intentionally absent
-        # from D above, but nc0's `or 0` fallback would silently feed the DCF grid as if
-        # the issuer held zero cash and zero debt — still wrong, just wrong in the other
+        # from D above, and a `or 0` fallback would silently feed the DCF grid as if the
+        # issuer held zero cash and zero debt — still wrong, just wrong in the other
         # direction. Skip the grid entirely rather than launder an unquotable net_cash
-        # through a default.
-        if fcf and fcf > 0 and not _is_reorg:
-            sys.path.insert(0, str(ENGINE / "valuation"))
-            import toolkit
-            V = card["valuation"]
-            V["_assumptions"] = ("MECHANICAL: 10y horizon, 10% discount, 2.5% terminal growth, "
-                                 "base FCF = TTM. A ruler for sanity, never a thesis.")
-            try:
-                r = toolkit.reverse_dcf(px, sh, fcf, 0.10, 0.025, 10, net_cash=nc0)
-                V["market_implied_fcf_growth_pct"] = round(r["implied_growth"] * 100, 2)
-            except Exception as e:
-                V["reverse_dcf_error"] = str(e)[:80]
-            grid = {}
-            for g in (-0.05, 0.0, 0.05, 0.10, 0.15):
-                try:
-                    out = toolkit.dcf([fcf * (1 + g) ** y for y in range(1, 11)],
-                                      0.10, 0.025, net_cash=nc0, shares=sh)
-                    ps = out.get("per_share") or (out.get("equity_value", 0) / sh if sh else None)
-                    grid[f"{g * 100:+.0f}%"] = round(ps, 2) if ps else None
-                except Exception:
-                    grid[f"{g * 100:+.0f}%"] = None
-            V["dcf_value_per_share_at_growth"] = grid
+        # through a default. ruler_inputs() reads the same F/D the card is being built
+        # from, so the grid here and the one the model pack recomputes from a stored card
+        # are the same arithmetic (THE MECHANICAL RULER, below).
+        if not _is_reorg:
+            card["valuation"].update(mechanical_valuation(**ruler_inputs(card, price=px, shares=sh)))
     elif not _non_primary:
         card["flags"].append("no live price and/or shares_out — market-derived values skipped")
     # else: _non_primary already carries its own NON-PRIMARY SECURITY flag above — a second,
@@ -3011,6 +3006,133 @@ def build(tk, cik_override=None):
         card["flags"].append(f"MIXED PERIODS: flow figures end {flow_end} but balance sheet is "
                              f"{bal} — multiples mix eras; note it when quoting them")
     return card
+
+
+# ---------------------------------------------------------------- THE MECHANICAL RULER
+# The reverse DCF and the DCF/share grid every card carries (2026-09-22 rebuild). Two defects
+# fixed together, both live on every card before this:
+#
+#   1. DEBT COUNTED TWICE. The grid discounted LEVERED free cash flow (CFO − capex: interest
+#      already paid) and then subtracted net debt as well. Levered FCF belongs to the equity
+#      alone; subtracting the debt again charges for it twice. It is the VRRM lesson the primer
+#      already records ($0.83 a share on the double count, ~$4.20 redone), and it was still live:
+#      TDG read 19.3% growth priced in and a NEGATIVE value per share at 0% growth. Now the base
+#      is UNLEVERED: FCF + interest × (1 − tax), valued as the whole business, then net debt
+#      comes off ONCE.
+#   2. TWO DISCOUNT RATES ON ONE SCREEN. The grid used 10%; EPV and ROIC (research/quality.py,
+#      research/models.py) use the 9% house WACC. The only argument for 10% was that it sat
+#      nearer a cost of EQUITY, which is what levered cash flow is discounted at — and with an
+#      unlevered base the right rate is the cost of capital. One rate now: WACC below, the same
+#      9% the rest of the desk uses (tests/test_valuation_ruler.py pins the three equal).
+#
+# Field names and shapes are unchanged (market_implied_fcf_growth_pct, dcf_value_per_share_at_
+# growth, _assumptions); `ruler` is added beside them with the inputs and their arithmetic.
+WACC = 0.09            # the house cost of capital: research/quality.py WACC, research/models.py WACC
+TERMINAL_G = 0.025
+HORIZON_Y = 10
+TAX_DEFAULT = 0.23     # research/models.py TAX — the fallback when the effective rate is not on file
+LADDER = (-0.05, 0.0, 0.05, 0.10, 0.15)
+
+
+def _year_of(fig):
+    """(value, days) for a flow figure: the value scaled to a year when it is a single partial
+    period (fincard.py-045's rule), else as filed with days None. (None, None) if absent/STALE."""
+    if not isinstance(fig, dict) or fig.get("value") is None or fig.get("STALE"):
+        return None, None
+    d = _partial_period_days(fig)
+    return (fig["value"] * 365.0 / d, d) if d else (fig["value"], None)
+
+
+def ruler_inputs(card, price=None, shares=None):
+    """Everything the ruler needs, read off a card — at build time (F/D as they are being
+    written) or from a stored card (the model pack, so a fix reaches every card tonight
+    instead of as each one is rebuilt). ONE reader, so both are the same arithmetic."""
+    F, D = card.get("figures") or {}, card.get("derived") or {}
+    px = price if price is not None else (card.get("price") or {}).get("value")
+    sh = shares if shares is not None else (F.get("shares_out") or {}).get("value")
+    fcf = (D.get("fcf") or {}).get("value")
+    fcf_days = _partial_period_days(F.get("cfo")) if fcf is not None else None
+    if fcf is not None and fcf_days:
+        fcf = fcf * 365.0 / fcf_days
+    inter, int_days = _year_of(F.get("interest_expense"))
+    tax, pre = F.get("tax") or {}, F.get("pretax_income") or {}
+    rate, basis = None, "default"
+    if (tax.get("value") is not None and (pre.get("value") or 0) > 0 and not tax.get("STALE")
+            and not pre.get("STALE") and _same_period(tax, pre)):
+        rate, basis = min(max(tax["value"] / pre["value"], 0.0), 0.45), "effective"
+    return {"price": px, "shares": sh, "fcf": fcf, "fcf_days": fcf_days,
+            "net_cash": (D.get("net_cash") or {}).get("value"), "interest": inter,
+            "interest_days": int_days, "tax_rate": TAX_DEFAULT if rate is None else rate,
+            "tax_basis": basis}
+
+
+def mechanical_valuation(price, shares, fcf, net_cash, interest=None, tax_rate=TAX_DEFAULT,
+                         fcf_days=None, interest_days=None, tax_basis="default"):
+    """The ruler: reverse DCF (growth the price already pays for) and value per share across a
+    growth ladder, on UNLEVERED free cash flow at the house WACC, net debt subtracted once.
+
+    Returns the card's `valuation` fields, or {} when the base cash flow is not positive — a
+    DCF of a cash-burning business is not a low number, it is not a number (the card then has
+    no valuation, as before; the model pack says "not applicable" with the FCF). A missing
+    interest line (most net-cash names carry none) leaves FCF as filed, and the note says so."""
+    sys.path.insert(0, str(ENGINE / "valuation"))
+    import toolkit
+    if not (price and shares) or fcf is None:
+        return {}
+    nc = net_cash or 0.0                         # a bank has no net_cash by design: counted as 0, as before
+    notes = []
+    if interest is not None and interest <= 0:
+        # SRPT tags a NEGATIVE interest line (net interest income): there is no debt cost to add
+        # back, and subtracting it would push the base below the FCF it came from
+        notes.append(f"interest line is {interest/1e6:,.0f}M — net income, not a cost — nothing added back")
+        interest = None
+    shield = (interest or 0.0) * (1 - tax_rate)
+    base = fcf + shield
+    if base <= 0:
+        return {}
+    if fcf_days:
+        notes.append(f"FCF annualised from {fcf_days}d")
+    if interest:
+        notes.append(f"interest {interest/1e6:,.0f}M" + (f" (annualised from {interest_days}d)" if interest_days else "")
+                     + f" × (1 − {tax_rate:.0%} {tax_basis} tax) = {shield/1e6:,.0f}M added back")
+    elif not notes:
+        notes.append("no interest line on the card — FCF used as filed")
+    V = {}
+    V["ruler"] = {"basis": "unlevered FCF (FCF + interest × (1 − tax)), net debt subtracted once",
+                  "fcf": round(fcf), "interest": (round(interest) if interest else None),
+                  "tax_rate": round(tax_rate, 4), "base_fcf": round(base), "net_cash": round(nc),
+                  "discount_rate": WACC, "terminal_growth": TERMINAL_G, "years": HORIZON_Y,
+                  "formula": f"FCF {fcf/1e6:,.0f}M + {shield/1e6:,.0f}M = unlevered {base/1e6:,.0f}M; "
+                             + "; ".join(notes)}
+    V["_assumptions"] = (f"MECHANICAL: {HORIZON_Y}y horizon, {WACC:.0%} discount (the house WACC), "
+                         f"{TERMINAL_G:.1%} terminal growth, base = UNLEVERED TTM FCF (FCF + interest "
+                         f"× (1 − tax)) valued as the whole business, net debt subtracted once. "
+                         f"A ruler for sanity, never a thesis.")
+    try:
+        r = toolkit.reverse_dcf(price, shares, base, WACC, TERMINAL_G, HORIZON_Y, net_cash=nc)
+        V["market_implied_fcf_growth_pct"] = round(r["implied_growth"] * 100, 2)
+    except Exception as e:
+        V["reverse_dcf_error"] = str(e)[:80]
+    grid = {}
+    for g in LADDER:
+        try:
+            out = toolkit.dcf([base * (1 + g) ** y for y in range(1, HORIZON_Y + 1)],
+                              WACC, TERMINAL_G, net_cash=nc, shares=shares)
+            ps = out.get("per_share")
+            grid[f"{g * 100:+.0f}%"] = round(ps, 2) if ps else None
+        except Exception:
+            grid[f"{g * 100:+.0f}%"] = None
+    V["dcf_value_per_share_at_growth"] = grid
+    return V
+
+
+def valuation_from_card(card, price=None, shares=None):
+    """The ruler recomputed from a STORED card — what the model pack shows, so a card built
+    before 2026-09-22 (levered, 10%) reads on today's basis without waiting for its rebuild.
+    Empty for a reorg card (net_cash is unquotable there — see build())."""
+    if any(str(f).startswith("IN REORG") for f in card.get("flags") or []):
+        return {}
+    return mechanical_valuation(**ruler_inputs(card, price=price, shares=shares))
 
 
 def _manual_cli(a):

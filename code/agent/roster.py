@@ -61,10 +61,12 @@ BRIEF = DATA / "roster_brief.md"
 # `charter` is the allowed-edit surface — empty list means "writes no code".
 ROLES = [
     {
-        "id": "pm", "name": "PM — portfolio manager", "who": "best Claude available · broker access",
-        # David 2026-09-01: "I want the PMs to run on fable 5.1 going forward / always the best
-        # model available." `best` is a TIER (CLAUDE_TIERS below): first entry the CLI can run wins.
-        "model": "best",
+        "id": "pm", "name": "PM — portfolio manager", "who": "best Opus · broker access",
+        # David 2026-09-22: every Claude job on Opus 5.5, the PM at the highest effort (was: Fable
+        # 5.1, 2026-09-01). `best` is a TIER (CLAUDE_TIERS below): first entry the CLI can run wins.
+        # `effort` is the CLI's --effort for every PM session — trade, event, finish, strategy —
+        # unless EFFORT_KINDS gives a kind its own (David's open ultracode decision, 2026-09-23).
+        "model": "best", "effort": "max",
         "cron": "loop.py trade", "cadence_note": "+ event-triggered (triggers.py ACTION, cap 3/day)",
         "purpose": "The only role that moves dollars. Judgment: question, re-evaluate, decide, "
                    "and write a pre-trade memo before every order.",
@@ -94,7 +96,7 @@ ROLES = [
     },
     {
         "id": "vp", "name": "VP — night sweep and prep desk",
-        "who": "code + local models, then a Sonnet review pass",
+        "who": "code + local models, then an Opus review pass",
         # David 2026-08-18: "promote the VP to the best claude sonnet model for now. give it a
         # little boost in intelligence until things run smoothly." The 16 coded stages are
         # unchanged and still cost zero tokens; what Sonnet adds is a REVIEW of their output
@@ -222,7 +224,7 @@ ROLES = [
     },
     {
         "id": "numbers", "name": "Numbers Engineer — accounting forensics (was: Fixer)",
-        "who": "Sonnet · NO broker access",
+        "who": "Opus · NO broker access",
         # Was Opus. David 2026-08-18: "Fixer should go down to sonnet model rather than opus."
         # This is the per-job sign-off PROJECT_STANDARDS §2 requires for a model downgrade.
         # Defensible: the work is mechanical root-cause repair against a queue, every change
@@ -247,7 +249,7 @@ ROLES = [
     },
     {
         "id": "signals", "name": "Signals Engineer — signal-vs-noise",
-        "who": "Sonnet · NO broker access",
+        "who": "Opus · NO broker access",
         # NEW 2026-08-19 (ORG_PLAN, approved by David): bench/feeds/triggers/scout/cannibal —
         # ~2,000 lines of origination and intel code — had no owner at all. Sonnet for the
         # same reason the Numbers Engineer is: mechanical repair against evidence, judgment
@@ -269,7 +271,7 @@ ROLES = [
     },
     {
         "id": "build", "name": "Build Engineer — surfaces",
-        "who": "Sonnet · NO broker access",
+        "who": "Opus · NO broker access",
         # NEW 2026-08-28 (owners.py-067, authorized by David "fix everything, no decisions
         # needed me" 2026-08-27): subsystem `surfaces` (the dashboard) had an owner that
         # never ran — 4 asks deep, oldest stalled 5 days, while the /agent page showed a
@@ -465,28 +467,163 @@ it is either fixed, or it is a decision with a named owner sitting in front of t
 
 # ---------------------------------------------------------------- Claude model tiers
 # A role names a TIER, never a bare model id (same doctrine as models.json for local models).
-# The launcher tries the list in order and falls back on a "does not support this model" death,
-# so a tier can name a model the installed CLI cannot run yet without killing the session.
-# Updating the box to a newer model is ONE edit here. `best` is David's standing order for the
-# PM ONLY (2026-09-01: "only PM is best (fable 5.1), others can still be opus (best opus), and
-# sonnet"): the most capable generally available Claude, currently Fable 5.1. `opus` and
-# `sonnet` are the CLI aliases, which track the newest release of each.
+# Updating the box to a newer model is ONE edit here. David's standing order, 2026-09-22 20:58 ET:
+# "Move all auto claude jobs to opus 5.5, for PM it should be ultracode effort, everything else
+# at high effort (if these are possible)" — so EVERY Claude role runs Opus 5.5, everyone but the
+# PM at `high` (CLAUDE_EFFORT below) and the PM at `max` for now: ultracode IS possible on the
+# box's CLI, but it is a different kind of session, so it is David's decision (EFFORT_KINDS
+# below). `best` stays the PM's tier NAME, now identical to `opus`, so splitting the PM out again
+# is one edit. Superseded: 2026-09-01 "only PM is best (fable 5.1), others can still be opus
+# (best opus), and sonnet" — Fable 5.1 left the PM's tier on 2026-09-22.
+# `opus` and `sonnet` as bare entries are the CLI aliases; a pinned id ahead of an alias is a
+# newer model than the alias resolves to on an older CLI.
+#
+# claude_models() drops a pinned id the INSTALLED CLI cannot run (MIN_CLI below), so the tier's
+# first entry is always runnable. That matters because only the PM's launcher falls back
+# (loop._launch_guard relaunches on "does not support this model"); runner.launch, ops.py and
+# vp.py spawn the FIRST entry and nothing else, so a tier led by a model the CLI refuses would
+# kill every non-PM job. On the box's CLI 2.1.280 (installed 2026-09-22, where `opus` also
+# resolves to claude-opus-5-5) every tier leads with claude-opus-5-5; an older CLI (2.1.257
+# refused it: "version 2.1.280 or newer is required") falls back to the `opus` alias.
 CLAUDE_TIERS = {
-    "best": ["claude-fable-5-1", "opus"],
-    "opus": ["opus"],
+    "best": ["claude-opus-5-5", "opus"],
+    "opus": ["claude-opus-5-5", "opus"],
     "sonnet": ["sonnet"],
 }
 
+# Names a launcher or the lab mode uses for a role's sessions -> the org-chart row they run as.
+# `fixer` is the Numbers Engineer's old name; the rest are the PM's own session kinds (mode.py
+# jobs, contract C35's prompt roles), every one of which thinks as the PM.
+ROLE_ALIASES = {"fixer": "numbers", "pm_strategy": "pm", "strategy": "pm", "pm_event": "pm",
+                "pm_daily": "pm", "pm_weekly": "pm"}
+
+# ---- effort (David 2026-09-22): the PM at `max`, every other Claude session at `high`. A role row
+# may carry "effort"; a role without one — and every research/runner.py kind (research, finish,
+# update, rec, brief, board, cards, industry, pe, primer, briefs), which names no role — gets
+# CLAUDE_EFFORT.
+#
+# `ultracode` is a real --effort value, though `claude --help` lists only low…max: the 2.1.280
+# parser maps it to xhigh effort PLUS dynamic-workflow orchestration (the session may fan work
+# out to workflow sub-agents). Read from the installed binary on 2026-09-23 — never exercised in a
+# live `-p` session, where it also needs workflows enabled and an xhigh-capable model (Opus 5.5 is).
+#
+# A level the installed CLI would not take runs at EFFORT_FALLBACK instead, and contract C37 names
+# it every night. Never the default: the CLI does not refuse an unknown --effort, it prints a
+# warning and runs at the MODEL's default (`medium` on Opus 5.5), so a typo in the PM's row would
+# quietly drop the one session that moves dollars two levels.
+CLAUDE_EFFORT = "high"
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultracode")
+EFFORT_FALLBACK = "max"
+MIN_CLI_EFFORT = {"ultracode": "2.1.280"}   # the first release known to take it (the box's)
+
+# Session kinds that run at a level of their own, over their role's row. EMPTY until David
+# decides — the open decision of 2026-09-23 (his word was "ultracode", `max` is the do-nothing
+# default): {"strategy": "ultracode"} gives the monthly strategy session (no broker, nothing
+# placed) the workflow sub-agents while every trade session stays at `max`. Before a trade
+# session gets it, prove on one live session that (1) the sub-agents inherit --strict-mcp-config
+# and --disallowedTools, (2) the fan-out ends inside CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS and the
+# claudeq slot, and (3) its usage fits the shared 5h window.
+EFFORT_KINDS = {}
+
+# The first CLI release that can run a pinned id. An id not listed here is assumed runnable.
+MIN_CLI = {"claude-opus-5-5": "2.1.280"}
+
+_CLI = {"at": 0.0, "v": None}
+_CLI_TTL = 600.0     # the dashboard is long-lived; a CLI update shows within ten minutes
+
+
+def _ver(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def cli_version():
+    """The installed claude CLI's version as a tuple, or None when it cannot be read. Asks the
+    binary runner.clean_env() puts first on PATH (~/.local/bin, the native CLI — /usr/bin/claude
+    is a stale npm copy). Cached briefly; never raises."""
+    import time
+    if time.time() - _CLI["at"] < _CLI_TTL:
+        return _CLI["v"]
+    v = None
+    try:
+        exe = Path.home() / ".local" / "bin" / "claude"
+        r = subprocess.run([str(exe) if exe.exists() else "claude", "--version"],
+                           capture_output=True, text=True, timeout=20)
+        v = _ver(r.stdout)
+    except Exception:
+        v = None
+    _CLI.update(at=time.time(), v=v)
+    return v
+
+
+def _runnable(models):
+    """`models` minus every pinned id the installed CLI is too old for. When the version cannot
+    be read, every id in MIN_CLI is dropped and the rest kept unchanged — an unknown CLI is not
+    a reason to launch on a model it may refuse."""
+    have = cli_version()
+    out = [m for m in models
+           if m not in MIN_CLI or (have is not None and have >= _ver(MIN_CLI[m]))]
+    return out or ["opus"]     # the alias every CLI resolves; a tier is never left empty
+
 
 def claude_models(role_id, default="opus"):
-    """The ordered model list for a role — tier expanded, or the literal id if not a tier."""
-    role_id = {"fixer": "numbers"}.get(role_id, role_id)
+    """The ordered model list for a role — tier expanded (or the literal id if not a tier),
+    filtered to what the installed CLI can run."""
+    role_id = ROLE_ALIASES.get(role_id, role_id)
     tier = default
     for r in ROLES:
         if r["id"] == role_id:
             tier = r.get("model") or default
             break
-    return list(CLAUDE_TIERS.get(tier, [tier]))
+    return _runnable(list(CLAUDE_TIERS.get(tier, [tier])))
+
+
+def _effort_ok(level):
+    """Whether the installed CLI takes `level` for --effort. A gated level (MIN_CLI_EFFORT) on a
+    CLI whose version cannot be read is not taken — same rule as a pinned model id."""
+    if level not in EFFORT_LEVELS:
+        return False
+    if level not in MIN_CLI_EFFORT:
+        return True
+    have = cli_version()
+    return have is not None and have >= _ver(MIN_CLI_EFFORT[level])
+
+
+def claude_effort(role_id=None, default=CLAUDE_EFFORT):
+    """The --effort level a role's (or session kind's) sessions run at: EFFORT_KINDS first, then
+    the role row's `effort`, else `default`. No role (every runner.py kind) is the default. A
+    level the installed CLI would not take comes back as EFFORT_FALLBACK (see effort_problems)."""
+    level = EFFORT_KINDS.get(role_id)
+    if level is None:
+        rid = ROLE_ALIASES.get(role_id, role_id)
+        level = next((r.get("effort") for r in ROLES if r["id"] == rid), None) or default
+    return level if _effort_ok(level) else EFFORT_FALLBACK
+
+
+def effort_label(role_id):
+    """A role's effort as the org chart shows it: its level, and any session kind of its own."""
+    kinds = [f"{k}: {claude_effort(k)}" for k in sorted(EFFORT_KINDS) if ROLE_ALIASES.get(k, k) == role_id]
+    level = claude_effort(role_id)
+    return f"{level} ({', '.join(kinds)})" if kinds else level
+
+
+def effort_problems():
+    """One line per effort the org chart asks for that the installed CLI would not take — its
+    sessions run at EFFORT_FALLBACK instead. Contract C37 reports these; empty is clean."""
+    asked = ([(r["id"], r["effort"]) for r in ROLES if r.get("effort")]
+             + sorted(EFFORT_KINDS.items()) + [("default", CLAUDE_EFFORT)])
+    out = []
+    for who, level in asked:
+        if _effort_ok(level):
+            continue
+        if level in EFFORT_LEVELS:
+            v = cli_version()
+            why = (f"needs CLI {MIN_CLI_EFFORT[level]}+, installed "
+                   f"{'.'.join(map(str, v)) if v else 'unreadable'}")
+        else:
+            why = f"not an --effort value ({', '.join(EFFORT_LEVELS)})"
+        out.append(f"{who}: effort {level!r} {why} — its sessions run at {EFFORT_FALLBACK!r}")
+    return out
 
 
 # ---------------------------------------------------------------- the crontab is the clock
@@ -1011,14 +1148,15 @@ def brief():
          "and change their instructions when the instructions are the problem._", ""]
 
     L += ["## Who ran, and how fresh their work is", "",
-          "| role | who | model | cadence (from `crontab -l`) | latest output |", "|---|---|---|---|---|"]
+          "| role | who | model · effort | cadence (from `crontab -l`) | latest output |", "|---|---|---|---|---|"]
     for r in rs:
         age = _age_str(r["last_output_age_min"])
         missing = [o["path"] for o in r["outputs"]
                    if o["state"] is not None and not o["state"].get("exists")]
         note = f" · ⚠ missing: {', '.join(Path(m).name for m in missing)}" if missing else ""
         cad = r["cadence"] if r["cadence_live"] != "NOT IN CRONTAB" else f"⚠ **NOT IN CRONTAB** · {r['cadence']}"
-        L.append(f"| **{r['name']}** | {r['who']} | `{r.get('model') or '—'}` | "
+        mdl = f"`{r['model']}` · {effort_label(r['id'])}" if r.get("model") else "`—`"
+        L.append(f"| **{r['name']}** | {r['who']} | {mdl} | "
                  f"{cad} | {age}{note} |")
     L += [""]
     drift = cron_drift()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 The VP — night sweep and prep desk for the PM. The coded stages cost ZERO Claude
-tokens; the final review stage is one Sonnet session (model from roster.py).
+tokens; the final review stage is one Opus session (model and effort from roster.py).
 
 David, 2026-08-14: "this local model at night should sweep as much as possible and
 ensure enough prep is ready for the PM. It should act as a VP now, review everything
@@ -98,11 +98,15 @@ def run(label, cmd, timeout=1800):
         # sweep rendered '| filings | **FAILED** | ... | ok  MSGS card=... |' for three nights
         # while hiding the row that actually failed (ETD, a superseded filing on an active
         # candidate). On failure, carry the first line that is NOT a pass (ask vp.py-122).
+        # `N/A` is not a failure either: asof.py prints an out-of-scope row (a 20-F filer)
+        # as N/A with ok=True, and it never moves the exit code. Without it here the stage
+        # note read 'N/A MDXH … not failing' on 09-16/17/18/22 while the row that actually
+        # failed the stage (SUPRSD GPI, an 8-K filed 2026-09-08) went unnamed.
         fail_line = ""
         if not ok:
             for ln in out:
                 t = ln.strip()
-                if t and not t.lower().startswith(("ok", "pass", "[ok")):
+                if t and not t.lower().startswith(("ok", "pass", "[ok", "n/a")):
                     fail_line = t[:200]
                     break
     except subprocess.TimeoutExpired:
@@ -135,7 +139,7 @@ def candidate_desk(n=5):
     per day considered" on the table). Picks the n candidates most worth preparing
     tonight — underwriting first, then pm_reviewed, then triage score — skipping held
     names. Prep is CODE (dossier.py: filings pulled, terms quote-verified, fincard
-    built); the Sonnet review then owes each one a VERDICT, and the PM's morning read
+    built); the Opus review then owes each one a VERDICT, and the PM's morning read
     starts from prepared evidence instead of a cold filing. Returns
     [{tk, status, why, build}] — build=False when the dossier is already fresh (<5d),
     which still counts as considered tonight."""
@@ -339,7 +343,7 @@ def brief(stages=None):
     # system exists to catch. But silence would read as "there was no review", so say it.
     L += ["", "---", "",
           "_**VP review (judgment layer) has not run against this brief.** The sixteen coded "
-          "stages above are complete; the Sonnet pass that triages them for you is separate "
+          "stages above are complete; the Opus pass that triages them for you is separate "
           "and appends below when it finishes. If you are reading this line, it has not — "
           "treat the stage output as raw and do your own triage._"]
     # ASKS, BEFORE THE TRADING DAY (David 2026-08-19: the VP should "ensure all asks are
@@ -523,7 +527,7 @@ def review(timeout=1800):
         with claudeq.slot("vp review", "vp", "review", timeout_s=wait_s):
             p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                                 "--strict-mcp-config", "--mcp-config", str(nomcp),
-                                "--model", runner.job_model("vp")],
+                                "--model", runner.job_model("vp"), "--effort", runner.job_effort("vp")],
                                cwd=str(ROOT), capture_output=True, text=True,
                                timeout=timeout, env=runner.clean_env())
         out = (p.stdout or "").strip().splitlines()
@@ -631,7 +635,7 @@ def held_events(tk, since):
 def analyst_target():
     """WHO gets tonight's analyst slot, and the stated reason — EVENT-driven, not calendar.
 
-    A held name earns the nightly Opus/Sonnet slot only when `held_events()` finds something
+    A held name earns the nightly Opus slot only when `held_events()` finds something
     that moved; among those that qualify, the one re-underwritten longest ago goes first, so
     the rotation still exists — it just no longer runs on an empty calendar. When no held
     name qualifies, the slot goes to the top of the CANDIDATE DESK (underwriting first, then
@@ -670,7 +674,7 @@ def analyst_target():
 
 
 def analyst(timeout=2400, take_slot=True):
-    """The overnight ANALYST (Sonnet): a documents-first re-underwrite of the rotation name so
+    """The overnight ANALYST (Opus): a documents-first re-underwrite of the rotation name so
     the PM judges an analyst's work instead of doing it (David, 2026-09-01 — the human split:
     the analyst re-derives, the PM decides). Instructions: prompts/analyst.md (PM-owned)."""
     if not _pm_prep_today("analyst"):
@@ -707,7 +711,7 @@ def analyst(timeout=2400, take_slot=True):
               else contextlib.nullcontext()):
             p = subprocess.run([runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
                                 "--strict-mcp-config", "--mcp-config", str(nomcp),
-                                "--model", runner.job_model("analyst")],
+                                "--model", runner.job_model("analyst"), "--effort", runner.job_effort("analyst")],
                                cwd=str(ROOT), capture_output=True, text=True, timeout=timeout, env=runner.clean_env())
         out = (p.stdout or "").strip().splitlines()
         ok2 = p.returncode == 0 and (DATA / "analyst_brief.md").exists() \

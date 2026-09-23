@@ -5,10 +5,10 @@ per ORG_PLAN.md).
 
 Four headless Claude roles, NONE of which can touch the broker (empty MCP set):
 
-  numbers  (alias: fixer) 07:05 UTC Tue-Sat, Sonnet: the accounting-forensics
+  numbers  (alias: fixer) 07:05 UTC Tue-Sat, Opus: the accounting-forensics
            engineer. Works the quality queue + its ask inbox to zero; owns the
            number pipeline per owners.py; every fix proven by a re-scan.
-  signals  07:35 UTC Tue-Sat, Sonnet: the signal-vs-noise engineer. Owns the
+  signals  07:35 UTC Tue-Sat, Opus: the signal-vs-noise engineer. Owns the
            origination/intel pipeline (scout, feeds, relevance, cannibal, bench,
            trigger RULES); its job is proving each feed is actually saying
            something rather than running silently.
@@ -247,7 +247,7 @@ def verify():
     try:   # a role the lab mode switches off cannot "miss" (lean 2026-09-20: numbers/signals/coo
         sys.path.insert(0, str(ENGINE))   # are gated, their cron lines stay — verify must not page)
         import mode as _labmode
-        _off = {r for r in FINISH if not _labmode.allows(r)}
+        _off = {r for r in set(FINISH) | ON_DEMAND if not _labmode.allows(r)}
     except ImportError:
         _off = set()
     for role, (pats, h, m, days) in FINISH.items():
@@ -279,6 +279,13 @@ def verify():
             healed.append(f"{role} re-filed ({r.get('msg', '?')[:70]})")
             misses.remove(msg)
     # ON-DEMAND roles (no cron line): file a run when asks are waiting for them, once a day.
+    # A FILING, not a relaunch — nothing missed — so it never rides the 'missed its run'
+    # page, and a role the lab mode switches off is not filed at all (said in this log, not
+    # paged). Both used to happen: launch() refused ({'ok': False, 'skipped': True}) and the
+    # refusal still went out as a CRITICAL 'self-heal relaunched' page every morning (09-21,
+    # 09-22: 'build … filed: lab mode lean: ops build does not run'), and a real on-demand
+    # filing was paged the same way.
+    filed = []
     for role in sorted(ON_DEMAND):
         marker = DATA / f"verify_ondemand_{role}_{_dt.date.today().isoformat()}"
         if marker.exists():
@@ -289,14 +296,24 @@ def verify():
             waiting = [a for a in asks.load()["asks"] if a.get("status") == "open" and a.get("to") == role]
         except Exception:
             waiting = []
-        if waiting:
+        if waiting and role in _off:
+            print(f"on-demand {role}: {len(waiting)} ask(s) waiting, but the lab mode keeps it off "
+                  f"(mode.py) — not filed; a COO grant (ops.py {role} --by coo) is the way in")
+        elif waiting:
             marker.write_text(f"{len(waiting)} open ask(s)")
             r = launch(role)
-            healed.append(f"{role} (on demand, {len(waiting)} ask(s) waiting) filed: {r.get('msg', '?')[:60]}")
+            line = f"{role} (on demand, {len(waiting)} ask(s) waiting): {r.get('msg', '?')[:60]}"
+            if r.get("ok"):
+                filed.append(line)
+            else:
+                print(f"on-demand not filed — {line}")
     if healed:
         subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
                         "Ops role missed its run — self-heal relaunched",
                         ("; ".join(healed))[:190]], check=False)
+    if filed:   # default-tiered (digest): routine work, held for the daily rollup
+        subprocess.run([os.path.expanduser("~/maintenance/bin/notify.sh"), "stocks",
+                        "Ops on-demand role filed", ("; ".join(filed))[:190]], check=False)
     if misses:
         try:
             sys.path.insert(0, str(HERE))
@@ -412,11 +429,11 @@ def launch(role, now=False, by=None):
         return {"ok": False, "msg": f"prompt did not render: {type(e).__name__}: {e}"}
     cmd = [runner.CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions",
            "--strict-mcp-config", "--mcp-config", str(NO_MCP),
-           # Each role's model comes from the org chart (roster.py), not from here.
-           # numbers/signals=sonnet, coo/hunt=opus (David 2026-08-18: "Fixer should go down
-           # to sonnet"; PROJECT_STANDARDS §2 per-job sign-off). The COO and hunt stay on
-           # Opus because their whole value is catching what the cheaper roles got wrong.
-           "--model", runner.job_model(role)]
+           # Each role's model AND effort come from the org chart (roster.py), not from here:
+           # since 2026-09-22 every ops role is Opus 5.5 at `high` (David: "move all auto
+           # claude jobs to opus 5.5 ... everything else at high effort"). Sonnet, which
+           # numbers/signals ran on from 2026-08-18, was retired 2026-09-20.
+           "--model", runner.job_model(role), "--effort", runner.job_effort(role)]
     logp = LOGS / f"ops_{role}.log"
     log = open(logp, "w")
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log,

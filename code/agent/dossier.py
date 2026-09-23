@@ -178,16 +178,23 @@ def resolve_exhibit_filing(rec, ref):
 # EXHIBIT fetches are both skipped (primary filings already fetched stay; nothing
 # already on disk is discarded) and every skip is recorded on its own row so a partial
 # dossier says exactly what it does and doesn't have, same as refresh_cards.py's stub.
+# Since CRON-6 (2026-09-22) the tail doesn't START past the budget either and every
+# download is cut at it, so the margin only has to cover whatever is in flight when it trips
+# (fincard.build(), whose own fetch this module can't bound, or one terms call).
 BUDGET_S = 650
 
 
-def list_exhibits(cik, acc, type_re=EXHIBIT_TYPE_RE):
+def list_exhibits(cik, acc, type_re=EXHIBIT_TYPE_RE, strict=False):
     """Exhibits matching type_re in a filing's index page: [(type, document_filename), ...].
-    Default EXHIBIT_TYPE_RE (EX-99.x); pass EX10_TYPE_RE for a debt-exhibit lookup."""
+    Default EXHIBIT_TYPE_RE (EX-99.x); pass EX10_TYPE_RE for a debt-exhibit lookup.
+    strict=True raises on a failed index fetch instead of returning [] — build() records the
+    listing on the manifest and trusts it next run, so "fetch failed" must not read as "none"."""
     url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{acc}-index.htm"
     try:
         idx = get(url)
     except Exception:
+        if strict:
+            raise
         return []
     out = []
     for row in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", idx):
@@ -206,6 +213,38 @@ FACT_TAGS = {
     "equity": ["StockholdersEquity"],
     "shares": ["CommonStockSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingBasic"],
 }
+# a duration fact counts as a year only at 350-380 days and as a quarter only at 80-100
+# (52/53-week years and 13/14-week quarters included). SEC stamps every fact with its
+# FILING's fp/form, so a 10-K's Q4-only column is also fp=FY/10-K and a 10-Q's year-to-date
+# column shares the quarter's fp — keyed on (end, fp) alone, whichever came last overwrote
+# the other (the same defect research/evidence.py carried: RDI FY2020 revenue 15.0M against
+# a real 77.9M, brokera-3 2026-09-22). Instant facts (cash, debt, equity, shares outstanding)
+# carry no start and pass as before.
+FY_DAYS = (350, 380)
+Q_DAYS = (80, 100)
+
+
+def _tidy_series(vals):
+    """One tag's companyfacts rows -> facts.json rows: a 10-K duration row only when it spans
+    a full year, a 10-Q duration row only when it spans one quarter, deduped on
+    (start, end, fp) so no period overwrites another that shares its end date."""
+    seen = {}
+    for v in vals:
+        if v.get("form") not in ("10-K", "10-Q") or not v.get("end"):
+            continue
+        if v.get("start"):
+            try:
+                days = (dt.date.fromisoformat(v["end"]) - dt.date.fromisoformat(v["start"])).days
+            except ValueError:
+                continue
+            lo, hi = FY_DAYS if v["form"] == "10-K" else Q_DAYS
+            if not lo <= days <= hi:
+                continue
+        seen[(v.get("start"), v["end"], v.get("fp", ""))] = {
+            "start": v.get("start"), "end": v["end"], "val": v["val"], "fp": v.get("fp")}
+    return sorted(seen.values(), key=lambda x: x["end"])
+
+
 # keyword families that locate term-bearing passages (code finds, model reads)
 TERM_KEYWORDS = ["redemption", "redeem", "redeemable", "conversion", "convert",
                  "exchange ratio", "liquidation preference", "change of control",
@@ -227,12 +266,31 @@ STOP = set("the a an and or of to in for on by with as at from that this is are 
            "has have had its it their which will shall may any all such per share shares company".split())
 
 
-def get(url):
+def get(url, deadline=None):
+    """`deadline` (an absolute time.time()) bounds the WHOLE download. urlopen's timeout=45 is
+    per socket read, so a slow trickle never trips it: on 2026-09-22 ARI's build was killed by
+    vp.py's 900s cap mid-companyfacts, a download no budget check could stop (CRON-6)."""
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=45) as r:
-        data = r.read()
+        if deadline is None:
+            data = r.read()
+        else:
+            chunks = []
+            while chunk := r.read(1 << 16):
+                if time.time() > deadline:
+                    raise TimeoutError(f"download passed the build's wall-clock budget ({url})")
+                chunks.append(chunk)
+            data = b"".join(chunks)
     time.sleep(0.15)  # EDGAR politeness
     return data.decode("utf-8", errors="replace")
+
+
+def _write_atomic(p, txt):
+    """Temp file + rename: a later build trusts a stored filing (and the next run's merge
+    trusts terms.json), so a SIGKILL mid-write must never leave a half-written one behind."""
+    tmp = p.with_name(p.name + ".part")
+    tmp.write_text(txt, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def strip_html(raw):
@@ -341,55 +399,108 @@ def build(tk, cik_override=None):
         if form in counts and counts[form] < FORM_COUNTS[form] and doc:
             counts[form] += 1
             picked.append({"form": form, "date": date, "acc": acc, "doc": doc})
+
+    # STORED FILINGS ARE REUSED, NOT RE-DOWNLOADED (STAFF-4, review 2026-09-22): a document
+    # at an accession never changes once filed, yet every build re-fetched every primary doc
+    # and every EX-99 — ~9 minutes of pure download on ARI 09-22 before a single term was
+    # read, and the bulk of why all 7 held-name dossiers tripped the budget that night. A file is reused
+    # when the LAST manifest recorded it for the SAME accession and it still has the recorded
+    # length; a same-day same-form name collision or a half-written file fails that check and
+    # is fetched fresh. New files are written atomically, so a kill never leaves one to trust.
+    prior_rows = {(r.get("acc"), r.get("file")): r
+                  for r in _j(d / "manifest.json", {}).get("filings") or [] if r.get("file")}
+
+    def stored(acc, name):
+        """(text, the prior manifest row) for an intact stored copy of acc's `name`, else None."""
+        r, p = prior_rows.get((acc, f"filings/{name}")), d / "filings" / name
+        if not r or not p.exists():
+            return None
+        try:
+            txt = p.read_bytes().decode("utf-8", errors="replace")  # no newline translation
+        except Exception:
+            return None
+        return (txt, r) if len(txt) == r.get("chars") else None
+
     extra = []
     budget_tripped = False
-    for i, f in enumerate(picked):
-        if time.time() - t0 > BUDGET_S:
-            budget_tripped = True
-            for rest in picked[i:]:
-                rest["skipped"] = f"BUDGET ({BUDGET_S}s) tripped before this filing was fetched (dossier.py-153)"
-            break
+    for f in picked:
         form_clean = f["form"].replace(" ", "").replace("/", "")
-        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
-        try:
-            txt = strip_html(get(url))
-        except Exception as e:
-            f["error"] = str(e)[:80]
-            continue
-        if len(txt) > 3_000_000:
-            txt, f["truncated"] = txt[:3_000_000], True
         name = f"{f['date']}_{form_clean}.txt"
-        (d / "filings" / name).write_text(txt)
-        f["file"], f["chars"] = f"filings/{name}", len(txt)
+        have = stored(f["acc"], name)
+        if have:
+            txt = have[0]
+            f["file"], f["chars"] = f"filings/{name}", len(txt)
+            if have[1].get("truncated"):
+                f["truncated"] = True
+        else:
+            # a stored filing costs no network, so it is reused even after the budget trips;
+            # only a FETCH is refused past it
+            if budget_tripped or time.time() - t0 > BUDGET_S:
+                budget_tripped = True
+                f["skipped"] = f"BUDGET ({BUDGET_S}s) tripped before this filing was fetched (dossier.py-153)"
+                continue
+            url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
+            try:
+                txt = strip_html(get(url, deadline=t0 + BUDGET_S))
+            except Exception as e:
+                f["error"] = str(e)[:80]
+                continue
+            if len(txt) > 3_000_000:
+                txt, f["truncated"] = txt[:3_000_000], True
+            _write_atomic(d / "filings" / name, txt)
+            f["file"], f["chars"] = f"filings/{name}", len(txt)
 
         if f["form"] not in EXHIBIT_FORMS and f["form"] not in ("10-K", "10-Q"):
             continue
-        if budget_tripped or time.time() - t0 > BUDGET_S:
-            budget_tripped = True
-            f["exhibits_skipped"] = f"BUDGET ({BUDGET_S}s) tripped before exhibits were enumerated (dossier.py-153)"
-            continue
 
         if f["form"] in EXHIBIT_FORMS:
-            for ex_type, ex_doc in list_exhibits(cik, f["acc"]):
-                if ex_doc == f["doc"]:
-                    continue  # already fetched as the primary document
-                ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{ex_doc}"
-                ex = {"form": f["form"], "date": f["date"], "acc": f["acc"], "doc": ex_doc, "exhibit": ex_type}
+            # this accession's EX-99 listing, as the last build recorded it (exhibit_docs):
+            # when every listed exhibit is still stored intact, no index fetch and no download
+            listed = have[1].get("exhibit_docs") if have else None
+            if listed is None or not all(stored(f["acc"], f"{f['date']}_{form_clean}_{t.replace(' ', '')}.txt")
+                                         for t, _ in listed):
+                if budget_tripped or time.time() - t0 > BUDGET_S:
+                    budget_tripped = True
+                    f["exhibits_skipped"] = (f"BUDGET ({BUDGET_S}s) tripped before exhibits were "
+                                             "enumerated (dossier.py-153)")
+                    continue
                 try:
-                    ex_txt = strip_html(get(ex_url))
+                    listed = [[ex_type, ex_doc] for ex_type, ex_doc in list_exhibits(cik, f["acc"], strict=True)
+                              if ex_doc != f["doc"]]  # the primary document is already fetched
+                except Exception as e:
+                    f["exhibits_error"] = str(e)[:80]
+                    continue
+            f["exhibit_docs"] = listed
+            for ex_type, ex_doc in listed:
+                ex_name = f"{f['date']}_{form_clean}_{ex_type.replace(' ', '')}.txt"
+                ex = {"form": f["form"], "date": f["date"], "acc": f["acc"], "doc": ex_doc, "exhibit": ex_type}
+                have_ex = stored(f["acc"], ex_name)
+                if have_ex:
+                    ex["file"], ex["chars"] = f"filings/{ex_name}", len(have_ex[0])
+                    if have_ex[1].get("truncated"):
+                        ex["truncated"] = True
+                    extra.append(ex)
+                    continue
+                if time.time() - t0 > BUDGET_S:
+                    budget_tripped = True
+                    break
+                ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{ex_doc}"
+                try:
+                    ex_txt = strip_html(get(ex_url, deadline=t0 + BUDGET_S))
                 except Exception as e:
                     ex["error"] = str(e)[:80]
                     extra.append(ex)
                     continue
                 if len(ex_txt) > 3_000_000:
                     ex_txt, ex["truncated"] = ex_txt[:3_000_000], True
-                ex_name = f"{f['date']}_{form_clean}_{ex_type.replace(' ', '')}.txt"
-                (d / "filings" / ex_name).write_text(ex_txt)
+                _write_atomic(d / "filings" / ex_name, ex_txt)
                 ex["file"], ex["chars"] = f"filings/{ex_name}", len(ex_txt)
                 extra.append(ex)
-                if time.time() - t0 > BUDGET_S:
-                    budget_tripped = True
-                    break
+            continue
+
+        if budget_tripped or time.time() - t0 > BUDGET_S:
+            budget_tripped = True
+            f["exhibits_skipped"] = f"BUDGET ({BUDGET_S}s) tripped before exhibits were enumerated (dossier.py-153)"
             continue
 
         # dossier.py-200: this 10-K/10-Q's own Exhibit Index may name a debt-note exhibit
@@ -425,14 +536,14 @@ def build(tk, cik_override=None):
                 continue
             ex_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{ex_acc.replace('-', '')}/{found}"
             try:
-                ex_txt = strip_html(get(ex_url))
+                ex_txt = strip_html(get(ex_url, deadline=t0 + BUDGET_S))
             except Exception as e:
                 ex["error"] = str(e)[:80]
                 extra.append(ex)
                 continue
             if len(ex_txt) > 3_000_000:
                 ex_txt, ex["truncated"] = ex_txt[:3_000_000], True
-            (d / "filings" / ex_name).write_text(ex_txt)
+            _write_atomic(d / "filings" / ex_name, ex_txt)
             ex["doc"], ex["file"], ex["chars"] = found, f"filings/{ex_name}", len(ex_txt)
             extra.append(ex)
             if time.time() - t0 > BUDGET_S:
@@ -440,60 +551,72 @@ def build(tk, cik_override=None):
                 break
     picked.extend(extra)
 
+    # THE TAIL IS BUDGETED TOO (CRON-6, review 2026-09-22): companyfacts, fincard.build()
+    # (its own companyfacts download) and fincheck (a thinking model call) ran unconditionally
+    # after the budget. On 09-22 ARI's filings loop ended 04:45 and vp.py's 900s kill landed
+    # ~6 minutes later inside this tail, so facts.json, terms.json and the manifest were never
+    # written — ARI's 6th such kill since 09-04. None of them STARTS past the budget now, the
+    # companyfacts download is cut at it, and a stage that doesn't run leaves the last build's
+    # file in place, named on the manifest's stages_skipped. A skipped fincard is NOT rebuilt
+    # elsewhere the same night: refresh_cards.py reaches it in its oldest-first turn, which on the
+    # slow link (2-3 cards a night since ~09-03) can be several nights away.
+    stages_skipped = []
     facts = {}
-    try:
-        gaap = json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")) \
-            .get("facts", {}).get("us-gaap", {})
-        for concept, tags in FACT_TAGS.items():
-            for tag in tags:
-                units = gaap.get(tag, {}).get("units", {})
-                vals = [v for v in (units.get("USD") or units.get("shares") or [])
-                        if v.get("form") in ("10-K", "10-Q") and v.get("end")]
-                if vals:
-                    seen = {(v["end"], v.get("fp", "")): {"end": v["end"], "val": v["val"], "fp": v.get("fp")}
-                            for v in vals}
-                    facts[concept] = {"tag": tag,
-                                      "series": sorted(seen.values(), key=lambda x: x["end"])[-16:]}
-                    break
-    except Exception as e:
-        facts["_error"] = str(e)[:100]
-    (d / "facts.json").write_text(json.dumps(facts, indent=1))
+    if budget_tripped or time.time() - t0 > BUDGET_S:
+        budget_tripped = True
+        stages_skipped.append(f"companyfacts: BUDGET ({BUDGET_S}s) tripped first — facts.json is the last build's")
+    else:
+        try:
+            gaap = json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                                  deadline=t0 + BUDGET_S)).get("facts", {}).get("us-gaap", {})
+            for concept, tags in FACT_TAGS.items():
+                # the tag that runs LATEST wins, list order breaks ties — a dead first tag
+                # (HALO 'Revenues' ends 2020) used to win (same fix as research/evidence.py)
+                best = None
+                for tag in tags:
+                    units = gaap.get(tag, {}).get("units", {})
+                    series = _tidy_series(units.get("USD") or units.get("shares") or [])
+                    if series and (best is None or series[-1]["end"] > best[1][-1]["end"]):
+                        best = (tag, series)
+                if best:
+                    facts[concept] = {"tag": best[0], "series": best[1][-16:]}
+        except Exception as e:
+            facts["_error"] = str(e)[:100]
+        if "_error" in facts and (d / "facts.json").exists():
+            # a cut-off download must not replace a good series with an error stub
+            stages_skipped.append(f"companyfacts: {facts['_error']} — facts.json is the last build's")
+        else:
+            (d / "facts.json").write_text(json.dumps(facts, indent=1))
 
     # codified digits-by-date (David 2026-08-12): every number the PM uses comes from
     # code with tag+period+formula attached — never from a model's working memory
-    try:
-        sys.path.insert(0, str(HERE.parent / "valuation"))
-        import fincard
-        card = fincard.build(tk, cik)
-        (d / "fincard.json").write_text(json.dumps(card, indent=1))
-        fincheck(d, card)
-    except Exception as e:
-        print(f"(fincard skipped: {str(e)[:80]})")
-
-    terms = extract_terms(d, title, deadline=t0 + BUDGET_S)
-    budget_tripped = budget_tripped or bool(terms.get("budget_skipped"))
-    if terms.get("budget_skipped"):
-        # MERGE, don't overwrite (dossier.py-153): extract_terms() only re-examines
-        # docs it had budget for — a budget-tripped run's "terms" list is a fresh look
-        # at 1-2 docs, not a full pass. Live-tested on ARI: two consecutive
-        # budget-tripped runs landed on DIFFERENT single docs (one on the 10-Q, 23
-        # terms; the next on an 8-K exhibit that failed to parse, 0 terms) — writing
-        # THAT list straight to terms.json would have ERASED the prior run's 23 terms
-        # the moment a night got unlucky, turning a coverage gap into active data
-        # loss. Keep the OLD entry for any doc this run never got to (budget_skipped,
-        # and still present in filings/); this run's terms — including an empty
-        # result — replace the old entry for whichever doc(s) it DID re-examine,
-        # since a fresh look supersedes a stale one either way.
+    if budget_tripped or time.time() - t0 > BUDGET_S:
+        budget_tripped = True
+        stages_skipped.append(f"fincard + fincheck: BUDGET ({BUDGET_S}s) — fincard.json is the last build's")
+    else:
         try:
-            old = json.loads((d / "terms.json").read_text())
-        except Exception:
-            old = {}
-        skipped, on_disk = set(terms["budget_skipped"]), {p.name for p in (d / "filings").glob("*.txt")}
-        carried = [t for t in old.get("terms", []) if t.get("doc") in skipped and t.get("doc") in on_disk]
-        if carried:
-            terms["terms"] = carried + terms["terms"]
-            terms["carried_from_prior_run"] = sorted({t["doc"] for t in carried})
-    (d / "terms.json").write_text(json.dumps(terms, indent=1))
+            sys.path.insert(0, str(HERE.parent / "valuation"))
+            import fincard
+            card = fincard.build(tk, cik)
+            (d / "fincard.json").write_text(json.dumps(card, indent=1))
+            if time.time() - t0 > BUDGET_S:
+                budget_tripped = True
+                stages_skipped.append(f"fincheck: BUDGET ({BUDGET_S}s) tripped during fincard.build()")
+            else:
+                fincheck(d, card)
+        except Exception as e:
+            print(f"(fincard skipped: {str(e)[:80]})")
+
+    # MERGE, don't overwrite (dossier.py-153): extract_terms() only re-examines docs it had
+    # budget for, and a budget-tripped run's fresh look at 1-2 docs must not ERASE the prior
+    # run's terms for the rest. The previous terms.json is read HERE, before extract_terms'
+    # first per-doc write replaces it, and handed in as `prior` so every write — incremental
+    # and final — is "prior terms for docs not re-read + this run's terms". Reading it back
+    # after the loop (as this did until STAFF-3, review 2026-09-22) read the loop's OWN
+    # partial output, so nothing was ever carried: ARI fell 17 -> 5 -> 4 terms 09-15..09-18.
+    terms = extract_terms(d, title, deadline=t0 + BUDGET_S, prior=_j(d / "terms.json", {}))
+    budget_tripped = budget_tripped or bool(terms.get("budget_skipped"))
+    _write_atomic(d / "terms.json", json.dumps(terms, indent=1))
     (d / "manifest.json").write_text(json.dumps(
         {"ticker": tk, "cik": cik, "resolved_via": via, "title": title,
          "built": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -502,11 +625,15 @@ def build(tk, cik_override=None):
          # BUDGET (dossier.py-153): visible on the manifest, not just buried per-filing
          # skip notes — a partial dossier must say so where the VP brief/contract
          # checks already look, not require grepping 14 filing rows to notice.
-         "budget_tripped": budget_tripped, "build_seconds": round(time.time() - t0)},
+         "budget_tripped": budget_tripped, "build_seconds": round(time.time() - t0),
+         "stages_skipped": stages_skipped, "extract_failed": terms.get("extract_failed", [])},
         indent=1))
+    failed = terms.get("extract_failed") or []
     print(f"dossier {tk}: {len([f for f in picked if f.get('file')])} filings · "
           f"{len(facts)} fact series · {len(terms.get('terms', []))} terms "
           f"({sum(1 for t in terms.get('terms', []) if t.get('verified'))} quote-verified)"
+          + (f" · EXTRACTION FAILED on {len(failed)} doc(s), prior terms kept, retried next run: "
+             f"{', '.join(failed)}" if failed else "")
           + (f" · BUDGET TRIPPED at {BUDGET_S}s (dossier.py-153) — partial" if budget_tripped else ""))
     return d
 
@@ -675,11 +802,11 @@ def keyword_windows(txt, keywords, width=1200, cap=4, total_cap=14000, per_group
     return out
 
 
-def extract_terms(d, title, deadline=None):
+def extract_terms(d, title, deadline=None, prior=None):
     """Local model extracts security/contract terms from keyword-located passages.
     Every extraction must carry a verbatim quote; code verifies the quote exists.
 
-    BUDGET (dossier.py-153): this is ONE ask_json call per filing on disk, each
+    BUDGET (dossier.py-153): this is ONE ask_json call per filing on disk, most
     think=True (extended reasoning — slower per call by design) and up to 36,000
     chars of excerpt for a deal doc. Found live testing this fix (2026-09-08): this
     loop, not the exhibit-fetch loop above, is ARI's real bottleneck — a single
@@ -699,9 +826,41 @@ def extract_terms(d, title, deadline=None):
     every term this run had already extracted, not just the in-flight doc's — the
     ARI sweep that motivated this ask reported "14 filings, 0 terms" despite several
     calls plausibly having completed first. Writing `d/"terms.json"` after every doc
-    means a kill now loses only whatever was in flight at the moment it landed."""
+    means a kill now loses only whatever was in flight at the moment it landed.
+
+    PRIOR TERMS SURVIVE A PARTIAL RUN (STAFF-3, review 2026-09-22): `prior` is the
+    terms.json this run started from. Every write — per doc and the returned dict — is
+    prior's terms for each doc this run has NOT successfully re-read (not reached yet,
+    budget_skipped, or extract_failed; and still in filings/) plus this run's terms. A doc
+    that was re-read — including one with no keyword windows or an honest empty list —
+    supersedes its prior entry, since a fresh look beats a stale one.
+
+    AN EMPTY REPLY IS A FAILURE, NOT "NO TERMS" (STAFF-2): ask_json returns {} when the
+    reply didn't parse, and with thinking on that is almost always the model spending its
+    whole output cap reasoning and never answering — 34 of 274 'dossier terms' calls
+    09-08..09-22, each an empty reply at exactly the cap, ARI's DEFM14A 4 times of 4. Its
+    terms were never extracted while the doc read as "examined, none found". Now: a deal
+    doc (long excerpt, the most important read) is asked WITHOUT thinking — the setting
+    every term on file came from before 09-07; any other doc whose thinking call comes back
+    empty is asked once more without it (think_fallback); a doc that still has no parseable
+    {"terms": [...]} lands on extract_failed, keeps its prior terms, and is retried next run."""
     out = {"extracted_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-           "model": f"{DEFAULT_MODEL} (local)", "terms": [], "budget_skipped": []}
+           "model": f"{DEFAULT_MODEL} (local)", "terms": [], "budget_skipped": [],
+           "extract_failed": [], "think_fallback": []}
+    docs = sorted((d / "filings").glob("*.txt"), reverse=True)
+    on_disk, reread = {p.name for p in docs}, set()
+    prior_terms = [t for t in (prior or {}).get("terms") or [] if isinstance(t, dict)]
+
+    def merged():
+        carried = [t for t in prior_terms if t.get("doc") in on_disk and t.get("doc") not in reread]
+        res = dict(out, terms=carried + out["terms"])
+        if carried:
+            res["carried_from_prior_run"] = sorted({t["doc"] for t in carried})
+        return res
+
+    def answered(v):
+        return isinstance(v, dict) and "terms" in v
+
     # NEWEST FIRST (dossier.py-153): filenames are "YYYY-MM-DD_FORM[...].txt", so a
     # plain sorted() processes the OLDEST filing first — exactly backwards under a
     # tight budget. Live-tested on ARI: budget allowed exactly 1 of 14 filings before
@@ -710,7 +869,7 @@ def extract_terms(d, title, deadline=None):
     # subsequent-events redemption/dividend terms this dossier most needs current
     # (fincard.py-162, same night). A budget-constrained run should capture what's
     # NEW, not what's alphabetically/chronologically first.
-    for doc in sorted((d / "filings").glob("*.txt"), reverse=True):
+    for doc in docs:
         if deadline is not None and time.time() > deadline:
             out["budget_skipped"].append(doc.name)
             continue
@@ -726,6 +885,7 @@ def extract_terms(d, title, deadline=None):
         else:
             wins = keyword_windows(txt, TERM_KEYWORDS)
         if not wins:
+            reread.add(doc.name)  # looked at, nothing term-bearing: supersedes any prior entry
             continue
         excerpt = "\n\n[---]\n\n".join(wins)
         deal_ask = (
@@ -736,7 +896,7 @@ def extract_terms(d, title, deadline=None):
             "how broker non-votes/abstentions are treated (type \"vote_threshold\"), and "
             "Liquidating Trust interest transferability (type \"trust_transferability\")."
         ) if is_deal_doc else ""
-        v = ask_json(
+        prompt = (
             f"These are excerpts from an SEC filing ({doc.name}) for {title}. Extract every "
             "explicit SECURITY or DEAL TERM present: redemption (optional/mandatory, dates, "
             "prices), conversion/exchange ratios, dividend rate & cumulative status, liquidation "
@@ -745,22 +905,32 @@ def extract_terms(d, title, deadline=None):
             " Return JSON {\"terms\":[{\"type\":\"...\",\"detail\":\"<one "
             "precise clause with numbers/dates>\",\"quote\":\"<supporting sentence copied "
             "CHARACTER-FOR-CHARACTER from the excerpt, max 40 words>\"}]}. Only terms explicitly "
-            "in the text — omit anything you cannot quote. Empty list if none.\n\n" + excerpt,
-            num_predict=3000 if is_deal_doc else 2200, think=True, job="dossier terms")
-        ntxt = norm(txt)
-        for t in (v.get("terms") or []) if isinstance(v, dict) else []:
-            q = str(t.get("quote", ""))
-            t["doc"] = doc.name
-            t["verified"] = bool(q) and norm(q) in ntxt
-            out["terms"].append(t)
-        # incremental write (dossier.py-202): survives an external SIGKILL mid-loop.
-        # build() overwrites this with the fully merged version once extract_terms
-        # returns normally, so a clean run's terms.json is unaffected.
+            "in the text — omit anything you cannot quote. Empty list if none.\n\n" + excerpt)
+        v = ask_json(prompt, num_predict=3000 if is_deal_doc else 2200, think=not is_deal_doc,
+                     job="dossier terms")
+        if not answered(v) and not is_deal_doc and (deadline is None or time.time() <= deadline):
+            out["think_fallback"].append(doc.name)
+            v = ask_json(prompt, num_predict=2200, think=False, job="dossier terms")
+        if not answered(v):
+            out["extract_failed"].append(doc.name)
+        else:
+            reread.add(doc.name)
+            ntxt = norm(txt)
+            for t in v["terms"] if isinstance(v["terms"], list) else []:
+                if not isinstance(t, dict):
+                    continue
+                q = str(t.get("quote", ""))
+                t["doc"] = doc.name
+                t["verified"] = bool(q) and norm(q) in ntxt
+                out["terms"].append(t)
+        # incremental write (dossier.py-202): survives an external SIGKILL mid-loop, and
+        # carries prior terms for every doc not yet re-read (STAFF-3) so a kill can't shrink
+        # the file either. build() writes the final merged version once this returns.
         try:
-            (d / "terms.json").write_text(json.dumps(out, indent=1))
+            _write_atomic(d / "terms.json", json.dumps(merged(), indent=1))
         except Exception:
             pass
-    return out
+    return merged()
 
 
 # ---------------- audit ----------------
