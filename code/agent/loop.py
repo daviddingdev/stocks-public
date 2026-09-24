@@ -702,9 +702,14 @@ def reconcile():
         if cv:
             try:
                 import notify as _n
+                # Same routing as the nightly check (contract.push_kind): a MONEY_BOOK violation
+                # pages as blocking; anything else (a stale card, a null bear) goes to the evening
+                # digest. Every violation used to page after every session: 09-23 paged a stale
+                # watch card and a false C7 at 14:55Z.
+                lines = sorted(cv, key=lambda x: (x.split() or [""])[0] not in contract.MONEY_BOOK)
                 _n.push("Stocks · agent CONTRACT",
-                        "Agent desk contract violations:\n" + "\n".join(cv[:10]),
-                        tier="actionable", kind="blocking")  # money-book invariants; default-tiered digest, held (08-31)
+                        "Agent desk contract violations:\n" + "\n".join(lines[:10]),
+                        tier="actionable", kind=contract.push_kind(cv))
             except Exception:
                 pass
         print(f"{now} contract: {len(cv)} violation(s)" + (" — " + "; ".join(cv[:4]) if cv else ""))
