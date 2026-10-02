@@ -37,13 +37,14 @@ flowchart TB
   R["roster<br/><small>org chart as DATA — what ran, how fresh</small>"]:::d
   PM["the PM session<br/><small>reads the desk, decides, writes the memo</small>"]:::ai
   T["trigger engine<br/><small>every few minutes, market hours</small>"]:::c
+  GW["execution gateway<br/><small>the only code path that can place an order</small>"]:::g
   REC["reconcile vs broker"]:::g
   PH["phone"]:::o
 
   SC --> BN
   SC --> VP
   BN --> VP
-  VP --> AN --> NW --> R --> PM --> REC
+  VP --> AN --> NW --> R --> PM --> GW --> REC
   T --> PH
   PM --> PH
   REC -->|"unresolved → alarm"| PH
