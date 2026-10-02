@@ -45,6 +45,7 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from edgar_identity import UA  # SEC contact identity, config-driven
+import secdoor  # the box's one SEC door, with _get's own fetch as fallback
 SEC = "https://www.sec.gov"
 DATA = "https://data.sec.gov"
 STD_NS = {"us-gaap", "dei", "srt", "xbrldi", "xhtml", "ecd", "ffd", "invest",
@@ -90,6 +91,16 @@ def contexts(raw):
 
 
 def _get(url, timeout=120):
+    # SEC through the box's one SEC door first (secdoor.py); the urlopen line is the unchanged
+    # fallback when the desk can't answer.
+    try:
+        body = secdoor.fetch(url, timeout=timeout)
+    except secdoor.Unavailable:
+        pass
+    else:
+        if body is None:
+            raise secdoor.absent(url)
+        return body
     return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout).read()
 
 

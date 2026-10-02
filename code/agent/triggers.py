@@ -58,6 +58,9 @@ sys.path.insert(0, str(HERE))
 import feeds  # noqa: E402  (fh_get, cik_map, UA, universe)
 import loop   # noqa: E402
 import learn  # noqa: E402  (kpi_breaches: reads data/kpis.json sources, judges hit/miss)
+if str(ENGINE) not in sys.path:
+    sys.path.append(str(ENGINE))
+import follow  # noqa: E402  (names David stopped following — rules 1b and 9 skip them)
 
 STATE_F = DATA / "trigger_state.json"
 ALERTS_F = DATA / "alerts.json"
@@ -173,6 +176,34 @@ def today_distribution(c, tk):
     return sum(a.get("amount_per_share") or 0 for a in corp_actions(c, tk) if a.get("ex_date") == today_s)
 
 
+def priced_follow_names(root=None):
+    """(tk, verdict, buy_below, overall) for every research folder whose lenses.json says Buy
+    below / Follow with a buy_below — rule 9's list. A name David stopped following is skipped
+    (follow.py, 2026-09-27: "don't need to update things i don't care about"): its verdict
+    stays on disk, its push does not fire. Its price_levels entry is parked by follow.stop(),
+    and level_plans() skips it, so rule 1b stays silent too."""
+    out, stop = [], follow.stopped(CONF)
+    for lf in sorted(Path(root or ENGINE.parent).glob("*/analysis/lenses.json")):
+        ov = (_j(lf, {}) or {}).get("overall") or {}
+        verdict, buy_below = ov.get("verdict"), ov.get("buy_below")
+        if verdict not in ("Buy below", "Follow") or not buy_below:
+            continue
+        tk = lf.parent.parent.name.rsplit("-", 1)[-1].upper()
+        if tk not in stop:
+            out.append((tk, verdict, buy_below, ov))
+    return out
+
+
+def level_plans(c):
+    """Rule 1b's list: triggers.json price_levels minus the names David stopped following.
+    follow.stop() parks a name's level, but an update session already running at the stop (or a
+    forced one) can write a fresh price_levels entry afterwards — without this check that level
+    would push for a name he stopped (review 2026-09-27)."""
+    stop = follow.stopped(CONF)
+    return {tk: lv for tk, lv in (c.get("price_levels") or {}).items()
+            if isinstance(lv, dict) and str(tk).upper() not in stop}
+
+
 def held_symbols():
     brokera = [t for t, m in _j(CONF / "positions.json", {}).items() if (m.get("shares") or 0) > 0]
     agent = [p.get("symbol") for p in _j(DATA / "portfolio.json", {}).get("positions", []) if p.get("symbol")]
@@ -216,6 +247,22 @@ def push(topic, title, msg, nkind=None):
     _n.push(title, msg, channel="stocks", tier="actionable", kind=nkind)
 
 
+# winddown (mode.py, David 2026-09-29): the book only exits, so a PM session is worth launching
+# only for an event that can move an exit. The underwriting reminders (re-underwrite,
+# thesis-vs-price, buy-below, concentration, price level) still ALERT; they stop launching.
+WINDDOWN_ACTION_KINDS = frozenset({"filing", "price move", "kpi breach", "earnings", "13D stake",
+                                   "order guard", "drawdown"})
+
+
+def _lab_mode():
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _labmode
+        return _labmode.lab()
+    except Exception:
+        return "build"
+
+
 def alert(state, c, key, kind, symbol, msg, action=False, book=""):
     """Dedup by key (per day); record, push, and optionally launch a decision session.
     Held-names-only policy (David, 2026-07-30): every alert names the BOOK it hits
@@ -225,6 +272,8 @@ def alert(state, c, key, kind, symbol, msg, action=False, book=""):
     if seen.get(key) == today:
         return False
     seen[key] = today
+    if action and kind not in WINDDOWN_ACTION_KINDS and _lab_mode() == "winddown":
+        action = False   # recorded and pushed as an alert; no session (see WINDDOWN_ACTION_KINDS)
     alerts = _j(ALERTS_F, [])
     alerts.append({"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                    "kind": kind, "symbol": symbol, "msg": msg, "action": bool(action), "book": book})
@@ -239,7 +288,7 @@ def alert(state, c, key, kind, symbol, msg, action=False, book=""):
             pf = _j(DATA / "portfolio.json", {})
             if (pf.get("cash") or 0) > 0 or (pf.get("total_value") or 0) > 0:
                 r = loop.launch("trade", event=True)   # job pm_event: allowed in every mode
-                if r.get("ok"):
+                if r.get("ok") and not r.get("skipped"):   # a live PM refuses with ok+skipped
                     n[today] = n.get(today, 0) + 1
                     push(c["ntfy_topic"], "Stocks · agent", f"Decision session launched: {msg}")
     return True
@@ -305,7 +354,7 @@ def run():
                            action=is_agent, book=book)
 
     # --- 1b: named price levels (sell/entry plans) — config "price_levels" ---
-    for tk, lv in (c.get("price_levels") or {}).items():
+    for tk, lv in level_plans(c).items():
         q = feeds.fh_get("quote", symbol=tk) or {}
         price, prev = q.get("c"), q.get("pc")
         # Same prior-session trap rule 1 guards above: pre-open, `c` is yesterday's close,
@@ -549,12 +598,7 @@ def run():
     # go silent (state["buybelow_armed"]) until price closes back OUT of the band
     # (> buy_below*1.02), which re-arms it for the next crossing.
     armed = state.setdefault("buybelow_armed", {})
-    for lf in sorted((ENGINE.parent).glob("*/analysis/lenses.json")):
-        ov = (_j(lf, {}) or {}).get("overall") or {}
-        verdict, buy_below = ov.get("verdict"), ov.get("buy_below")
-        if verdict not in ("Buy below", "Follow") or not buy_below:
-            continue
-        tk = lf.parent.parent.name.rsplit("-", 1)[-1].upper()
+    for tk, verdict, buy_below, ov in priced_follow_names():
         q = feeds.fh_get("quote", symbol=tk) or {}
         price = q.get("c")
         # Pre-open, `c` is the prior close; alerting on it consumes seen["buybelow:<tk>"]

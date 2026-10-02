@@ -166,7 +166,9 @@ _CHILDREN = {}   # pid -> Popen, so this process reaps what it spawned
 # Wall-clock cap per kind, ~1.7x claudeq's est_min (research 90/finish 25/update 15) so a
 # hung session dies instead of holding the queue slot — RDI ran 1,585 min against a 90-min
 # estimate and stopped the queue for 12 other jobs across 19h (2026-09-07).
-CAP_MIN = {"research": 150, "finish": 45, "update": 25}
+# notes (sources/notes_review.py, 2026-09-27) runs inside `claudeq.py run --est 40`, whose own
+# 98-min timeout kills only notes_review.py, never this detached child; 70 dies first.
+CAP_MIN = {"research": 150, "finish": 45, "update": 25, "notes": 70}
 
 
 # ---------- MCP scope: which sessions see the broker (brokera-1, 2026-09-22) ----------
@@ -276,6 +278,19 @@ def _kill_group(p):
             pass
 
 
+def _release_own_slot(job):
+    """A fixed launch that took the slot under its own pid and then spawned nothing gives it back
+    now, rather than holding it until this process exits (a long-lived caller would hold it for
+    its whole life)."""
+    if not job:
+        return
+    try:
+        import claudeq
+        claudeq.release(os.getpid())
+    except Exception:
+        pass
+
+
 def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s=0):
     """Spawn ONE headless Claude session. `prompt` may be a string or a CALLABLE — a callable is
     resolved after the slot is acquired, so a queued job picks its work when it starts. ONE AT A TIME (claudeq, David 2026-09-04): a
@@ -291,8 +306,14 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
     if not ok:
         return {"ok": False, "msg": msg}
     if job:
+        # Wait AND take in one step, under THIS process's pid (memo claudeq-handoff-ready, 2026-09-23):
+        # wait_free() only SAW a free slot, so the tick or another waiter could start a session between
+        # it and the take() after Popen — PLUMB-4's kill below was the only guard. The slot is handed
+        # to the child the moment it exists (handoff, after Popen); until then the launcher holds it.
         import claudeq
-        if not claudeq.wait_free(wait_s):
+        got, _why = claudeq.wait_and_take(job, os.getpid(), kind or job, sub, est_min, log_path,
+                                          timeout_s=wait_s)
+        if not got:
             h = claudeq._read(claudeq.HOLDER) or {}
             return _slot_skip(job, kind, f"Claude slot busy after {wait_s}s: {h.get('job', '?')} still running")
     # A job that WAITED for the slot must choose its work now, not when it was filed. Pass a
@@ -302,6 +323,7 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
     if callable(prompt):
         prompt = prompt()
     if not prompt:
+        _release_own_slot(job)
         return {"ok": False, "msg": "nothing to do: the prompt builder returned empty"}
     # a missing broker config degrades to no broker (the session still runs, on yfinance/EDGAR),
     # never to the user-scope MCP set
@@ -327,6 +349,7 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
                              cwd=str(ROOT), stdout=log, stderr=log,
                              start_new_session=True, env=clean_env())
     except Exception as e:
+        _release_own_slot(job)
         return {"ok": False, "msg": f"launch error: {e}"[:160]}
     # Record the pid. Without it "is this still running?" was answered by log mtime,
     # which cannot tell a working run from a dead one — a finished/crashed job kept
@@ -340,16 +363,16 @@ def launch(prompt, log_path, job=None, kind=None, sub=None, est_min=None, wait_s
     try:
         import claudeq
         if job:
-            took, why = claudeq.take(job, p.pid, kind or job, sub, est_min, log_path)
+            took, why = claudeq.handoff(os.getpid(), p.pid, log_path)
         if took:
             claudeq.watcher(p.pid)
     except Exception:
         pass
     if not took:
-        # PLUMB-4: wait_free() only SAW a free slot, it did not claim it. Between that and take()
-        # the tick (or another waiter) started its own session, and take() said so. Two sessions
-        # on the one credential is the thing the queue exists to prevent, so ours goes — before
-        # it has done any work — and the skip is reported like a timeout.
+        # PLUMB-4: the launcher held the slot from wait_and_take() and handoff() refused it — a trade
+        # preempt or a reap took the slot in between. Two sessions on the one credential is the
+        # thing the queue exists to prevent, so ours goes — before it has done any work — and the
+        # skip is reported like a timeout.
         _kill_group(p)
         _CHILDREN.pop(p.pid, None)
         try:
@@ -448,7 +471,7 @@ def research_prompt(tk):
     return (
         f"research {tk} — run the deep-research teardown exactly as specified in "
         f"~/Stocks/_engine/research/RUNBOOK.md, applying the evaluation methodology in "
-        f"~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry, kill-the-thesis). "
+        f"~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry and the two alternatives it must beat, kill-the-thesis). "
         f"Steps: (0) FIRST run `python3 ~/Stocks/_engine/research/evidence.py {tk}` — it builds "
         f"research/_evidence/ (XBRL fact series in facts.json, text-extracted key filings, sections.json "
         f"offsets, INDEX.md navigation map with local-model reading notes), THEN run "
@@ -485,7 +508,11 @@ def research_prompt(tk):
         f"min(base/1.30, bear/0.75) for compounder; null ONLY for a Pass, naming the failed gate), bear/base/bull "
         f"per share, price and as_of the verdict was struck at, and signal = the verdict text plus the price for "
         f"Buy below (e.g. 'Buy below $40'); 'Neutral' is retired — a verdict without buy_below is a Pass with a "
-        f"named failed gate, nothing else; plus analysis/card.json "
+        f"named failed gate, nothing else; and the three EDGE fields in `overall` (EVALUATION-FRAMEWORK.md "
+        f"§Verdict — the decision plane on /dip/options reads them): edge (one sentence — the mechanism by which "
+        f"we might be right where the market is not, never 'it screens cheap'), why_dark (who is not looking and "
+        f"why, in words, or 'not dark: <why>'), what_brings_light (the event, dated if possible, that would make "
+        f"the market see it); plus analysis/card.json "
         f"(the one-page thesis card, same schema as OmniAB-OABI/analysis/card.json — thesis sentence, state, "
         f"now/later actions, milestones, ladder, kill triggers; 2-4 items per list). Be honest, argue both "
         f"sides, and report gaps plainly — this informs David's decision, it is not a pitch. "
@@ -525,20 +552,74 @@ def finish_prompt(tk):
         f"`python3 ~/Stocks/_engine/research/shelf.py {tk}` (run it in the FOREGROUND and wait for it to exit; NEVER poll for it with `pgrep -f` on the ticker or the script name — that pattern matches this session's own command line, the wait never ends, and the queue froze 23h on 2026-09-06 exactly so) first. Then READ, in this order: SHELF.md, "
         f"shelf/fincard.json, research/adversarial-review.md, every research/*.md, financials/*. Where the "
         f"refuter OVERTURNED a claim, the synthesis must carry the overturned version, never the original. "
-        f"Apply ~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry, "
+        f"Apply ~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md (gates, five pillars, asymmetry and the two alternatives it must beat, "
         f"kill-the-thesis) and RUNBOOK.md §3. Now do step {step3}"
     )
 
 
-def launch_finish(tk, now=False):
+def stopped_refusal(tk, force=False):
+    """David stopped following tk (follow.py, 2026-09-27: "don't need to update things i don't
+    care about"): no update, teardown or finish is filed or dispatched for it unless forced.
+    follow.stop() drops the queued ones; this refuses the next filer, the queue's own dispatch of
+    a job filed before the stop included. None = clear to proceed."""
+    if force:
+        return None
+    import follow
+    if follow.is_stopped(tk, CONF):
+        return {"ok": False, "stopped": True,
+                "msg": f"You stopped following {tk} — restore it on /research (or pass --force) first."}
+    return None
+
+
+def _queued_force(kind, tk, now):
+    """True when the queue is dispatching a kind:tk job that was filed with --force for a stopped
+    name. The box dispatcher calls launch_*(tk, now=True) with no force argument
+    (~/maintenance/bin/claudeq.py _dispatch), so a forced filing used to be refused at dispatch
+    and dropped with only an event line (review 2026-09-27). The job's own file is still in the
+    queue while it dispatches, and its args survive a limit-death or kill re-file, so the
+    override rides there as args["force"]."""
+    if not now:
+        return False
+    import follow
+    if not follow.is_stopped(tk, CONF):
+        return False
+    try:
+        import claudeq
+        j = claudeq.pending_for(f"{kind}:{tk}")
+        return bool(j and (j.get("args") or {}).get("force"))
+    except Exception:
+        return False
+
+
+def _file(kind, tk, force=False):
+    """File kind:tk on the box queue. A forced filing for a stopped name carries args["force"]
+    (_queued_force reads it at dispatch); an unforced copy already pending under the same key is
+    dropped first, because enqueue de-duplicates by key and would hand back the copy the
+    dispatcher refuses."""
+    import claudeq
+    args = {"tk": tk}
+    if force:
+        import follow
+        if follow.is_stopped(tk, CONF):
+            args["force"] = True
+            dup = claudeq.pending_for(f"{kind}:{tk}")
+            if dup and not (dup.get("args") or {}).get("force"):
+                claudeq.drop(dup.get("id") or f"{kind}:{tk}")
+    return claudeq.enqueue(kind, args, by="runner")
+
+
+def launch_finish(tk, now=False, force=False):
     tk = tk.upper()
+    force = force or _queued_force("finish", tk, now)
+    refused = stopped_refusal(tk, force)
+    if refused:
+        return refused
     if not finish_applicable(tk):
         return {"ok": False, "msg": f"{tk} is not finishable: needs research/adversarial-review.md and no FINAL-REPORT yet."}
     if run_state(research_log(tk)) == "alive":
         return {"ok": False, "msg": f"Research on {tk} is already running."}
     if not now:
-        import claudeq
-        return claudeq.enqueue("finish", {"tk": tk}, by="runner")
+        return _file("finish", tk, force)
     return launch(finish_prompt(tk), research_log(tk), kind="finish")
 
 
@@ -638,13 +719,17 @@ def reconcile_teardowns():
         _save_pending_teardowns(d)
 
 
-def launch_research(tk, now=False, full=False):
+def launch_research(tk, now=False, full=False, force=False):
     """Deep teardown. Files a queue job (claudeq) unless dispatched by the queue itself
     (now=True). One per ticker: a live run refuses a second launch — OABI launched twice
     nine seconds apart on 2026-09-04 and one copy died at 94s for nothing. A teardown that
     only lacks its synthesis is FINISHED, not redone, unless full=True."""
     tk = tk.upper()
     reconcile_teardowns()
+    force = force or _queued_force("research", tk, now)
+    refused = stopped_refusal(tk, force)
+    if refused:
+        return refused
     if run_state(research_log(tk)) == "alive":
         return {"ok": False, "msg": f"Research on {tk} is already running."}
     reason = gate_check(tk)
@@ -658,10 +743,9 @@ def launch_research(tk, now=False, full=False):
     if not (now and tk in _load_pending_teardowns()):
         _record_teardown_filed(tk)
     if not full and finish_applicable(tk):
-        return launch_finish(tk, now=now)
+        return launch_finish(tk, now=now, force=force)
     if not now:
-        import claudeq
-        return claudeq.enqueue("research", {"tk": tk}, by="runner")
+        return _file("research", tk, force)
     return launch(research_prompt(tk), research_log(tk), kind="research")
 
 
@@ -720,7 +804,9 @@ def update_prompt(tk, folder, report_date):
         f'"ladder" [{{"zone","action","status"}} — mark resting orders LIVE],"kill" [top thesis-break triggers]}}. '
         f"Keep every list to 2-4 tight items — this is the ONLY thing David reliably reads; the card must stand alone.\n"
         f"Also: REWRITE analysis/lenses.json `overall` with the v0.3 verdict fields (verdict, bar, buy_below, "
-        f"bear, base, bull, price, as_of, signal = verdict text plus price for Buy below, confidence, summary) and "
+        f"bear, base, bull, price, as_of, signal = verdict text plus price for Buy below, confidence, summary, and the "
+        f"edge fields edge / why_dark / what_brings_light per EVALUATION-FRAMEWORK.md §Verdict — write them if the "
+        f"dossier predates them, keep them if unchanged) and "
         f"update the lenses if the read changed; prepend a line "
         f"'> **Updated {today}** — see [update-{today}.md](updates/update-{today}.md)' under the title of "
         f"FINAL-REPORT.md; and update this ticker's next_catalyst in ~/Stocks/_engine/config/positions.json "
@@ -744,8 +830,12 @@ def _ntfy_topic():
         return ""
 
 
-def launch_update(tk, now=False):
+def launch_update(tk, now=False, force=False):
     tk = tk.upper()
+    force = force or _queued_force("update", tk, now)
+    refused = stopped_refusal(tk, force)
+    if refused:
+        return refused
     cd = company_dir(tk)
     if not cd:
         return {"ok": False, "msg": f"No research folder for {tk} — run a full Deep research instead."}
@@ -756,8 +846,7 @@ def launch_update(tk, now=False):
     if run_state(lg) == "alive":
         return {"ok": False, "msg": f"An update for {tk} is already running."}
     if not now:
-        import claudeq
-        return claudeq.enqueue("update", {"tk": tk}, by="runner")
+        return _file("update", tk, force)
     rep = cd / "analysis" / "FINAL-REPORT.md"
     rdate = dt.date.fromtimestamp(rep.stat().st_mtime).isoformat() if rep.exists() else "unknown"
     prompt = update_prompt(tk, cd.name, rdate)
@@ -821,6 +910,22 @@ def standing_feedback():
         return []
 
 
+def _stopped_line():
+    """The digest reads every research folder by glob; a name David stopped following
+    (follow.py, 2026-09-27: "don't need to update things i don't care about") is named here so
+    the session skips its folder and never recommends it back. Empty when nothing is stopped."""
+    try:
+        import follow
+        stop = sorted(follow.stopped(CONF))
+    except Exception:
+        return ""
+    if not stop:
+        return ""
+    return (f"STOPPED FOLLOWING: David stopped following {', '.join(stop)}. Skip their folders, do not "
+            f"recommend them, and do not propose research on them; he restores a name himself when he "
+            f"wants it back.\n")
+
+
 def rec_prompt():
     today = dt.date.today().isoformat()
     fb = standing_feedback()
@@ -849,6 +954,7 @@ def rec_prompt():
         f"~/Stocks/_engine/config/positions.json, account.json, watchlist.txt, external.json, "
         f"the newest ~/Stocks/_engine/candidate-boards/board_*.md, every analysis/FINAL-REPORT.md and "
         f"analysis/lenses.json under ~/Stocks/*/, and ~/Stocks/_engine/research/EVALUATION-FRAMEWORK.md. "
+        + _stopped_line() +
         f"Pull live prices for holdings and watchlist (yfinance via _engine/.venv, or curl) so numbers are current.\n"
         f"NEWS LAYER (additive, added 2026-08-11): also read ~/Stocks/_engine/agent/data/news_brief.md — the "
         f"local-model materiality-scored top news items of the last ~30h (check its generated timestamp; on "
@@ -1057,21 +1163,22 @@ if __name__ == "__main__":
         save_token_interactive()
         sys.exit(0)
     now = "--now" in args          # bypass the queue: interactive use only, one at a time still
+    force = "--force" in args      # research/finish/update/chain: file it even for a stopped name
     if args[:1] == ["rec"]:
         r = launch_rec(now=now)
     elif args[:1] == ["brief"]:
         r = launch_brief(force="--force" in args, now=now)
     elif args[:1] == ["research"] and len(args) > 1:
-        r = launch_research(args[1], now=now, full="--full" in args)
+        r = launch_research(args[1], now=now, full="--full" in args, force=force)
     elif args[:1] == ["finish"] and len(args) > 1:
-        r = launch_finish(args[1], now=now)
+        r = launch_finish(args[1], now=now, force=force)
     elif args[:1] == ["update"] and len(args) > 1:
-        r = launch_update(args[1], now=now)
+        r = launch_update(args[1], now=now, force=force)
     elif args[:1] == ["chain"] and len(args) > 1:
         # N focused updates, one queue job each — the queue serialises them and a limit
         # death re-files the one that died instead of announcing stale verdicts as new
         # (the 2026-09-04 rescore_chain.sh lesson).
-        rs = [launch_update(t, now=False) for t in args[1:] if not t.startswith("--")]
+        rs = [launch_update(t, now=False, force=force) for t in args[1:] if not t.startswith("--")]
         r = {"ok": all(x.get("ok") for x in rs), "jobs": rs,
              "msg": "; ".join(f"{t.upper()}: {x.get('msg', '')}" for t, x in zip([a for a in args[1:] if not a.startswith('--')], rs))}
     elif args[:1] == ["autorefresh"]:
@@ -1079,6 +1186,7 @@ if __name__ == "__main__":
     else:
         sys.exit("usage: runner.py rec | runner.py brief [--force] | runner.py research TICKER | "
                  "runner.py finish TICKER | runner.py update TICKER | runner.py chain TICKER... | runner.py save-token   "
-                 "(--now skips the queue's clock; the slot is still one at a time)")
+                 "(--now skips the queue's clock; the slot is still one at a time; --force files a "
+                 "research/finish/update for a name you stopped following)")
     print(json.dumps(r))
     sys.exit(0 if r.get("ok") else 1)

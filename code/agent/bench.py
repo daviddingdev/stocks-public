@@ -178,6 +178,7 @@ CORPUS = DATA / "bench_corpus"
 UNIVERSE = DATA / "bench_universe.json"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from edgar_identity import UA  # SEC contact identity, config-driven
+import secdoor  # the box's one SEC door, with _get's own fetch as fallback
 
 
 def _stamp():
@@ -195,6 +196,16 @@ REV_TAGS = ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax")
 
 
 def _get(url, tries=3):
+    # SEC through the box's one SEC door first (secdoor.py); the loop is the unchanged
+    # fallback when the desk can't answer.
+    try:
+        body = secdoor.fetch(url, timeout=60)
+    except secdoor.Unavailable:
+        pass
+    else:
+        if body is None:
+            raise secdoor.absent(url)
+        return body
     for i in range(tries):
         try:
             return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60).read()
@@ -259,19 +270,48 @@ def universe(min_rev=50e6, max_rev=None):
     return out
 
 
+STALE_DAYS = 100   # a 10-Q is due every quarter (+40-45d to file): past this, a newer one exists
+
+
+def _newest_filing(d):
+    ds = sorted(f.name[:10] for f in d.glob("*.txt"))
+    return ds[-1] if ds else None
+
+
 def fetch(limit=120, forms=("10-K", "10-Q")):
-    """Pull the latest 10-K/10-Q text for universe names we have not read yet.
-    EDGAR-polite; resumable — it only ever fetches what is missing."""
+    """Pull the latest 10-K/10-Q text for universe names we have not read yet, THEN refresh
+    the stalest names already on disk. EDGAR-polite; resumable.
+
+    signals 2026-09-26: this used to fetch ONLY names with no corpus folder, so once the
+    universe was covered (mid-August) it logged "fetched 0 companies" for 31 straight
+    nights and never pulled a newer quarter for anyone — ~240 names were already a quarter
+    behind, and the Q3 10-Q wave (late Oct-Nov) would never have reached the Bench at all,
+    which reads whatever quarter happens to be on disk. New names still go first; the rest
+    of the nightly limit goes to names whose newest filing is > STALE_DAYS old, oldest
+    first. A refresh only ADDS the newer document — earlier files stay, because the
+    work queue's done-records point at them."""
     uni = _j(UNIVERSE, {}).get("names") or {}
     if not uni:
         print("no universe — run: bench.py universe"); return 0
     CORPUS.mkdir(parents=True, exist_ok=True)
     todo = [v for tk, v in sorted(uni.items()) if not (CORPUS / tk).exists()]
     random.Random(7).shuffle(todo)          # unbiased order, stable across runs
-    got = 0
-    for u in todo[:limit]:
+    cutoff = (dt.date.today() - dt.timedelta(days=STALE_DAYS)).isoformat()
+    stale = []
+    for tk, v in uni.items():
+        d = CORPUS / tk
+        if d.is_dir() and not (d / ".nofilings").exists():
+            newest = _newest_filing(d)
+            chk = d / ".refresh_checked"   # nothing newer on EDGAR last time: re-ask weekly, not nightly
+            recent_chk = chk.exists() and time.time() - chk.stat().st_mtime < 7 * 86400
+            if newest and newest < cutoff and not recent_chk:
+                stale.append((newest, v))
+    stale = [v for _, v in sorted(stale, key=lambda x: x[0])]
+    got = refreshed = unchanged = 0
+    for u in (todo + stale)[:limit]:
         tk, cik = u["ticker"], u["cik"]
         d = CORPUS / tk
+        is_refresh = d.is_dir()
         try:
             sub = json.loads(_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json"))
             rec = sub["filings"]["recent"]
@@ -284,23 +324,38 @@ def fetch(limit=120, forms=("10-K", "10-Q")):
                     break
             if not picked:
                 d.mkdir(parents=True, exist_ok=True)
-                (d / ".nofilings").write_text(_now()); continue
+                if not is_refresh:
+                    (d / ".nofilings").write_text(_now())
+                continue
             d.mkdir(parents=True, exist_ok=True)
+            wrote = 0
             for form, (date, acc, doc) in picked.items():
+                out = d / f"{date}_{form.replace('/', '')}.txt"
+                if out.exists():
+                    continue
                 url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}"
                 txt = _strip(_get(url))[:3_000_000]
-                (d / f"{date}_{form.replace('/', '')}.txt").write_text(txt)
+                out.write_text(txt)
+                wrote += 1
                 time.sleep(0.15)            # EDGAR fair-access
-            got += 1
-            if got % 20 == 0:
-                print(f"  fetched {got}…")
+            if is_refresh:
+                refreshed += bool(wrote)
+                unchanged += not wrote      # issuer late / deregistered: newest on EDGAR is what we hold
+                if not wrote:
+                    (d / ".refresh_checked").write_text(_now())
+            else:
+                got += 1
+            if (got + refreshed) and (got + refreshed) % 20 == 0 and wrote:
+                print(f"  fetched {got} new, refreshed {refreshed}…")
         except Exception as e:
             print(f"  skip {tk}: {str(e)[:70]}")
             time.sleep(0.3)
     have = sum(1 for x in CORPUS.iterdir() if x.is_dir()) if CORPUS.exists() else 0
     funnel_record("bench:fetch", len(todo), got)
-    print(f"fetched {got} companies · corpus now {have} of {len(uni)} universe names")
-    return got
+    funnel_record("bench:refresh", len(stale), refreshed)
+    print(f"fetched {got} companies · refreshed {refreshed} stale (>{STALE_DAYS}d) of {len(stale)} "
+          f"({unchanged} had nothing newer on EDGAR) · corpus now {have} of {len(uni)} universe names")
+    return got + refreshed
 
 
 # Where contract/business disclosure actually lives. The first test read 18 cover pages,
@@ -413,15 +468,23 @@ def fill(limit=40):
     return added
 
 
-def _lease(q, worker):
-    """Take one pending task, or reclaim one whose lease expired (a dead worker)."""
+def _lease(q, worker, min_date=None):
+    """Take one pending task, or reclaim one whose lease expired (a dead worker).
+
+    PM 2026-09-25: min_filing_date used to be checked only at the SURVIVOR gate, so a
+    window in a filing older than the cutoff was still read and could never survive — 55.6%
+    of channel 11's 8,699 reads (4,839, almost all FY2025 10-Ks) and 57.6% of its 2,400
+    pending tasks at a 2026-06-01 cutoff. A pre-cutoff task is now left pending, unread
+    (a later, looser cutoff can still take it)."""
+    def readable(t):
+        return not min_date or (_filing_date(t["file"]) or "") >= min_date
     now = time.time()
     for t in q["tasks"].values():
-        if t["state"] == "pending":
+        if t["state"] == "pending" and readable(t):
             t.update(state="leased", worker=worker, leased_at=now)
             return t
     for t in q["tasks"].values():   # reclaim: a killed worker loses one task, not the night
-        if t["state"] == "leased" and now - (t.get("leased_at") or 0) > LEASE_S:
+        if t["state"] == "leased" and now - (t.get("leased_at") or 0) > LEASE_S and readable(t):
             t.update(state="leased", worker=worker, leased_at=now,
                      reclaimed=(t.get("reclaimed", 0) + 1))
             return t
@@ -444,7 +507,7 @@ def work(minutes=60, model_key="fast", worker=None, think=None):
           f"mode: think={md['think']} num_predict={md['num_predict']} chunk={md['chunk']}")
     while time.time() < deadline:
         q = _load()
-        t = _lease(q, worker)
+        t = _lease(q, worker, min_date=qn.get("min_filing_date"))
         if not t:
             print("queue drained"); break
         _write(QUEUE, q)

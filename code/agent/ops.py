@@ -265,10 +265,14 @@ def verify():
     # runs Saturdays. Marker file per role per day guards against relaunch loops; if the
     # NEXT verify still finds the miss (marker present), it escalates as before.
     import datetime as _dt
+    # Markers live in their own folder (catalog exemption `ops_markers`, 2026-09-26): loose in
+    # data/ they were 17 undeclared files by the cold sweep, one more every morning a role is filed.
+    markers = DATA / "ops_markers"
+    markers.mkdir(parents=True, exist_ok=True)
     healed = []
     for msg in list(misses):
         role = msg.split(":")[0]
-        marker = DATA / f"verify_relaunch_{role}_{_dt.date.today().isoformat()}"
+        marker = markers / f"verify_relaunch_{role}_{_dt.date.today().isoformat()}"
         if role in PROMPTS and not marker.exists():
             marker.write_text(msg)
             # USAGE-WINDOW RULE (David 2026-08-31 / 2026-09-01): no Claude session starts inside
@@ -287,7 +291,7 @@ def verify():
     # filing was paged the same way.
     filed = []
     for role in sorted(ON_DEMAND):
-        marker = DATA / f"verify_ondemand_{role}_{_dt.date.today().isoformat()}"
+        marker = markers / f"verify_ondemand_{role}_{_dt.date.today().isoformat()}"
         if marker.exists():
             continue
         try:

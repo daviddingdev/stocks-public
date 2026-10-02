@@ -73,4 +73,4 @@ figures in every memo have been audited against the source, and the brief is one
 - **Anything the trigger engine can't express as arithmetic.** If waking someone up
   requires a model's opinion, it is not an alert; it is a note for the morning.
 
-_Last updated September 2026._
+_Last updated October 2026._

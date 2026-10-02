@@ -320,6 +320,10 @@ def _is_punctuation_delta(context, literal):
 # a MODEL_WORDS keyword match never reaches it. The "=" sign itself is the signal; it
 # needs no keyword and no fixed distance.
 _EQUALS_BEFORE_RE = re.compile(r"=\s*\*{0,2}\$?\s*$")
+# the FAR end of a computed range: "3.70-4.00 x 130,764,290 FD sh = 483,827,873-523,057,160"
+# — the result is a range, and only its first end sits against the "=" (numwatch.py-258's
+# first live pass read ARI's kpis.json and called 523,057,160 unsourced)
+_EQUALS_RANGE_BEFORE_RE = re.compile(r"=\s*\*{0,2}\$?\s*[\d,.]+\s*[KMBkmb]?\s*(?:–|—|-|to)\s*\$?\s*$")
 _EQUALS_AFTER_RE = re.compile(r"^\s*\*{0,2}\s*=")
 
 
@@ -330,7 +334,8 @@ def _is_computed_result(context, literal):
     if i < 0:
         return False
     before, after = context[:i], context[i + len(literal):]
-    return bool(_EQUALS_BEFORE_RE.search(before) or _EQUALS_AFTER_RE.search(after))
+    return bool(_EQUALS_BEFORE_RE.search(before) or _EQUALS_AFTER_RE.search(after)
+                or _EQUALS_RANGE_BEFORE_RE.search(before))
 
 
 def _rounding_interval(num_text):
@@ -379,6 +384,9 @@ def _rolling_sums(quarters, n):
         if all(isinstance(q.get("value"), (int, float)) for q in window):
             out.append(sum(q["value"] for q in window))
     return out
+
+
+PRICE_KEYS = ("market_cap", "enterprise_value")   # derived from the live quote, not a filing
 
 
 def _card_values(card, keys):
@@ -456,6 +464,18 @@ def _in_filings_near(a, label, filing_texts, window=600):
     # rule's three; it does not buy a match on a single character.
     pats = [p for p in dict.fromkeys(pats)
             if p and len(re.sub(r"[^1-9]", "", p)) >= 2]
+    # the WORDS form, same as _in_filings: an 8-K prints "$6.2 billion", never "6,200", so
+    # VSNT's verbatim revenue outlook could not clear this check from the mislabel path
+    # while the plain path cleared it on the same filing (numwatch.py-268). Same 2-digit
+    # bar; "6.2 billion" is a stricter string than "6,200", not a looser one.
+    for scale, word in ((1e9, "billion"), (1e6, "million")):
+        v = a / scale
+        if 1 <= v < 1000:
+            for dec in (1, 2, 3):
+                w = f"{v:.{dec}f}".rstrip("0").rstrip(".")
+                if len(re.sub(r"[^1-9]", "", w)) >= 2:
+                    pats.append(f"{w} {word}")
+    pats = list(dict.fromkeys(pats))
     for name, txt in filing_texts.items():
         low = txt.lower()
         for w in words:
@@ -676,6 +696,13 @@ def trace_number(a, label, card, filing_texts, context="", literal=""):
                   if w not in fam_words and w not in ("ttm", "total", "current", "the", "of")]
         if not extras:
             all_keys = sorted({k for _, ks in FAMILIES for k in ks})
+            # numwatch.py-268: a MARKET-PRICED value moves with the tape, so a flow figure
+            # colliding with it is a coincidence of the day's price, not the LYFT shape.
+            # VSNT's verbatim revenue outlook ($6.2-6.45B) cried MISLABEL for three sweeps
+            # while EV sat in that range and went quiet when the price moved EV to $6.04B —
+            # same memo, same filing. Only a price-concept label is checked against them.
+            if not set(fam_keys) & set(PRICE_KEYS):
+                all_keys = [k for k in all_keys if k not in PRICE_KEYS]
             for src, v in _card_values(card, all_keys):
                 if abs(abs(v) - a) <= TOL * max(abs(v), a):
                     # a coincidental card-concept match is not proof of mislabeling if the
@@ -746,6 +773,76 @@ def _find_amount(text, literal, a):
     return -1
 
 
+_RANGE = re.compile(r"\d\s*(?:–|—|-|to)\s*\$?\s*$|^\s*(?:–|—|-|to)\s*\$?\s*\d")
+
+
+def _is_range_end(text, i, literal):
+    """True when the number is one end of a range ("$6.2–6.45B", "$1.9 to $2.05B") — two
+    endpoints share one label by construction and must never be reconciled against each
+    other."""
+    if i < 0:
+        return False
+    return bool(_RANGE.search(text[max(0, i - 6): i]) or
+                _RANGE.search(text[i + len(literal): i + len(literal) + 6]))
+
+
+RECONCILE_SKIP = ("documented-error", "forward")
+RECONCILE_BAND = 1.5
+
+
+def _half_width(literal):
+    """Half the rounding interval the source's own printed precision allows."""
+    iv = _rounding_interval(literal)
+    return (iv[1] - iv[0]) / 2 if iv else 0.0
+
+
+def reconcile(tk, claims):
+    """numwatch.py-258: numbers that SHARE A LABEL within one name must agree to rounding.
+
+    Every other check here asks whether a number traces to SOMETHING — a card concept, a
+    filing string, a printed formula. None asks whether the name's own prose agrees with
+    itself. ARI carried three 'pro-forma cash' values (577,742K / 747,002K / 747,064K) and two
+    dividend values (492,478 / 492,416) for 19 days; each was correctly labelled and each
+    traced, so the watchdog printed 0 findings nightly while a KPI stated ICD cover 1.43x on
+    the book's largest position (true 1.105-1.194x). Caught by the VP review, not by code.
+
+    Grouped on the normalised label; two values conflict when their printed-precision
+    intervals do not overlap (_rounding_interval), so "$1.24B" and "1,239,480K" agree and 492,478K
+    and 492,416K do not. Skipped: a number the PM labels as an error, forward guidance, and
+    range endpoints — each legitimately shares a label with a different value."""
+    groups = {}
+    for c in claims:
+        if c["status"] in RECONCILE_SKIP or c.get("range"):
+            continue
+        key = " ".join(re.findall(r"[a-z0-9]+", c["label"].lower()))
+        # only labels that CLAIM a card concept (the FAMILIES words). The first live pass
+        # (2026-09-26) fired only on generic labels — 'gap', 'growth', 'price increases' —
+        # each naming different items inside one memo; ARI's defect was all concept labels.
+        if key and any(re.search(rf"\b{re.escape(w)}\b", key)
+                       for words, _ in FAMILIES for w in words):
+            groups.setdefault(key, []).append(c)
+    out = []
+    for key, cs in sorted(groups.items()):
+        vals = {}
+        for c in cs:     # one entry per distinct value; keep the most precise literal
+            k = round(c["abs"])
+            if k not in vals or c["hu"] < vals[k]["hu"]:
+                vals[k] = c
+        cs = sorted(vals.values(), key=lambda c: c["abs"])
+        # a NEAR MISS is the defect — a stale copy of the same figure (577,742K vs 747,002K,
+        # 492,478K vs 492,416K). Values further apart than RECONCILE_BAND are different
+        # things under a loose label: the second live pass had the model label ARI's "cash
+        # net of the carrying loan = 206,314K" plain 'cash', against the 1,239,480K balance.
+        clash = [(x, y) for i, x in enumerate(cs) for y in cs[i + 1:]
+                 if abs(x["abs"] - y["abs"]) > x["hu"] + y["hu"]
+                 and max(x["abs"], y["abs"]) <= RECONCILE_BAND * min(x["abs"], y["abs"])]
+        if clash:
+            out.append(f"RECONCILE in {tk}: '{key}' carries {len(cs)} values that do not agree "
+                       f"to rounding — " + "; ".join(f"{c['text']} ({c['doc']})" for c in cs)
+                       + " — one of them is stale or wrong; correct it at the source")
+    return out
+
+
 def sweep_prose(tk, texts):
     """texts: {label: prose}. Returns (finds, evidence): finds are unsourced/mislabel
     defects; evidence is one detail string per number cleared as in-filing/documented-
@@ -757,13 +854,16 @@ def sweep_prose(tk, texts):
     card = _j(NAMES / tk / "fincard.json", {})
     fdir = NAMES / tk / "filings"
     filing_texts = {p.name: p.read_text(errors="replace") for p in fdir.glob("*.txt")} if fdir.exists() else {}
-    finds, seen_in_filing = [], []
+    finds, seen_in_filing, claims = [], [], []
     for label, text in texts.items():
         for n in extract_prose_numbers(text, label):
             i = _find_amount(text, n["text"], n["abs"])
             context = text[max(0, i - 80): i + 80] if i >= 0 else ""
             status, detail = trace_number(n["abs"], n["label"], card, filing_texts, context,
                                            literal=n["text"])
+            claims.append({"text": n["text"], "label": n["label"], "abs": n["abs"], "doc": label,
+                           "status": status, "hu": _half_width(n["text"]),
+                           "range": _is_range_end(text, i, n["text"])})
             if status in ("in-filing", "documented-error", "modelled", "news-sourced", "computed"):
                 seen_in_filing.append(f"[{status}] {n['text']} ({n['label']}) — {detail}")
                 continue
@@ -772,6 +872,7 @@ def sweep_prose(tk, texts):
             elif status == "unsourced":
                 finds.append(f"UNSOURCED in {label}: {n['text']} ({n['label']}) — {detail}; "
                              "source it or fix it")
+    finds += reconcile(tk, claims)
     if seen_in_filing:
         import collections as _c
         kinds = _c.Counter(x[1:x.index("]")] for x in seen_in_filing)
@@ -788,6 +889,7 @@ def run():
     held = [p["symbol"] for p in pf.get("positions", []) if p.get("symbol")]
     thesis = {k: v for k, v in _j(DATA / "thesis.json", {}).items() if not k.startswith("_")}
     book = (JOURNAL / "BOOK.md").read_text(errors="replace") if (JOURNAL / "BOOK.md").exists() else ""
+    kpis = _j(DATA / "kpis.json", {})
     report = {"ran_at": now, "names": {}, "n_findings": 0}
     for tk in held:
         card = _j(NAMES / tk / "fincard.json", {})
@@ -809,6 +911,11 @@ def run():
         m = re.search(rf"(?im)^- \*\*{tk}[^\n]*\n(?:(?!^- \*\*|^#).*\n)*", book)
         if m:
             texts["BOOK.md"] = m.group(0)
+        # the KPI texts state numbers too, and were read by nothing: two of ARI's three
+        # 'pro-forma cash' values lived only here (numwatch.py-258)
+        kp = [r for r in kpis.get(tk) or [] if isinstance(r, dict) and r.get("why")]
+        if kp:
+            texts["kpis.json"] = "\n".join(f"- [{r.get('kpi')}] {r['why']}" for r in kp)
         prose_finds, evidence = sweep_prose(tk, texts)
         finds += prose_finds
         report["names"][tk] = finds

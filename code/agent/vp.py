@@ -134,6 +134,22 @@ def held_names():
     return [p["symbol"] for p in pf.get("positions", []) if p.get("symbol")]
 
 
+def _cash_sleeve():
+    """mode.CASH_SLEEVE (SGOV, the T-bill ETF free cash sits in) — cash, not a company: it has
+    no CIK and no filings, so the dossier stage has nothing to build (decision:28201185)."""
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _m
+        return _m.cash_sleeve()
+    except Exception:
+        return set()
+
+
+# candidates.json `kind` -> local_read.py --kind (the three documents it knows how to find)
+LOCAL_READ_KIND = {"13D": "sc13d", "activist-13D": "sc13d", "reg-effective": "reg_effective",
+                   "spin-registration": "spin", "spinoff": "spin"}
+
+
 def candidate_desk(n=5):
     """The VP's candidate desk (David, 2026-08-27: the VP must put "at least 5 options
     per day considered" on the table). Picks the n candidates most worth preparing
@@ -165,7 +181,8 @@ def candidate_desk(n=5):
         mf = NAMES / tk / "manifest.json"
         fresh = mf.exists() and (_t.time() - mf.stat().st_mtime) < 5 * 86400
         why = (it.get("pm_note") or it.get("detail") or "")[:200]
-        out.append({"tk": tk, "status": it.get("status"), "why": why, "build": not fresh})
+        out.append({"tk": tk, "status": it.get("status"), "why": why, "build": not fresh,
+                    "kind": it.get("kind"), "url": it.get("url")})
         if len(out) >= n:
             break
     return out
@@ -848,7 +865,10 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
     stages.append(run("score", ["python3", "relevance.py"], 900))
     stages.append(run("triage", ["python3", "scout.py", "run"], 1200))
     if not fast:
+        sleeve = _cash_sleeve()
         for tk in held_names():
+            if tk in sleeve:
+                continue
             stages.append(run(f"dossier:{tk}", ["python3", "dossier.py", "build", tk], 900))
         # candidate desk (David 2026-08-27): >=5 options prepared per sweep, coded
         desk = candidate_desk()
@@ -858,6 +878,20 @@ def sweep(fast=False, bench_minutes=60, bench_fill=400, no_review=False):
         for d in desk:
             if d["build"]:
                 stages.append(run(f"cand:{d['tk']}", ["python3", "dossier.py", "build", d["tk"]], 900))
+            # vp.py-233 (2026-09-26): the seller-only LOCAL READ (local_read.py, signals'
+            # vp.py-173) on every seller-shaped desk candidate — one whole-document call on
+            # the GPU, zero Claude tokens; the scout card picks up the verified holder/share
+            # count on its next run. Skipped when the name's read is under 5 days old, the
+            # same freshness rule as the dossier, so a candidate that sits on the desk all
+            # week is read once, not nightly.
+            lk = LOCAL_READ_KIND.get(d.get("kind") or "")
+            lr = NAMES / d["tk"] / "local_read.json"
+            if lk and not (lr.exists() and (time.time() - lr.stat().st_mtime) < 5 * 86400):
+                # a 13D's own row carries the filing URL; local_read's feed lookup only sees
+                # the current feed window, which a desk candidate has usually rolled out of
+                via = ["--url", d["url"]] if lk == "sc13d" and d.get("url") else []
+                stages.append(run(f"seller:{d['tk']}", ["python3", "local_read.py", "seller",
+                                                        d["tk"], "--kind", lk, *via], 600))
     # Thesis-shaped reading (REVIEW-PLAN §8.1, 2026-09-12): every NEW document the dossier
     # stages just pulled, read with the name's own kill / KPI / prediction questions
     # (watch.py, prompts/watch.md). ~25 s per 20k-char passage on the dense role, so the cap

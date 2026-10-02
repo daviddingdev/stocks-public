@@ -42,6 +42,7 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from edgar_identity import UA  # SEC contact identity, config-driven
+import secdoor  # the box's one SEC door, with _get's own fetch as fallback
 
 # concepts measured over a period; unit defaults to USD unless noted
 FLOW = {
@@ -320,12 +321,19 @@ INSTANT = {
     # normally a Note-level combined figure (see RESCUE_VETO caution elsewhere in this
     # file) so it is intentionally ordered last — it only replaces a tag that is itself
     # stale or absent, never a fresher, cleaner current/noncurrent split.
+    # ConvertibleLongTermNotesPayable added 2026-09-26 (numbers, quality.py fincard-flag:WIX:
+    # NET CASH UNRELIABLE): WIX carries its whole debt stack as convertible notes tagged
+    # 1,125,769,000 at 2025-12-31 under this concept, which no alternate matched — debt_lt
+    # fell back to a 2019 LongTermLoansPayable of 1,219,000, excluded as STALE, and net cash
+    # read ~$1.13B too high. The concept INCLUDES the current portion (us-gaap definition),
+    # so it is last in line and its current twin is deliberately NOT mapped into
+    # debt_current: it only wins where nothing cleaner reports as fresh.
     "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermLoansPayable",
                 "LongTermDebtAndCapitalLeaseObligations", "LongTermLineOfCredit",
                 "OtherLongTermDebtNoncurrent", "FinanceLeaseLiabilityNoncurrent",
                 "FinanceLeaseLiability", "LongTermNotesPayable", "ConvertibleDebtNoncurrent",
                 "UnsecuredLongTermDebt", "DebtLongtermAndShorttermCombinedAmount",
-                "NotesPayable"],
+                "NotesPayable", "ConvertibleLongTermNotesPayable"],
     "debt_current": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
                      "LongTermDebtAndCapitalLeaseObligationsCurrent",
                      "OtherLongTermDebtCurrent", "FinanceLeaseLiabilityCurrent",
@@ -772,6 +780,16 @@ MANUAL = {
 
 
 def _get(url):
+    # SEC through the box's one SEC door first (secdoor.py; max_age 0, so as fresh as a
+    # direct GET); the three lines below are the unchanged fallback when the desk can't answer.
+    try:
+        body = secdoor.fetch(url, timeout=45)
+    except secdoor.Unavailable:
+        pass
+    else:
+        if body is None:
+            raise secdoor.absent(url)
+        return json.loads(body)
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=45) as r:
         data = json.loads(r.read())
@@ -804,6 +822,23 @@ def resolve_cik(tk, override=None):
 
 def _days(a, b):
     return (dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days
+
+
+def senior_preferred(F):
+    """(value, asof) of a preferred liquidation preference that is a LIVE senior claim on the
+    balance sheet EV is built from, else (0, None). fincard.py-269 (COO 2026-09-26): EV was
+    market_cap - net_cash with the preferred left out, although the card already read it for
+    common book value — ARI's Series B-1 ($169,260,000 liquidation preference, inside
+    StockholdersEquity) understated both EV and the CASH CLAIM pro-forma EV by exactly that.
+    Counted only when it is as current as the cash figure: most tagged preferences on the
+    corpus are years-old convertible preferred that converted at IPO (TMDX 2019, PL 2021),
+    and adding one of those would invent a claim that no longer exists."""
+    pf = F.get("preferred_liq_pref") or {}
+    v, a = pf.get("value"), pf.get("asof")
+    ca = (F.get("cash") or {}).get("asof")
+    if v and v > 0 and a and ca and a >= ca:
+        return v, a
+    return 0, None
 
 
 def _partial_period_days(fig):
@@ -1625,6 +1660,39 @@ def _mezzanine_equity(gaap, asof, parent_eq, ticker=None, eq_tag=None):
     return total if found else None
 
 
+def _nci_earnings_evidence(gaap, asof):
+    """A sentence naming INDEPENDENT evidence of noncontrolling interest in the period ending
+    at the balance-sheet date, else None (fincard.py-252, COO 2026-09-19).
+
+    The footing gap alone cannot tell NCI from a claim ahead of common: parent-only equity
+    that omits an NCI and a balance sheet that omits a mezzanine preferred both leave assets
+    minus equity ABOVE stated liabilities, same sign, same shape. The income statement can:
+    ProfitLoss (consolidated) differs from NetIncomeLoss (parent) only by the NCI's share, and
+    NetIncomeLossAttributableToNoncontrollingInterest is that share directly. KNTK: ProfitLoss
+    117,988,000 vs NetIncomeLoss 47,872,000 (six months to 2026-06-30) — an Up-C whose 4.10B
+    gap is the NCI. WEST fails the same identity by 273,330,000, and ProfitLoss ==
+    NetIncomeLoss there: the gap is its Series A Convertible Preferred in mezzanine (10-Q
+    2026-06-30, to the dollar), a real senior claim — an evidence test built on the gap's
+    sign would have called that NCI and dropped the claim from the reader's view."""
+    def at_end(tag):
+        return {(r.get("start"), r["end"]): r["val"]
+                for r in sorted(gaap.get(tag, {}).get("units", {}).get("USD", []),
+                                key=lambda r: r.get("filed") or "")
+                if r.get("end") == asof and r.get("start") and r.get("val") is not None}
+    share = at_end("NetIncomeLossAttributableToNoncontrollingInterest")
+    for (st, en), v in sorted(share.items()):
+        if v:
+            return (f"NetIncomeLossAttributableToNoncontrollingInterest {v:,.0f} "
+                    f"({st}..{en})")
+    pl, ni = at_end("ProfitLoss"), at_end("NetIncomeLoss")
+    for k in sorted(set(pl) & set(ni)):
+        a, b = pl[k], ni[k]
+        if a != b and abs(a - b) > 0.05 * max(abs(a), abs(b)):
+            return (f"ProfitLoss (consolidated) {a:,.0f} vs NetIncomeLoss (parent) "
+                    f"{b:,.0f} ({k[0]}..{k[1]})")
+    return None
+
+
 def _foot_check(card, F, gaap, tol=0.01, flag=True):
     """Does the balance sheet foot? Runs on EVERY card, always.
 
@@ -1679,20 +1747,52 @@ def _foot_check(card, F, gaap, tol=0.01, flag=True):
                     f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but "
                     f"stated liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%) "
                     f"— even after adding {mezz:,.0f} of noncontrolling/temporary equity "
-                    f"(still {gap2:,.0f} / {err2 * 100:.1f}% short). That gap is liabilities "
-                    f"we cannot see — net cash and EV are understated by roughly that much. "
-                    f"Do not treat this card's leverage as known.")
+                    f"(still {gap2:,.0f} / {err2 * 100:.1f}% short). That residual is claims "
+                    f"ahead of common we cannot see — liabilities, or temporary equity (a "
+                    f"redeemable preferred) carried under no us-gaap tag — net cash and EV "
+                    f"are understated by roughly that much. Do not treat this card's "
+                    f"leverage as known.")
                 return False, implied, gap, err, eq, mezz
         else:
             # The statement does not foot. Do not assert anything — quantify what is missing,
             # which is far more useful than "stale" and is the ARI/HUT signature.
-            flag and card["flags"].append(
-                f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but stated "
-                f"liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%). That gap is "
-                f"liabilities we cannot see — net cash and EV are understated by roughly that "
-                f"much. Do not treat this card's leverage as known.")
+            # fincard.py-252: the gap's reading depends on evidence the gap cannot supply.
+            # With independent NCI evidence (and a parent-only equity tag, so the NCI is
+            # genuinely outside it) the gap is most likely the NCI — not a claim, so net
+            # cash and EV are NOT understated. Without it, the gap is a claim ahead of
+            # common: a liability, or temporary equity (a mezzanine preferred — WEST, PROP;
+            # SPAC redeemable shares — IPCXU) that no us-gaap tag in companyfacts carries.
+            _nci = (_nci_earnings_evidence(gaap, asof) if gap > 0 and
+                    (F.get("equity") or {}).get("tag") not in _NCI_INCLUSIVE_EQUITY_TAGS
+                    else None)
+            if _nci:
+                flag and card["flags"].append(
+                    f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but "
+                    f"stated liabilities = {tl:,.0f}, an UNEXPLAINED GAP of {gap:,.0f} "
+                    f"({err * 100:.1f}%) — most likely noncontrolling interest with no "
+                    f"dollar-valued us-gaap tag in companyfacts: the card's equity is "
+                    f"parent-only and {_nci}. NCI is not a claim on the cash, so net cash "
+                    f"and EV are not understated by it; leverage is UNCONFIRMED, not hidden "
+                    f"— confirm the NCI line on the filed balance sheet before quoting it "
+                    f"(fincard.py-252).")
+            else:
+                flag and card["flags"].append(
+                    f"BALANCE SHEET DOES NOT FOOT: assets - equity = {implied:,.0f} but "
+                    f"stated liabilities = {tl:,.0f}, a gap of {gap:,.0f} ({err * 100:.1f}%). "
+                    f"No noncontrolling interest shows in the period's earnings, so that gap "
+                    f"is claims ahead of common we cannot see — liabilities, or temporary "
+                    f"equity (a redeemable preferred, SPAC redeemable shares) carried under "
+                    f"no us-gaap tag — and net cash and EV are understated by roughly that "
+                    f"much. Do not treat this card's leverage as known.")
             return False, implied, gap, err, eq, 0.0
     return True, implied, gap, err, eq, 0.0
+
+
+def _rescue_ran(card):
+    """False when this build's filing rescue could not read the issuer's filing — the only
+    reader of extension-tagged concepts, so without it EXHAUSTIVENESS cannot be claimed."""
+    return not any(str(f).startswith(("filing-rescue unavailable", "filing-rescue failed"))
+                   for f in card.get("flags") or [])
 
 
 def _zero_proof(card, F, names, gaap, tol=0.01):
@@ -2127,6 +2227,17 @@ def build(tk, cik_override=None):
         # PROVE is zero. Run last, on what is still unresolved.
         try:
             _left = [n for n in _wanted if F.get(n, {}).get("source") != "filing-extension"]
+            if not _rescue_ran(card):
+                # PM 2026-09-25: EXHAUSTIVENESS scans companyfacts, which never carries an
+                # issuer's EXTENSION concepts — only the filing rescue reads those. With the
+                # rescue down, ARI's ari:DebtRelatedToRealEstateOwnedHeldForInvestment
+                # (371,428K, 10-Q filed 2026-08-10) was printed "ZERO, CHECKED" and fired a
+                # false reo_debt BREACH on a held name's tripwire (2026-09-17, 09-22, 09-25).
+                if _left:
+                    card["flags"].append(
+                        f"zero-proof skipped — the filing rescue did not run, so extension-tagged "
+                        f"concepts were never read; {', '.join(_left)} stay UNKNOWN, not zero")
+                _left = []
             for n in _zero_proof(card, F, _left, gaap):
                 stale_instant.discard(n)
         except Exception as e:
@@ -2215,6 +2326,37 @@ def build(tk, cik_override=None):
                       "formula": formula, **({"note": note} if note else {})}
 
     cash, sti = gv("cash") or 0, gv("st_investments") or 0
+    # SAME BALANCE SHEET (numbers 2026-09-26): net_cash adds st_investments to cash, so both
+    # must come off one balance sheet. The staleness guard only quarantines a tag >1y behind;
+    # inside that year a sti fact from another date was summed silently. FOXXW: Marketable-
+    # Securities 35,000,000 dated 2025-11-05 (an event date, not a quarter end) added to the
+    # 2026-03-31 cash of 3,190,474 — net cash 38.1M on 28.1M of TOTAL ASSETS. Excluded and
+    # said so, never summed: the direction of this error always flatters.
+    # Before excluding, read the statement's own subtotal at the cash date: JAZZ tags
+    # CashCashEquivalentsAndShortTermInvestments 2,199,800,000 at 2026-06-30 against cash
+    # 1,619,800,000, i.e. 580,000,000 of short-term investments — while the mapped tag's
+    # newest fact was 2,441,899,000 at 2025-12-31, which overstated net cash by 1.86B.
+    _sti_f, _cash_f = F.get("st_investments") or {}, F.get("cash") or {}
+    if sti and _sti_f.get("asof") and _cash_f.get("asof") and _sti_f["asof"] != _cash_f["asof"]:
+        _combo = [r for r in (gaap.get("CashCashEquivalentsAndShortTermInvestments", {})
+                              .get("units", {}) or {}).get("USD", [])
+                  if r.get("end") == _cash_f["asof"] and r.get("val") is not None]
+        _combo_v = max(_combo, key=lambda r: r.get("filed") or "")["val"] if _combo else None
+        if _combo_v is not None and _combo_v >= cash:
+            card["flags"].append(
+                f"ST_INVESTMENTS OFF-DATE: {sti:,.0f} is dated {_sti_f['asof']}, not the "
+                f"{_cash_f['asof']} balance sheet cash comes from — net_cash uses "
+                f"{_combo_v - cash:,.0f} instead (CashCashEquivalentsAndShortTermInvestments "
+                f"{_combo_v:,.0f} - cash {cash:,.0f}, same date).")
+            sti = _combo_v - cash
+        else:
+            card["flags"].append(
+                f"ST_INVESTMENTS OFF-DATE: {sti:,.0f} is dated {_sti_f['asof']}, not the "
+                f"{_cash_f['asof']} balance sheet cash comes from — EXCLUDED from net_cash "
+                f"(mixed-date sum). If the issuer still holds it under a line the card does "
+                f"not map, net_cash and EV are understated by up to that much; check the "
+                f"latest balance sheet.")
+            sti = 0
     dlt, dcur = gv("debt_lt") or 0, gv("debt_current") or 0
     # a QUARANTINED debt figure must poison net cash LOUDLY — DXC lesson 2026-08-13:
     # $2.37B of LTD sat stale-excluded while net_cash printed as cash alone, and a
@@ -2751,8 +2893,13 @@ def build(tk, cik_override=None):
                     " EV/multiples below inherit this error — resolve before using")
         nc = (D.get("net_cash") or {}).get("value")
         if nc is not None:
-            ev = mc - nc
-            put("enterprise_value", ev, f"market_cap {mc:,.0f} - net_cash {nc:,.0f}")
+            _pref, _pref_asof = senior_preferred(F)
+            ev = mc - nc + _pref
+            put("enterprise_value", ev,
+                f"market_cap {mc:,.0f} - net_cash {nc:,.0f}"
+                + (f" + preferred_liq_pref {_pref:,.0f}" if _pref else ""),
+                (f"preferred liquidation preference (asof {_pref_asof}) counted as a senior "
+                 f"claim ahead of common (fincard.py-269)" if _pref else ""))
 
             # CASH CLAIM (fincard.py-162, COO 2026-09-06 / numbers 2026-09-08): EV above
             # is a balance-sheet snapshot; a dated cash outflow the SAME filing already
@@ -2784,7 +2931,8 @@ def build(tk, cik_override=None):
                 card["flags"].append(
                     f"CASH CLAIM: dividends_payable {_dp:,.0f}, {_dp / cash * 100:.0f}% "
                     f"of reported cash {cash:,.0f} (asof {F['cash'].get('asof')}), on an "
-                    f"EV already compressed to {abs(ev) / mc * 100:.1f}% of market_cap — "
+                    f"EV already compressed to {ev / mc * 100:.1f}% of market_cap"
+                    + (f" (incl. preferred_liq_pref {_pref:,.0f})" if _pref else "") + " — "
                     f"pro-forma cash {_pro_forma_cash:,.0f}, pro-forma EV "
                     f"{_pro_forma_ev:,.0f} once paid. enterprise_value/ev_over_fcf below "
                     f"use REPORTED cash; re-derive with pro-forma EV before trusting the "
@@ -3062,12 +3210,13 @@ def ruler_inputs(card, price=None, shares=None):
         rate, basis = min(max(tax["value"] / pre["value"], 0.0), 0.45), "effective"
     return {"price": px, "shares": sh, "fcf": fcf, "fcf_days": fcf_days,
             "net_cash": (D.get("net_cash") or {}).get("value"), "interest": inter,
+            "preferred": senior_preferred(F)[0],
             "interest_days": int_days, "tax_rate": TAX_DEFAULT if rate is None else rate,
             "tax_basis": basis}
 
 
 def mechanical_valuation(price, shares, fcf, net_cash, interest=None, tax_rate=TAX_DEFAULT,
-                         fcf_days=None, interest_days=None, tax_basis="default"):
+                         fcf_days=None, interest_days=None, tax_basis="default", preferred=0):
     """The ruler: reverse DCF (growth the price already pays for) and value per share across a
     growth ladder, on UNLEVERED free cash flow at the house WACC, net debt subtracted once.
 
@@ -3081,6 +3230,11 @@ def mechanical_valuation(price, shares, fcf, net_cash, interest=None, tax_rate=T
         return {}
     nc = net_cash or 0.0                         # a bank has no net_cash by design: counted as 0, as before
     notes = []
+    if preferred:
+        # fincard.py-269: a live preferred is paid before common — the bridge from the whole
+        # business to a COMMON share subtracts it with the debt, once
+        nc -= preferred
+        notes.append(f"preferred {preferred/1e6:,.0f}M subtracted with net debt")
     if interest is not None and interest <= 0:
         # SRPT tags a NEGATIVE interest line (net interest income): there is no debt cost to add
         # back, and subtracting it would push the base below the FCF it came from
@@ -3100,7 +3254,8 @@ def mechanical_valuation(price, shares, fcf, net_cash, interest=None, tax_rate=T
     V = {}
     V["ruler"] = {"basis": "unlevered FCF (FCF + interest × (1 − tax)), net debt subtracted once",
                   "fcf": round(fcf), "interest": (round(interest) if interest else None),
-                  "tax_rate": round(tax_rate, 4), "base_fcf": round(base), "net_cash": round(nc),
+                  "tax_rate": round(tax_rate, 4), "base_fcf": round(base), "net_cash": round(net_cash or 0.0),
+                  "preferred": round(preferred) if preferred else None,
                   "discount_rate": WACC, "terminal_growth": TERMINAL_G, "years": HORIZON_Y,
                   "formula": f"FCF {fcf/1e6:,.0f}M + {shield/1e6:,.0f}M = unlevered {base/1e6:,.0f}M; "
                              + "; ".join(notes)}
@@ -3133,6 +3288,130 @@ def valuation_from_card(card, price=None, shares=None):
     if any(str(f).startswith("IN REORG") for f in card.get("flags") or []):
         return {}
     return mechanical_valuation(**ruler_inputs(card, price=price, shares=shares))
+
+
+WRDS_TOL = 0.01    # 1%: Compustat's millions-to-three-decimals is exact to $1,000
+
+
+def wrds_check(card, fundq, file_ask=True):
+    """The WRDS DIVERGENCE stage (fincard.py-168, PM split 2026-09-14: numbers owns the
+    comparison, build owns the pull). Compustat comp.fundq against the card, four legs:
+
+      cash      cheq (Compustat's cash AND short-term investments) vs card cash + st_investments.
+                ONE-SIDED: cheq >= ours files nothing — Compustat sweeping in restricted cash
+                or a longer-dated bucket is a mapping difference (the 09-05/06 probes' two
+                misses were exactly that), while cheq BELOW ours says the card may carry cash
+                the filer never reported as such.
+      assets    atq vs total_assets.
+      revenue   revtq summed over the four quarters ending datadate vs the card's TTM revenue.
+      net inc.  niq summed the same way vs the card's TTM net_income (both parent-only).
+
+    `fundq` is the pull's rows (newest first, the shape industry_watch stores) or a single row.
+    A leg compares only when both sides are for the SAME date/window — a card built before the
+    quarter Compustat has is a timing gap, not a divergence. Values are quoted both ways in
+    the ask. NEVER writes to the card: WRDS is licensed, cross-check-only (ToU, 2026-09-07).
+    Returns {ticker, datadate, legs, divergent, ask}; ask is the filed id, a dedupe hit, or None."""
+    rows = [fundq] if isinstance(fundq, dict) else list(fundq or [])
+    rows = sorted((r for r in rows if r and r.get("datadate")),
+                  key=lambda r: str(r["datadate"])[:10], reverse=True)
+    tk = (card or {}).get("ticker") or (rows[0].get("tic") if rows else None)
+    out = {"ticker": tk, "datadate": None, "legs": {}, "divergent": [], "ask": None}
+    if not rows or not card:
+        return out
+    F = card.get("figures") or {}
+    r0 = rows[0]
+    dd = str(r0["datadate"])[:10]
+    out["datadate"] = dd
+
+    def val(name):
+        f = F.get(name) or {}
+        return None if f.get("STALE") else f.get("value")
+
+    def leg(name, ours, theirs, one_sided=False, why=""):
+        if ours is None or theirs is None:
+            out["legs"][name] = {"skipped": why or "missing on one side"}
+            return
+        diff = (ours - theirs) / abs(theirs) if theirs else None
+        bad = diff is not None and (diff > WRDS_TOL if one_sided else abs(diff) > WRDS_TOL)
+        out["legs"][name] = {"ours": ours, "compustat": theirs,
+                             "diff_pct": round(diff * 100, 2) if diff is not None else None,
+                             "divergent": bool(bad)}
+        if bad:
+            out["divergent"].append(name)
+
+    def m(r, k):
+        v = r.get(k)
+        try:
+            return None if v is None or v != v else float(v) * 1e6     # NaN-safe, $M -> $
+        except (TypeError, ValueError):
+            return None
+
+    bs_asof = (F.get("total_assets") or F.get("cash") or {}).get("asof")
+    if bs_asof == dd:
+        cash = val("cash")
+        sti = (val("st_investments") or 0) if (F.get("st_investments") or {}).get("asof") == dd else 0
+        leg("cash", None if cash is None else cash + sti, m(r0, "cheq"), one_sided=True)
+        leg("total_assets", val("total_assets"), m(r0, "atq"))
+    else:
+        for n in ("cash", "total_assets"):
+            out["legs"][n] = {"skipped": f"card balance sheet {bs_asof} vs Compustat {dd}"}
+
+    four = rows[:4]
+    span = (_days(str(four[-1]["datadate"])[:10], dd) if len(four) == 4 else None)
+    for name, col in (("revenue", "revtq"), ("net_income", "niq")):
+        f = F.get(name) or {}
+        ttm_ok = (f.get("period_end") == dd and f.get("period_start")
+                  and 350 <= _days(f["period_start"], f["period_end"]) <= 380)
+        vals = [m(r, col) for r in four]
+        if not (span and 250 <= span <= 300 and None not in vals):
+            out["legs"][name] = {"skipped": "fewer than four consecutive Compustat quarters"}
+        elif not ttm_ok:
+            out["legs"][name] = {"skipped": f"card {name} is not a TTM ending {dd} "
+                                            f"({f.get('period') or 'absent'})"}
+        else:
+            leg(name, val(name), sum(vals))
+
+    if out["divergent"] and file_ask:
+        tag = f"wrds_check:{tk}@{dd}"
+        try:
+            sys.path.insert(0, str(ENGINE / "agent"))
+            import asks
+            dup = next((a["id"] for a in asks.load().get("asks", [])
+                        if a.get("status") == "open" and tag in (a.get("tags") or [])), None)
+            if dup:
+                out["ask"] = dup
+            else:
+                both = "; ".join(
+                    f"{n}: card {out['legs'][n]['ours']:,.0f} vs Compustat "
+                    f"{out['legs'][n]['compustat']:,.0f} ({out['legs'][n]['diff_pct']:+.2f}%)"
+                    for n in out["divergent"])
+                out["ask"] = asks.add(
+                    "numbers", f"WRDS divergence on {tk} at {dd}: {both}. Find which side is "
+                    f"wrong in the filing; fix the card's tag map if it is ours.",
+                    by="numbers", about="_engine/valuation/fincard.py", tags=("wrds_check", tag),
+                    why="fincard.wrds_check (fincard.py-168): Compustat comp.fundq disagrees "
+                        "with the card by more than 1% on the same date/window",
+                    repro=f"python3 _engine/valuation/fincard.py wrds-check {tk}")
+        except Exception as e:
+            out["ask"] = f"ask not filed: {type(e).__name__}: {str(e)[:80]}"
+    return out
+
+
+def _wrds_check_cli(a):
+    """fincard.py wrds-check TICKER [--dry] — re-run the check on the last stored pull
+    (warehouse/industry/wrds/<TK>.json, written by industry_watch.wrds_stage). No WRDS call."""
+    if len(a) < 2:
+        sys.exit("usage: fincard.py wrds-check TICKER [--dry]")
+    tk_ = a[1].upper()
+    pull = ENGINE / "warehouse" / "industry" / "wrds" / f"{tk_}.json"
+    if not pull.exists():
+        sys.exit(f"wrds-check: no stored pull at {pull}")
+    sys.path.insert(0, str(ENGINE / "valuation"))
+    import query
+    card, _src = query.find_card(tk_)
+    r = wrds_check(card, json.loads(pull.read_text()).get("fundq") or [],
+                   file_ask="--dry" not in a)
+    print(json.dumps(r, indent=1, default=str))
 
 
 def _manual_cli(a):
@@ -3206,9 +3485,13 @@ if __name__ == "__main__":
     if not a:
         sys.exit("usage: fincard.py TICKER [--cik N] [--out FILE]\n"
                   "       fincard.py manual TICKER FIELD VALUE --period-end YYYY-MM-DD "
-                  "--quote Q --doc D [--period P] [--formula F]")
+                  "--quote Q --doc D [--period P] [--formula F]\n"
+                  "       fincard.py wrds-check TICKER [--dry]")
     if a[0] == "manual":
         _manual_cli(a)
+        sys.exit(0)
+    if a[0] == "wrds-check":
+        _wrds_check_cli(a)
         sys.exit(0)
     cik = a[a.index("--cik") + 1] if "--cik" in a else None
     card = build(a[0], cik)

@@ -933,6 +933,263 @@ def special_situations(days=10):
     return out
 
 
+# ---------- index deletions (scout.py-261, PM 2026-09-23) ----------
+# An index deletion is the cleanest dated non-value seller there is: every index fund that
+# tracks the index must sell at the close before the effective date, whatever it thinks of
+# the company. The PM worked the September S&P 600 cohort BY HAND (press release, day bars,
+# a python table) and found the one unreversed name (AMSF) nothing in the funnel surfaced.
+# This reads S&P DJI's own releases (quarterly rebalances and ad-hoc "X Set to Join ..."
+# changes), keeps DELETIONS that leave the S&P Composite 1500 (a name moving 600 -> 400 is
+# an addition elsewhere in the same table, not a forced seller), and prices the forced-sale
+# print in code. Release URLs already read are remembered in feed.json itself, so each
+# release is fetched once, and the listing is polled at most every 3 hours.
+SPDJI_LIST = "https://press.spglobal.com/index.php?s=2429&l=50"
+_SPDJI_URL_RE = re.compile(r'href="(https://press\.spglobal\.com/(\d{4}-\d{2}-\d{2})-[^"]*'
+                           r'(?:Join|S-P-500|MidCap|SmallCap)[^"]*)"', re.I)
+COMPOSITE_1500 = ("S&P 500", "S&P MidCap 400", "S&P SmallCap 600")
+_MON = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                                     "sep", "oct", "nov", "dec"), 1)}
+IDX_WINDOW_D = 120      # keep deletions whose effective date is this recent
+IDX_PRICE_D = 60        # re-price the print this long after the effective date, then stop
+IDX_REPRICE_H = 6
+IDX_LISTING_H = 3
+SPIN_WINDOW_D = 90      # PM: spins whose distribution completed in the last 90 days
+IDX_PARSER = 2          # bump when _spdji_release learns something: older reads are re-parsed once
+CONSUMED_PCT = 2.0      # R-37: > +2% above the forced-sale print = the dislocation is consumed
+
+
+def _idx_date(s):
+    m = re.match(r"\s*([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),\s*(\d{4})", s or "")
+    if not m or m.group(1).lower() not in _MON:
+        return None
+    return dt.date(int(m.group(3)), _MON[m.group(1).lower()], int(m.group(2))).isoformat()
+
+
+def _html_text(raw):
+    import html as _html
+    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    return re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", t))).strip()
+
+
+def _spdji_release(url, rel_date):
+    """Deletions leaving the Composite 1500 from one S&P DJI release, each with the
+    release's own words about it when it has any."""
+    import html as _html
+    raw = requests.get(url, headers=UA, timeout=40).text
+    rows = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", raw):
+        cells = [c for c in (re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", td))).strip()
+                             for td in re.findall(r"(?is)<td[^>]*>(.*?)</td>", tr)) if c]
+        if len(cells) >= 5 and cells[2] in ("Addition", "Deletion"):
+            rows.append({"effective": _idx_date(cells[0]), "index": cells[1], "action": cells[2],
+                         "company": cells[3], "ticker": cells[4].strip().upper()})
+    text = _html_text(raw)
+    # the release body only (page navigation has no periods, so a [^.] window ran into it —
+    # KW's first "reason" was the site menu), and "Inc." / "Corp." are not sentence ends
+    # (every ad-hoc reason reads "X will replace Leggett & Platt Inc. ... which is being
+    # acquired by ...", and the clause that matters comes after the abbreviation)
+    a0, a1 = text.find("PRNewswire"), text.find("SOURCE S&P Dow Jones Indices")
+    text = text[a0 if a0 >= 0 else 0:a1 if a1 > 0 else None]
+    text = re.sub(r"\b(Inc|Corp|Co|Cos|Ltd|Hldgs|Bancorp|plc|L\.P|N\.V|S\.A|U\.S)\.", lambda m: m.group(1) + "\u2024", text)
+    added_1500 = {r["ticker"] for r in rows if r["action"] == "Addition" and r["index"] in COMPOSITE_1500}
+    out = []
+    for r in rows:
+        if r["action"] != "Deletion" or r["index"] not in COMPOSITE_1500 or r["ticker"] in added_1500:
+            continue
+        why = None
+        pats = [re.escape(r["company"]),
+                r"\((?:NYSE|NASD|NASDAQ|Nasdaq|NYSE American|Cboe BZX)[^)]{0,12}:\s*" + re.escape(r["ticker"]) + r"\s*\)"]
+        for pat in pats:
+            m = re.search(r"[^.]{0,300}" + pat + r"[^.]{0,300}\.", text)
+            if m and re.search(r"acqui|merg|spin|spun|replac|remov|representative|delist|bankrupt", m.group(0), re.I):
+                why = m.group(0).strip()
+                # the reason is usually a LATER sentence ("CrossCountry Mortgage, LLC is acquiring
+                # Two Harbors Investment Corp. ..."): any sentence of the body that names THIS
+                # company by its first two words AND says acquire/merge/spin. Same-sentence, whole
+                # body — a multi-change release otherwise lends one name's deal to its neighbour
+                # (ARI picked up "Apollo Management ... acquiring Janus Henderson").
+                short = " ".join(r["company"].split()[:2])
+                for sent in re.findall(r"[^.]*\.", re.split(r"Following is a summary|Effective Date Index Name", text)[0]):
+                    if short in sent and re.search(r"\bacquir|\bto acquire|\bmerg|spinning off|spin-off|bankrupt",
+                                                   sent, re.I) and sent.strip() not in why:
+                        why += " " + sent.strip()
+                        break
+                why = why.replace("\u2024", ".")[:600]
+                break
+        if not why:
+            m = re.search(r"The compan(?:y|ies) being removed from the " + re.escape(r["index"]) + r"[^.]*\.", text)
+            why = m.group(0).replace("\u2024", ".") if m else None
+        out.append({**r, "release_url": url, "release_date": rel_date, "why": why,
+                    "acquired": bool(why and re.search(r"acquir|merg|being purchased|take-private|taken private",
+                                                       why, re.I))})
+    # scout.py-261 note 2 (PM 2026-09-24): COMPLETED spins were in no radar — MFP (Middleby's
+    # spin, distributed 2026-07-06) was found by a web search. An index-sized spinco's
+    # addition release prints the spin itself: "<Parent> is spinning off <Spinco> in a
+    # transaction expected to close July 7". The spinco's ticker is its Addition row.
+    spins = []
+    for m in re.finditer(r"([A-Z][^.]{2,120}?) is spinning off ([A-Z][A-Za-z0-9&'\- ]{2,60}?) in a transaction"
+                         r"[^.]{0,40}?(?:completed|close|closed)(?: on)? ([A-Z][a-z]+\.? \d{1,2})", text):
+        parent, spin, day = m.group(1).strip(), m.group(2).strip(), m.group(3)
+        parent = re.split(r"\bconstituent\b|\. ", parent)[-1].strip().replace("\u2024", ".")
+        add = next((x for x in rows if x["action"] == "Addition" and x["company"].lower().startswith(spin.lower()[:12])), None)
+        done = _idx_date(f"{day}, {rel_date[:4]}")
+        if add and done:
+            spins.append({"ticker": add["ticker"], "company": add["company"], "parent": parent[:80],
+                          "completed": done, "index": add["index"], "release_url": url, "release_date": rel_date,
+                          "quote": m.group(0).replace("\u2024", ".")[:300]})
+    return out, spins
+
+
+def _deletion_print(tk, effective):
+    """The forced-sale print (the last close BEFORE the effective date — deletions take
+    effect prior to the open), its volume vs the prior 8 sessions' mean, and today's price
+    vs that print. Raw closes (auto_adjust=False): the PM compares a live quote to it."""
+    import logging
+    import yfinance as yf
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    eff = dt.date.fromisoformat(effective)
+    today = dt.date.today()
+    h = yf.Ticker(tk.replace(".", "-")).history(start=(eff - dt.timedelta(days=30)).isoformat(),
+                                                end=(today + dt.timedelta(days=1)).isoformat(),
+                                                interval="1d", auto_adjust=False)
+    if h is None or h.empty:
+        return {"price_error": "no daily bars (delisted, or the vendor has no symbol)"}
+    h = h[["Close", "Volume"]].dropna()
+    dates = [d.date() for d in h.index]
+    pre = [i for i, d in enumerate(dates) if d < eff]
+    if not pre:
+        return {"price_error": "no bar before the effective date"}
+    i = pre[-1]
+    prev_bd = eff - dt.timedelta(days=1)
+    while prev_bd.weekday() >= 5:
+        prev_bd -= dt.timedelta(days=1)
+    if dates[i] < prev_bd and today < eff:
+        return {"print_pending": f"forced-sale close is {prev_bd.isoformat()} — not printed yet"}
+    base = h["Volume"].iloc[max(0, i - 8):i]
+    vol = float(h["Volume"].iloc[i])
+    close = float(h["Close"].iloc[i])
+    now_c, now_d = float(h["Close"].iloc[-1]), dates[-1]
+    pct = (now_c / close - 1) * 100 if close else None
+    if now_d == dates[i] and (today - eff).days > 3:
+        # no bar after the forced-sale print: the name stopped trading (acquired/delisted) —
+        # a deal price, not a dislocation. Independent of the release's wording.
+        return {"print_date": dates[i].isoformat(), "print_close": round(close, 4), "print_volume": int(vol),
+                "delisted": True, "price_error": "no bars after the print — stopped trading (acquired/delisted)"}
+    return {"print_date": dates[i].isoformat(), "print_close": round(close, 4), "print_volume": int(vol),
+            "vol_mult_8d": round(vol / float(base.mean()), 2) if len(base) and base.mean() else None,
+            "now_close": round(now_c, 4), "now_date": now_d.isoformat(),
+            "vs_print_pct": round(pct, 2) if pct is not None else None,
+            "consumed": bool(pct is not None and pct > CONSUMED_PCT)}
+
+
+def _spin_first_week(tk, completed):
+    """First-week low after the distribution (min daily LOW over the first 5 regular-way
+    sessions on/after the completion date) and today's close vs that low."""
+    import logging
+    import yfinance as yf
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    d0 = dt.date.fromisoformat(completed)
+    h = yf.Ticker(tk.replace(".", "-")).history(start=d0.isoformat(),
+                                                end=(dt.date.today() + dt.timedelta(days=1)).isoformat(),
+                                                interval="1d", auto_adjust=False)
+    if h is None or h.empty:
+        return {"price_error": "no daily bars"}
+    h = h[["Low", "Close"]].dropna()
+    wk = h.iloc[:5]
+    low = float(wk["Low"].min())
+    low_d = wk["Low"].idxmin().date().isoformat()
+    now_c, now_d = float(h["Close"].iloc[-1]), h.index[-1].date().isoformat()
+    return {"first_week_low": round(low, 4), "first_week_low_date": low_d, "first_week_sessions": len(wk),
+            "now_close": round(now_c, 4), "now_date": now_d,
+            "vs_low_pct": round((now_c / low - 1) * 100, 2) if low else None}
+
+
+def index_deletions():
+    """(rows, releases, meta) for situations.index_deletions / index_releases / index_meta,
+    carried forward from the previous feed.json so nothing is re-read."""
+    prev = {}
+    try:
+        prev = json.loads((DATA / "feed.json").read_text()).get("situations") or {}
+    except Exception:
+        pass
+    now = dt.datetime.now(dt.timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+    today = dt.date.today()
+    cutoff = (today - dt.timedelta(days=IDX_WINDOW_D)).isoformat()
+    rows = [r for r in (prev.get("index_deletions") or [])
+            if (r.get("effective") or r.get("release_date") or "") >= cutoff]
+    spin_from = (today - dt.timedelta(days=SPIN_WINDOW_D)).isoformat()
+    spins = [r for r in (prev.get("spins_completed") or []) if (r.get("completed") or "") >= spin_from]
+    seen = {r["url"]: r for r in (prev.get("index_releases") or []) if r.get("url")}
+    meta = dict(prev.get("index_meta") or {})
+    last = meta.get("listing_at")
+    stale_parse = any(r.get("parser") != IDX_PARSER for r in seen.values())
+    due = stale_parse or not last or (now - dt.datetime.fromisoformat(last)).total_seconds() > IDX_LISTING_H * 3600
+    n_urls = 0
+    if due:
+        try:
+            listing = requests.get(SPDJI_LIST, headers=UA, timeout=40).text
+            urls = sorted({(m.group(1), m.group(2)) for m in _SPDJI_URL_RE.finditer(listing)})
+            n_urls = len(urls)
+            meta.update({"listing_at": now_iso, "listing_error": None, "listing_urls": n_urls})
+            for url, rel_date in urls:
+                if (url in seen and seen[url].get("parser") == IDX_PARSER) or rel_date < cutoff:
+                    continue
+                try:
+                    dels, sp = _spdji_release(url, rel_date)
+                except Exception as e:     # not marked seen: retried on the next listing poll
+                    meta["release_error"] = f"{url[-60:]}: {str(e)[:80]}"
+                    continue
+                seen[url] = {"url": url, "date": rel_date, "deletions": len(dels), "spins": len(sp),
+                             "read_at": now_iso, "parser": IDX_PARSER}
+                known = {(r["ticker"], r["effective"]) for r in rows}
+                rows += [d for d in dels if (d["ticker"], d["effective"]) not in known]
+                known_sp = {r["ticker"] for r in spins}
+                spins += [x for x in sp if x["ticker"] not in known_sp and x["completed"] >= spin_from]
+                time.sleep(0.5)
+        except Exception as e:
+            meta["listing_error"] = str(e)[:120]   # rows carry forward; the error is on the record
+    price_from = (today - dt.timedelta(days=IDX_PRICE_D)).isoformat()
+    for r in rows:
+        if r.get("acquired") or not r.get("effective") or r["effective"] < price_from:
+            continue
+        pa = r.get("priced_at")
+        if pa and (now - dt.datetime.fromisoformat(pa)).total_seconds() < IDX_REPRICE_H * 3600:
+            continue
+        for k in ("price_error", "print_pending"):
+            r.pop(k, None)
+        try:
+            r.update(_deletion_print(r["ticker"], r["effective"]))
+        except Exception as e:
+            r["price_error"] = str(e)[:100]
+        r["priced_at"] = now_iso
+    for r in spins:
+        pa = r.get("priced_at")
+        if pa and (now - dt.datetime.fromisoformat(pa)).total_seconds() < IDX_REPRICE_H * 3600:
+            continue
+        r.pop("price_error", None)
+        try:
+            r.update(_spin_first_week(r["ticker"], r["completed"]))
+        except Exception as e:
+            r["price_error"] = str(e)[:100]
+        r["priced_at"] = now_iso
+    funnel_record("feeds:index_deletions", n_urls, len(rows))
+    funnel_record("feeds:spins_completed", n_urls, len(spins))
+    meta["spins_completed"] = sorted(spins, key=lambda r: r["completed"], reverse=True)
+    return (sorted(rows, key=lambda r: (r.get("effective") or "", r["ticker"]), reverse=True),
+            sorted(seen.values(), key=lambda r: r["date"], reverse=True)[:80], meta)
+
+
+def _with_index_deletions(sit):
+    try:
+        sit["index_deletions"], sit["index_releases"], sit["index_meta"] = index_deletions()
+        sit["spins_completed"] = sit["index_meta"].pop("spins_completed", [])
+    except Exception as e:   # a new channel must never take the radar down with it
+        sit["index_deletions"], sit["index_releases"], sit["spins_completed"] = [], [], []
+        sit["index_meta"] = {"error": str(e)[:120]}
+    return sit
+
+
 def _tag_held(situations, held):
     """A 13D/spin/delisting/reg-effectiveness on a name we hold or watch is not one of
     dozens of market-wide rows, it is a tripwire on our own book — mark it so a reader (or a
@@ -947,7 +1204,7 @@ def _tag_held(situations, held):
         r["held"] = bool(tk and tk in held)
         if r["held"]:
             held_hits.append({"kind": "sc13d", "ticker": tk, "date": r.get("date"), "url": r.get("url")})
-    for key in ("spins", "delistings", "reg_effective", "n14"):
+    for key in ("spins", "delistings", "reg_effective", "n14", "index_deletions", "spins_completed"):
         for r in situations.get(key) or []:
             tk = r.get("ticker")
             r["held"] = bool(tk and tk in held)
@@ -1110,7 +1367,7 @@ def refresh():
         "market_news": market_news(),
         "earnings": _cross_check_earnings(earnings_calendar(tks), filings, today_s),
         "filings": filings,
-        "situations": _tag_held(special_situations(), set(tks)),
+        "situations": _tag_held(_with_index_deletions(special_situations()), set(tks)),
         "managers": manager_moves(),
         "as_of": {"news": now_iso, "market_news": now_iso, "earnings": now_iso,
                   "filings": now_iso, "situations": now_iso},
@@ -1157,7 +1414,8 @@ def refresh():
     print(f"feed.json: {len(tks)} tickers · {n_news} news · {n_fil} filings · "
           f"{len(feed['earnings'])} earnings · {len(feed['market_news'])} market headlines · "
           f"radar: {len(sit['sc13d'])} 13Ds, {len(sit['spins'])} spins, {len(sit['delistings'])} delistings, "
-          f"{len(sit['reg_effective'])} reg-effective (S-3/S-1), {len(sit['n14'])} N-14 fund reorgs"
+          f"{len(sit['reg_effective'])} reg-effective (S-3/S-1), {len(sit['n14'])} N-14 fund reorgs, "
+          f"{len(sit.get('index_deletions') or [])} index deletions, {len(sit.get('spins_completed') or [])} completed spins"
           + (f" ({n_held_hits} on held/universe names)" if n_held_hits else "")
           + (f"  ⚠ DEGRADED (carried over): {', '.join(degraded)}" if degraded else "")
           + (f"  [vendor: {'; '.join(FH_FAILS[-3:])}]" if FH_FAILS else ""))

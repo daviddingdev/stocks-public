@@ -26,7 +26,7 @@ SOURCING doctrine's questions, Opus judges only the ranked top of the funnel.
 
 data/candidates.json lifecycle: new -> pre_triaged -> triaged -> pm_reviewed ->
 underwriting | passed | dropped.  Zero Claude tokens anywhere in this file.
-CLI: scout.py run | scout.py list
+CLI: scout.py run | scout.py list | scout.py covers [N]   (stage 0b backfill, no model)
 """
 import datetime as dt
 import json
@@ -121,6 +121,36 @@ def _local_read_seller(tk, kind):
     return None, None
 
 
+IDX_EVENT_D = 60
+
+
+def _index_deletion_detail(r):
+    d = (f"{r.get('index')} DELETION of {r.get('company')} effective before the open {r.get('effective')} — "
+         f"S&P DJI press release {r.get('release_date')} ({r.get('release_url')})")
+    if r.get("why"):
+        d += f': "{r["why"][:300]}"'
+    if r.get("print_close") is not None and r.get("now_close") is not None:
+        d += (f" · forced-sale print: close ${r['print_close']:,.2f} on {r['print_date']}, volume "
+              f"{r['print_volume']:,} = {r.get('vol_mult_8d')}x the prior 8 sessions' mean · now "
+              f"${r['now_close']:,.2f} ({r['now_date']} close) = {r['vs_print_pct']:+.2f}% vs the print -> "
+              + ("CONSUMED (R-37: > +2% above the print)" if r.get("consumed")
+                 else "NOT consumed (R-37: within +2% of the print or below it)"))
+    elif r.get("print_pending"):
+        d += f" · {r['print_pending']}"
+    elif r.get("price_error"):
+        d += f" · price not computed: {r['price_error']}"
+    card = _j(NAMES / str(r.get("ticker")) / "fincard.json", {})
+    D = card.get("derived") or {}
+    bits = [f"{lab} {fmt(D[k]['value'])}" for k, lab, fmt in (
+        ("market_cap", "cap", lambda v: f"${v / 1e6:,.0f}M"),
+        ("net_cash", "net cash", lambda v: f"${v / 1e6:,.0f}M"),
+        ("fcf_yield_pct", "FCF yield", lambda v: f"{v:.1f}%"))
+        if isinstance((D.get(k) or {}).get("value"), (int, float))]
+    if bits:
+        d += f" · card ({str(card.get('built', ''))[:10]}): " + ", ".join(bits)
+    return d
+
+
 def _events():
     """Stage 0: normalized events with stable ids from the feeds."""
     feed = _j(DATA / "feed.json", {})
@@ -192,6 +222,37 @@ def _events():
                    "detail": f"N-14 fund reorganization/merger registration: {r.get('company', '?')} "
                              f"— check for CEF/mutual-fund-into-ETF conversion language",
                    "url": r.get("url")})
+    # scout.py-261 (PM 2026-09-23): index DELETIONS leaving the S&P Composite 1500, read and
+    # priced by feeds.index_deletions() from S&P DJI's own releases. Acquired names (the
+    # release says so, or the tape stopped after the print) are a deal price, not a forced
+    # seller, and are not minted; a deletion more than IDX_EVENT_D past its effective date is
+    # history. The detail carries the whole R-37 test so pre-triage and the PM read the same
+    # numbers the PM computed by hand on 2026-09-23.
+    idx_from = (dt.date.today() - dt.timedelta(days=IDX_EVENT_D)).isoformat()
+    for r in (sit.get("index_deletions") or []):
+        tk, eff = r.get("ticker"), r.get("effective")
+        if not tk or not eff or eff < idx_from or r.get("acquired") or r.get("delisted"):
+            continue
+        ev.append({"id": f"idxdel:{tk}:{eff}", "kind": "index-deletion", "ticker": tk, "date": eff,
+                   "detail": _index_deletion_detail(r), "url": r.get("release_url")})
+    # scout.py-261 note 2: COMPLETED spins (distribution in the last 90 days), from the same
+    # S&P DJI releases — the spinco's first-week low is the flush print, today's price vs it
+    # is how much of the flush is left
+    for r in (sit.get("spins_completed") or []):
+        tk = r.get("ticker")
+        if not tk or not r.get("completed"):
+            continue
+        d = (f"COMPLETED SPIN: {r.get('parent')} spun off {r.get('company')} ({tk}), completion "
+             f"{r['completed']} per S&P DJI press release {r.get('release_date')} ({r.get('release_url')}): "
+             f"\"{(r.get('quote') or '')[:260]}\"")
+        if r.get("first_week_low") is not None:
+            d += (f" · first-week low ${r['first_week_low']:,.2f} ({r['first_week_low_date']}, min daily low of "
+                  f"the first {r.get('first_week_sessions')} sessions from {r['completed']}) · now "
+                  f"${r['now_close']:,.2f} ({r['now_date']} close) = {r['vs_low_pct']:+.2f}% vs that low")
+        elif r.get("price_error"):
+            d += f" · price not computed: {r['price_error']}"
+        ev.append({"id": f"spindone:{tk}:{r['completed']}", "kind": "spin-completed", "ticker": tk,
+                   "date": r["completed"], "detail": d, "url": r.get("release_url")})
     # scout.py-172 (funnel audit 2026-09-07): STRATEGY-PROPOSAL-v3 §1 "Deleted as a
     # source": 13F flow (a 13F names a buyer, never a seller) and insider clusters as a
     # mechanism ON THEIR OWN (a cluster is a CONFIRMER on a name that already has a
@@ -356,6 +417,341 @@ def _unsupported_figures(sketch, detail):
     return bad
 
 
+# ---------------------------------------------------------------- reg-effective: cover + gate
+# scout.py-267 (PM 2026-09-25): an EFFECT notice says a registration went effective and
+# nothing else, so every reg-effective row reached pre-triage as "shelf or primary raise?"
+# and was scored "Routine S-1/S-3 filing" — 1 of 120 rows ever carried a named seller,
+# while the registration statements' own covers showed 30 of 76 September rows were
+# resale registrations (KRP: 9,500,000 units = 9.42%; PED: 11,040,909 sh = 83.06%, both
+# found by hand). Code now opens the document filed under the EFFECT's file number at
+# collection, quotes its cover sentence verbatim, tags RESALE / PRIMARY / MIXED /
+# UNCLEAR, and computes N as a % of the outstanding count printed in the SAME document.
+# No model anywhere in this stage; the cover read is stored on the row, so no row is
+# fetched twice and there is no side file to declare.
+_REG_SKIP_FORMS = {"EFFECT", "CORRESP", "UPLOAD", "RW", "AW", "DEL AM", "RW WD", "AW WD",
+                   "10-Q", "10-K", "8-K", "S-8", "S-8 POS"}
+# a sentence runs to the first period NOT followed by a digit — "par value $0.0001" is not
+# its end (the PM's probe regex stopped there and lost the share count on half the rows)
+_SENT = r"(?:[^.]|\.(?=\d))*\."
+_COVER_RES = [
+    re.compile(r"This prospectus relates to" + _SENT),
+    re.compile(r"This prospectus (?:covers|registers)" + _SENT),
+    re.compile(r"(?:The|a|certain) selling (?:stock|share|unit|security|securities)holders?[^.]{0,200}? "
+               r"(?:may|are) (?:offer|offering|sell|resell)" + _SENT, re.I),
+    re.compile(r"(?:We|The Company) (?:may (?:offer and sell|offer|sell|issue)|will (?:offer and sell|offer|sell))"
+               + _SENT),
+    # a combined shelf's primary half, mid-sentence (MBUU: "From time to time, in one or more
+    # offerings, we may offer up to $300,000,000 ...")
+    re.compile(r"in one or more offerings, we may (?:offer|sell)" + _SENT),
+    re.compile(r"We are offering" + _SENT),
+]
+# the red-herring legend names the selling holder without saying anything ("Neither we nor
+# the Selling Stockholder may sell these securities until the registration statement ... is
+# effective") — J.Jill's first backfill quote was that legend, not its cover
+_LEGEND_RE = re.compile(r"until the registration statement|Neither we nor|have not authorized|"
+                        r"not an offer to sell", re.I)
+_RESALE_RE = re.compile(r"\bresale\b|\bresell|selling (?:stock|share|unit|security|securities)holder"
+                        r"|by the holders? of|by (?:the )?selling", re.I)
+_PRIMARY_RE = re.compile(r"\b(?:we|the company) (?:may|will|are) (?:offer|sell|issu)|\bwe are offering\b"
+                         r"|offered by us\b|issuance by us|by us of", re.I)
+_ISSUABLE_RE = re.compile(r"issuable upon|upon (?:the )?(?:exercise|conversion)|warrant|convertible|"
+                          r"pre-funded|equity line|purchase agreement", re.I)
+_N_RE = re.compile(r"(?:up to|aggregate of|of)\s+(?:an aggregate of\s+)?([\d,]{5,})\s+(?:shares|common units|"
+                   r"units|ordinary shares|American Depositary Shares|ADSs|subordinate voting shares|"
+                   r"Class [A-Z] (?:common|ordinary))", re.I)
+# the outstanding count, most specific phrasing first: the Offering summary's "outstanding
+# prior to this offering", then "based on N shares outstanding as of", then the looser
+# "N shares ... outstanding" — whose 80 chars of left context must not be about warrants/
+# options (MPLT's first bare match was its pre-funded-warrant count)
+# a share count, never a fragment of one: ",895,984" inside "100,895,984" is not a number
+# (the first backfill read KRP's denominator that way and printed 1,060% for a 9.42% shelf)
+_NUM = r"(?<![\d,.])(\d{1,3}(?:,\d{3})+|\d{5,})(?![\d,]*\d)"
+_OUT_RES = [
+    re.compile(r"outstanding (?:prior to|before) (?:this|the) offering:?\s*(?:\(\d\))?\s*" + _NUM, re.I),
+    re.compile(r"based on (?:approximately )?" + _NUM + r" (?:shares|common units|ordinary shares)"
+               r"[^.\d]{0,80}?outstanding as of", re.I),
+    re.compile(r"(?:common stock|common units|ordinary shares)[^.]{0,40}? outstanding"
+               r"(?: as of [A-Z][a-z]+ \d{1,2}, \d{4})?:?\s*" + _NUM, re.I),
+    re.compile(_NUM + r" (?:shares|common units|ordinary shares)[^.\d]{0,60}? "
+               r"(?:were |are )?(?:issued and )?outstanding", re.I),
+]
+
+
+def _sec_get(url, rng=None):
+    import urllib.request
+    time.sleep(0.15)   # SEC fair-access: well under 10 req/s
+    h = dict(UA)
+    if rng:
+        h["Range"] = f"bytes=0-{rng}"
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=60).read()
+
+
+def _doc_text(raw):
+    import html as _html
+    t = raw.decode("utf-8", "ignore")
+    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", t)
+    t = _html.unescape(re.sub(r"<[^>]+>", " ", t))
+    return re.sub(r"\s+", " ", t).replace("“", '"').replace("”", '"').replace("’", "'")
+
+
+def _reg_cover(cik, fno):
+    """Read the registration statement (or its final 424B prospectus) filed under the
+    EFFECT's file number. Returns {tag, form, filed, url, cover, shares, issuable,
+    outstanding, outstanding_quote, pct}; tag is RESALE / PRIMARY / MIXED / UNCLEAR, or
+    UNREAD when no document sits under the file number. Only the first 600KB is fetched —
+    the cover and the Offering summary are always at the front, and the slow link makes a
+    full S-1 exhibit bundle a real cost."""
+    f = json.loads(_sec_get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"))["filings"]["recent"]
+    idx = [i for i in range(len(f["form"]))
+           if f["fileNumber"][i] == fno and f["form"][i] not in _REG_SKIP_FORMS]
+    if not idx:
+        return {"tag": "UNREAD", "why": f"no registration document under {fno} in the recent index"}
+    i = idx[0]   # newest first: the final 424B prospectus if one exists, else the last amendment
+    url = (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+           f"{f['accessionNumber'][i].replace('-', '')}/{f['primaryDocument'][i]}")
+    t = _doc_text(_sec_get(url, rng=600000))[:120000]
+    # every cover-shaped sentence in the front of the document, in document order; the
+    # resale sentence and the primary sentence are found separately so a shelf that does
+    # both (MBUU: $300M primary + a resale; JILL: 5,000,000 primary + 7,338,933 resale by
+    # the Selling Stockholder) tags MIXED instead of whichever sentence came first
+    found = []
+    for rx in _COVER_RES:
+        for m in rx.finditer(t[:40000]):
+            if not _LEGEND_RE.search(m.group(0)):
+                # "This prospectus relates to" sorts ahead of every other phrasing when no
+                # sentence states a count (IPW: its cover sentence, not a later generic one)
+                found.append((0 if rx is _COVER_RES[0] else 1, m.start(), m.group(0)[:700]))
+                if _N_RE.search(m.group(0)) or rx is not _COVER_RES[2]:
+                    break   # a selling-holder sentence without a count: keep looking for one that has it
+    if not any(k == 0 for k, _, _ in found):
+        # a long table of contents can push "This prospectus relates to" past 40k (IPW)
+        m = next((m for m in _COVER_RES[0].finditer(t) if not _LEGEND_RE.search(m.group(0))), None)
+        if m:
+            found.append((0, m.start(), m.group(0)[:700]))
+    if not found:   # nothing cover-shaped in the front at all: first hit anywhere
+        for rx in _COVER_RES:
+            m = next((m for m in rx.finditer(t) if not _LEGEND_RE.search(m.group(0))), None)
+            if m:
+                found.append((0, m.start(), m.group(0)[:700]))
+                break
+    found = [(p, x) for _, p, x in sorted(found)]
+    # the resale sentence that STATES the share count wins over an earlier generic one ("the
+    # selling stockholders may sell ... in a number of different ways" — XAIR/NXXT/BIAFW)
+    res_all = [x for _, x in found if _RESALE_RE.search(x)]
+    res_s = next((x for x in res_all if _N_RE.search(x)), res_all[0] if res_all else None)
+    pri_s = next((x for _, x in found if _PRIMARY_RE.search(x) and not _RESALE_RE.search(x)), None)
+    sent = res_s or pri_s or (found[0][1] if found else None)
+    if found:
+        res, pri = bool(res_s), bool(pri_s) or bool(res_s and _PRIMARY_RE.search(res_s))
+        if pri and res and pri_s and pri_s != res_s:
+            sent = f"{res_s} [...] {pri_s}"[:900]
+    else:
+        # no cover sentence: fall back to the cover region's language
+        head = t[:15000]
+        res = bool(re.search(r"selling (?:stock|share|unit|security)holders?", head, re.I))
+        pri = bool(re.search(r"\bwe (?:may offer|are offering)\b", head, re.I))
+    tag = "MIXED" if res and pri else "RESALE" if res else "PRIMARY" if pri else "UNCLEAR"
+    n = None
+    if res_s if found else (sent and res):
+        m = _N_RE.search(res_s if found else sent)
+        if m:
+            n = float(m.group(1).replace(",", ""))
+    out = out_q = None
+    for rx in _OUT_RES:
+        for m in rx.finditer(t):
+            left = t[max(0, m.start() - 80):m.start()]
+            if rx is _OUT_RES[-1] and re.search(r"issuable|issuance|reserved|exercise|warrant|option|vesting",
+                                                left + m.group(0), re.I):
+                continue
+            v = float(m.group(1).replace(",", ""))
+            if v > 1000 and v != n:
+                out, out_q = v, m.group(0)[:200]
+                break
+        if out:
+            break
+    return {"tag": tag, "form": f["form"][i], "filed": f["filingDate"][i], "url": url,
+            "cover": sent, "shares": n,
+            "issuable": bool(res and _ISSUABLE_RE.search((res_s if found else sent) or "")),
+            "outstanding": out, "outstanding_quote": out_q,
+            "pct": round(100 * n / out, 2) if n and out else None}
+
+
+def _cover_text(c, card=None):
+    """The detail-line suffix for a read cover: verbatim sentence, tag, N and N/outstanding
+    with the denominator's source named. A fincard share count is used only when the
+    document prints none, and says so."""
+    if not c or c.get("tag") in (None, "ERROR"):
+        return ""
+    if c["tag"] == "UNREAD":
+        return f" · COVER [UNREAD]: {c.get('why', '')}"
+    kind = c["tag"] + (", warrant/convertible/ELOC shares" if c.get("issuable") else "")
+    s = f" · COVER [{kind}] ({c.get('form')} filed {c.get('filed')})"
+    if c.get("cover"):
+        s += f': "{c["cover"][:520]}"'
+    n, out = c.get("shares"), c.get("outstanding")
+    if n and out:
+        s += f" · {n:,.0f} sh = {c['pct']}% of {out:,.0f} outstanding (same document)"
+    elif n:
+        so = (((card or {}).get("figures") or {}).get("shares_out") or {}).get("value")
+        if so:
+            s += (f" · {n:,.0f} sh = {100 * n / so:.2f}% of {so:,.0f} outstanding "
+                  f"(fincard dei count — the document prints none)")
+        else:
+            s += f" · {n:,.0f} sh (no outstanding count in the document or a fincard)"
+    return s
+
+
+def _load_or_build_card(tk):
+    card = _j(NAMES / tk / "fincard.json", {})
+    if card:
+        return card
+    sys.path.insert(0, str(HERE.parent / "valuation"))
+    import fincard
+    card = fincard.build(tk)
+    (NAMES / tk).mkdir(parents=True, exist_ok=True)
+    (NAMES / tk / "fincard.json").write_text(json.dumps(card, indent=1))
+    return card
+
+
+def _coded_gate(card, doc_shares=None):
+    """G1 / G2-cfo / G3 of research/gate.py, read off the fincard, BEFORE pre-triage.
+    G1 and G3 are gate.py's own tests (equity > 0; a usable share count and market cap, no
+    open DOES-NOT-FOOT flag). G2 here is only its CFO leg, and it applies to every row, not
+    only the compounder bar: the PM's instruction (scout.py-267) is that a warrant/PIPE
+    resale of a CASH-BURNING issuer leaves on the shelf, and a TTM operating cash outflow
+    is that fact in one number. A missing figure is 'not evaluated', never a fail."""
+    F = (card or {}).get("figures") or {}
+    D = (card or {}).get("derived") or {}
+    gates = []
+    eq = (F.get("equity") or {}).get("value")
+    gates.append({"gate": "G1", "pass": None if eq is None else eq > 0,
+                  "detail": "no equity figure" if eq is None else f"equity {eq:,.0f}"})
+    cfo = (F.get("cfo") or {}).get("value")
+    per = (F.get("cfo") or {}).get("period") or ""
+    gates.append({"gate": "G2-cfo", "pass": None if cfo is None else cfo >= 0,
+                  "detail": "no CFO figure" if cfo is None
+                  else f"CFO {cfo:,.0f} ({per[:40]})" + (" — cash-burning issuer" if cfo < 0 else "")})
+    shares = (F.get("shares_out") or {}).get("value")
+    mcap = (D.get("market_cap") or {}).get("value")
+    price = ((card or {}).get("price") or {}).get("value")
+    src = ""
+    if (not shares or shares <= 1) and doc_shares:
+        # a registrant weeks past its IPO/de-SPAC has no dei cover count on companyfacts
+        # yet — the registration statement being gated prints one, so use it, named
+        shares, mcap, src = doc_shares, None, " (the registration statement's outstanding count)"
+    if not mcap and shares and price:
+        mcap = shares * price
+    foot = [f for f in (card or {}).get("flags", []) if "DOES NOT FOOT" in f]
+    if not shares or shares <= 1:
+        g3 = (False, f"shares_out={shares!r} — not a usable share count")
+    elif not mcap or mcap <= 0:
+        g3 = (False, "market cap not resolvable from shares x price")
+    elif foot:
+        g3 = (False, f"open balance-sheet-gap: {foot[0][:120]}")
+    else:
+        g3 = (True, f"shares_out {shares:,.0f}{src}, market cap {mcap:,.0f}")
+    gates.append({"gate": "G3", "pass": g3[0], "detail": g3[1]})
+    failed = next((g for g in gates if g["pass"] is False), None)
+    return {"verdict": "fail" if failed else "pass", "failed_gate": failed["gate"] if failed else None,
+            "gates": gates, "market_cap": mcap}
+
+
+_UNJUDGED = ("new", "pre_triaged", "enriching", "triaged", "triage_failed")
+
+
+def cover_and_gate(items, now, cap=30):
+    """Stage 0b for reg-effective rows: read the cover (once per row, 3 tries on a fetch
+    error), then run the coded gate on rows no human has judged. A fail leaves the funnel
+    as status 'gated' with the failed gate quoted — out of pre-triage AND out of vp.py's
+    candidate_desk, which fills slots from pre_triaged rows. A RESALE/MIXED row that
+    passes and was pre-scored blind before its cover existed goes back to 'new' so the
+    pre-triage reads the verbatim cover. A human verdict (pm_reviewed/dropped/underwriting)
+    only gains the cover as evidence; its status never moves. Returns counts."""
+    n = {"read": 0, "resale": 0, "gated": 0, "rescore": 0, "errors": 0}
+    todo = [it for it in items.values() if it.get("kind") == "reg-effective"
+            and (not it.get("cover") or (it["cover"].get("tag") == "ERROR" and it["cover"].get("tries", 0) < 3))]
+    todo.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    for it in todo[:cap] if cap else todo:
+        parts = str(it.get("id", "")).split(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            it["cover"] = {"tag": "UNREAD", "why": "no CIK on the row id"}
+            continue
+        try:
+            c = _reg_cover(parts[1], parts[2])
+        except Exception as ex:
+            c = {"tag": "ERROR", "why": str(ex)[:120], "tries": (it.get("cover") or {}).get("tries", 0) + 1}
+            n["errors"] += 1
+        c["at"] = now
+        it["cover"] = c
+        n["read"] += 1
+    for it in items.values():
+        c = it.get("cover")
+        if it.get("kind") != "reg-effective" or not c or c.get("tag") == "ERROR":
+            continue
+        tk = it.get("ticker")
+        card = None
+        if tk and "gate" not in it and it.get("status") in _UNJUDGED:
+            try:
+                card = _load_or_build_card(tk)
+                g = _coded_gate(card, c.get("outstanding"))
+            except (Exception, SystemExit) as ex:   # fincard.resolve_cik raises SystemExit
+                g = {"verdict": "not evaluated", "why": f"fincard build failed: {str(ex)[:100]}"}
+            g["at"] = now
+            it["gate"] = g
+            if g["verdict"] == "fail":
+                fg = next(x for x in g["gates"] if x["gate"] == g["failed_gate"])
+                it["status"] = "gated"
+                it["pre"] = {"plausible": 0, "channel": "none",
+                             "why": f"coded gate {fg['gate']} fail: {fg['detail']}"[:90]}
+                n["gated"] += 1
+            elif c.get("tag") in ("RESALE", "MIXED") and it.get("pre") and it["status"] != "new":
+                it["status"] = "new"   # new evidence (the cover), not a re-derivation
+                n["rescore"] += 1
+        if c.get("tag") in ("RESALE", "MIXED"):
+            n["resale"] += 1
+        if "COVER [" not in str(it.get("detail", "")):
+            base = str(it.get("detail", "")).replace(" — resale/selling-stockholder shelf or primary raise?", "")
+            it["detail"] = base + _cover_text(c, card or (_j(NAMES / tk / "fincard.json", {}) if tk else {}))
+    return n
+
+
+# scout.py-273 (numbers 2026-09-26): _events() re-quotes a cannibal row's net cash from a
+# newer fincard only while the screen still HITS the name — a row that fell off the screen
+# (dropped/pm_reviewed, never revisited by the merge) keeps the screen's figure forever, so
+# every later quarter's card rebuild can contradict it (GIII 379M vs card 521M, SIG 608M vs
+# 527M; scout.py-082 hand-closed the previous 8 of the same class). Refresh it from the card
+# on every run instead, keeping the superseded figure in the row so the PM's verdict still
+# reads against what it was given. Detail text only — status and pm_note never move.
+_NETCASH_RE = re.compile(r"net cash \$(-?[\d,]+(?:\.\d+)?)M", re.I)
+_REQUOTE_NOTE_RE = re.compile(r" · net cash re-quoted from fincard built [^·]*$")
+
+
+def refresh_cannibal_netcash(items):
+    n = 0
+    for it in items.values():
+        if it.get("kind") != "cannibal-screen" or not it.get("ticker"):
+            continue
+        det = str(it.get("detail") or "")
+        m = _NETCASH_RE.search(det)
+        card = _j(NAMES / it["ticker"] / "fincard.json", {})
+        cnc = ((card.get("derived") or {}).get("net_cash") or {}).get("value")
+        if not m or not isinstance(cnc, (int, float)):
+            continue
+        claimed = float(m.group(1).replace(",", "")) * 1e6
+        # C17's own tolerance (contract.py funnel_violations): same sign and within 10%
+        if (claimed >= 0) == (cnc >= 0) and abs(claimed - cnc) <= 0.10 * max(abs(cnc), 1):
+            continue
+        prior = _REQUOTE_NOTE_RE.search(det)
+        was = re.search(r"superseded \$(-?[\d,]+)M", prior.group(0)).group(1) if prior and "superseded $" in prior.group(0) \
+            else m.group(1)
+        det = _REQUOTE_NOTE_RE.sub("", det)
+        det = det[:m.start()] + f"net cash ${cnc / 1e6:,.0f}M" + det[m.end():]
+        it["detail"] = det + (f" · net cash re-quoted from fincard built {str(card.get('built', '?'))[:10]} "
+                              f"(superseded ${was}M from the screen run this row was judged on)")
+        n += 1
+    return n
+
+
 def _fincard_summary(tk):
     """scout.py-029: share_count_change_pct's own formula says "over 1365 days" — a span
     that varies by issuer with dei history and is almost never one year — but this printed
@@ -385,7 +781,7 @@ def _fincard_summary(tk):
     return txt, card
 
 
-def run(max_pre=25, max_triage=8):
+def run(max_pre=25, max_triage=8, max_cover=30):
     q = _j(CAND, {"_doc": "scout funnel — see scout.py", "items": {}})
     items = q.get("items", {})
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -414,6 +810,10 @@ def run(max_pre=25, max_triage=8):
             cur["detail"] = e["detail"]
             if cur.get("status") in ("new", "pre_triaged", "enriching", "triaged"):
                 cur["status"] = "new"
+        if cur and e.get("kind") in ("index-deletion", "spin-completed") and cur.get("detail") != e.get("detail"):
+            # scout.py-261: the price vs the forced-sale print moves every day — the R-37
+            # line on the row must be today's, never the day it was minted. Detail only.
+            cur["detail"], cur["last_seen"] = e["detail"], now
         if cur and e.get("kind") == "cannibal-screen":
             # scout.py-056: a re-hit refreshes the screen's numbers and sighting count on
             # the SAME row — never status or pm_note. A dropped/pm_reviewed verdict must
@@ -427,7 +827,15 @@ def run(max_pre=25, max_triage=8):
         # is dead now that _events() no longer mints that kind (STRATEGY-PROPOSAL-v3 §1)  —
         # any existing "insider-cluster" row just stops refreshing, which is correct: it was
         # demoted to a confirmer, not deleted from candidates.json.
-    new = [e for e in evs if e["id"] not in items]
+    # a deletion the PM already carries by hand (pm:AMSF:...:sp600-deletion, or the cohort
+    # row pm:SP600-DELETIONS whose ticker field lists five names) is not minted twice
+    pm_idx = {t for i in items.values() if i.get("kind") == "index-deletion" and not str(i.get("id", "")).startswith("idxdel:")
+              for t in str(i.get("ticker") or "").split()}
+    pm_spin = {i.get("ticker") for i in items.values() if not str(i.get("id", "")).startswith("spindone:")
+               and ("spin" in str(i.get("kind", "")) or ":spin" in str(i.get("id", "")))}
+    new = [e for e in evs if e["id"] not in items
+           and not (e.get("kind") == "index-deletion" and e.get("ticker") in pm_idx)
+           and not (e.get("kind") == "spin-completed" and e.get("ticker") in pm_spin)]
     n_pre = n_tri = n_triaged_ok = 0
     for e in new:
         items[e["id"]] = {**e, "status": "new", "first_seen": now, "last_seen": now}
@@ -442,7 +850,11 @@ def run(max_pre=25, max_triage=8):
     # named) never minted a scout row while five buyer-mechanism leads were reviewed and
     # all failed G5. Stable two-pass sort: newest-first within each group, seller-named
     # group promoted ahead of the rest.
-    _SELLER_NAMED_KINDS = {"reg-effective", "spin-registration"}
+    _SELLER_NAMED_KINDS = {"reg-effective", "spin-registration", "index-deletion", "spin-completed"}
+    # Stage 0b (scout.py-267): reg-effective rows get their registration statement's cover
+    # read and the coded G1/G2-cfo/G3 gate BEFORE the model sees them
+    cg = cover_and_gate(items, now, cap=max_cover)
+    refresh_cannibal_netcash(items)
     todo = [i for i in items.values() if i["status"] == "new"]
     todo.sort(key=lambda x: str(x.get("date", "")), reverse=True)
     todo.sort(key=lambda x: x.get("kind") not in _SELLER_NAMED_KINDS)
@@ -575,7 +987,21 @@ def run(max_pre=25, max_triage=8):
     top = sorted((i for i in items.values() if i["status"] == "triaged" and "triage" in i),
                  key=lambda x: -x["triage"]["score"])[:5]
     print(f"{now} scout: {len(new)} new events · {n_pre} pre-triaged · {n_tri} triaged · "
+          f"reg covers read {cg['read']} ({cg['resale']} resale/mixed on file, {cg['gated']} gated, "
+          f"{cg['rescore']} re-queued, {cg['errors']} fetch errors) · "
           f"queue top: {[(t.get('ticker'), t['triage']['score']) for t in top]}")
+
+
+def covers(cap=None):
+    """The code-only stages alone, no model (`scout.py covers [N]`): 0b reg-effective
+    cover + gate, and the cannibal net-cash re-quote (scout.py-273)."""
+    q = _j(CAND, {"items": {}})
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    n = cover_and_gate(q["items"], now, cap=cap)
+    n["netcash_requoted"] = refresh_cannibal_netcash(q["items"])
+    q["scanned_at"] = now
+    CAND.write_text(json.dumps(q, indent=1))
+    print(f"{now} scout covers: {n}")
 
 
 def list_items():
@@ -597,5 +1023,7 @@ if __name__ == "__main__":
         run()
     elif sys.argv[1:2] == ["list"]:
         list_items()
+    elif sys.argv[1:2] == ["covers"]:
+        covers(int(sys.argv[2]) if sys.argv[2:3] else None)
     else:
-        sys.exit("usage: scout.py run | scout.py list")
+        sys.exit("usage: scout.py run | scout.py list | scout.py covers [N]")

@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -143,6 +144,21 @@ def lab_mode_block():
                 "would have re-underwritten, file asks only when they block a trade (they queue for a build week; "
                 "nobody reads them tomorrow), do not file research or extra strategy sessions, and say in one "
                 "paragraph of the session log what a fully staffed desk would have caught that you could not.")
+    if m["lab"] == "winddown":
+        return (f"LAB MODE: WINDDOWN (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+                "David is closing this book: read DIRECTIVES.md 2026-09-29 and STRATEGY.md §W before anything else. "
+                "You buy NOTHING except the cash sleeve (SGOV). The gateway refuses every other buy, whether a new "
+                "name or an add (safety.py LAB_MODE_NO_NEW_POSITIONS / LAB_MODE_NO_ADDS, both HARD). A session is "
+                "three steps, in this order. (1) EXITS: for each held name, did the event or tripwire in BOOK.md's "
+                "WIND-DOWN block land? If yes, execute that exit (memo, audit, intent, preview, place, journal, "
+                "exactly as always). If no, write one line and move on; the plan is not re-argued. "
+                "(2) SWEEP: put free cash above $25 into SGOV with one intent, appending a dated addendum to the "
+                "standing memo journal/2026-09-29_SGOV_buy.md. (3) LOG: one short session log and one BOOK.md "
+                "delta. You run once a week (Tuesday), plus a session when a filing, a big move, a KPI breach or "
+                "an order-guard cancel lands on a held name. No origination (no funnel, EDGAR passes, parks or "
+                "bench questions), no staff management, no strategy or research sessions, no asks unless one "
+                "blocks an exit. When the last held name other than SGOV is sold, write one closing BOOK.md "
+                "stance. David then re-evaluates the project.")
     day = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}.get(_labmode.pm_day(), "the scheduled day")
     return (f"LAB MODE: {m['lab'].upper()} (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
             "David has put this book at minimum capacity while the desk's resources go to his own books. "
@@ -161,6 +177,10 @@ MARKET_HOLIDAYS = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026
                    # 2027 (added 2026-09-20 with the weekly Tuesday PM — MLK and Presidents' Day are Mondays)
                    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
                    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"}
+
+# A PM session alive this long has overrun (launch()'s one-PM lock): the longest healthy
+# session runs a couple of hours, so anything past this never exited — a failure, not a skip.
+STALE_PM_H = 6
 
 STRATEGY_ARC = ["2026-09-05", "2026-09-06", "2026-09-07"]   # David's three-day arc, markets closed
 
@@ -194,7 +214,8 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
     """event=True: a session a trigger launched (triggers.py ACTION) — job `pm_event`, which
     every mode allows, so a held name can exit on a Wednesday in hibernate (2026-09-20)."""
     if mode == "trade" and dt.date.today().isoformat() in MARKET_HOLIDAYS:
-        return {"ok": False, "msg": f"market holiday {dt.date.today()} — no trade session (loop.py MARKET_HOLIDAYS)"}
+        return {"ok": True, "skipped": True,
+                "msg": f"market holiday {dt.date.today()} — no trade session (loop.py MARKET_HOLIDAYS)"}
     if mode in ("trade", "strategy"):
         # the lab's service level (mode.py, 2026-09-12): hibernate = one PM session a week
         try:
@@ -204,7 +225,11 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
             job = ("strategy" if mode == "strategy" else "pm_event" if event
                    else ("pm_weekly" if dt.date.today().weekday() == weekly_day else "pm_daily"))
             if not _labmode.allows(job):
-                return {"ok": False, "msg": f"lab mode {_labmode.lab()}: {job} does not run (mode.py) — no session"}
+                # A deliberate no-launch, not a failure (decision:3f27581d, 2026-10-02): Mission
+                # Control reads the JSON "ok" as the job's verdict, and `ok: false` here raised a
+                # failed trade job every weekday of the wind-down. Same `skipped` key ops.py uses.
+                return {"ok": True, "skipped": True,
+                        "msg": f"lab mode {_labmode.lab()}: {job} does not run (mode.py) — no session"}
         except ImportError:
             pass
     if mode == "strategy" and not now:
@@ -231,6 +256,10 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
         # second PM session at 14:15Z while the 14:05Z one was alive — two writers on
         # BOOK.md / trades.json / thesis.json. A live pid refuses the launch; the trigger's
         # alert still fires and the live session sees it in its feed.
+        # The refusal is the guard WORKING when the live PM started today (09-28 and 09-29: a
+        # 13:50Z event session still at work when the 14:05Z daily fired) — a skip, `ok: true`.
+        # A PM alive for more than STALE_PM_H has overrun (a session that never exited): that
+        # is a failure, `ok: false` (decision:3f27581d, 2026-10-02).
         pidf = DATA / "trade_session.pid"
         try:
             old_pid = int(pidf.read_text().strip())
@@ -238,7 +267,12 @@ def launch(mode, attempt=1, model_idx=0, now=False, event=False, finish=None):
             _os.kill(old_pid, 0)
             with open(f"/proc/{old_pid}/cmdline", "rb") as fh:
                 if b"claude" in fh.read():
-                    return {"ok": False, "msg": f"trade session already live (pid {old_pid}) — not launching a second PM"}
+                    age_h = (time.time() - pidf.stat().st_mtime) / 3600
+                    if age_h > STALE_PM_H:
+                        return {"ok": False, "msg": f"trade session pid {old_pid} still live after {age_h:.0f}h — "
+                                                    "overran; not launching a second PM"}
+                    return {"ok": True, "skipped": True,
+                            "msg": f"trade session already live (pid {old_pid}, {age_h * 60:.0f} min) — not launching a second PM"}
         except Exception:
             pass
     ok, msg = runner.auth_check()

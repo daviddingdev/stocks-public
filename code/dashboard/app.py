@@ -35,6 +35,7 @@ if __name__ == "__main__":
 
 import markdown
 import requests
+import mdreader  # vendored copy of ~/maintenance/shared/mdreader/dist — re-copy to update, never patch
 from flask import Flask, abort, jsonify, request
 
 ROOT = Path("~/Stocks").expanduser().resolve()
@@ -85,6 +86,7 @@ def load_key(name):
 # any book without knowing it. Cache keys carry the slug for the same reason.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import books as _books  # noqa: E402
+import follow as _follow  # noqa: E402  — names David stopped following (2026-09-27)
 
 def _book():
     from flask import g, has_request_context
@@ -115,9 +117,36 @@ def read_account():
 
 def read_external():
     """Off-feed holdings that belong in the book's allocation: the BROKERA book's
-    external.json, or a book's hand-marked private.json (name/value/category/…)."""
+    external.json, or a book's hand-marked private.json (name/value/category/…). A hand row
+    that names its `feed_symbol` stops counting once the feed holds that symbol (CTEK's
+    subscription, itemized after its first NAV): the feed row replaces it, never adds to it."""
     ext = _bjson("external.json", None)
-    return ext if ext is not None else _bjson("private.json", [])
+    if ext is not None:
+        return ext
+    acct = _bjson("account.json", {}) or {}
+    feed = [f for f in acct.get("funds") or [] if isinstance(f, dict)]
+    return _books.live_hand_rows(_bjson("private.json", []), _bjson("positions.json", {}), feed) + [
+        feed_row(f, acct.get("as_of")) for f in feed]
+
+
+def feed_row(f, as_of=None):
+    """account.json "funds" row → the shape the book's value, allocation and widget read."""
+    if f.get("kind") == "account":
+        n = len([h for h in f.get("holdings") or [] if h.get("tk") and h.get("value")])
+        top = ", ".join(h["tk"] for h in (f.get("holdings") or [])[:4] if h.get("tk"))
+        note = (f"J.P. Morgan account {f.get('account')}: " + (f"{n} holdings ({top}{'…' if n > 4 else ''}), " if n else "")
+                + f"${float(f.get('cash') or 0):,.0f} cash")
+        return {"name": FUND_NAMES.get(f.get("key"), f.get("account_name") or "Fund account"), "category": "Separately managed account",
+                "tag": "SMA", "value": f.get("value"), "cost": None, "as_of": f"feed · {as_of or ''}", "note": note,
+                "plane_key": f.get("key"), "source": "feed"}
+    return {"name": f.get("name") or f.get("symbol"), "category": "Fund subscription", "tag": "subscribed",
+            "value": f.get("value"), "cost": f.get("value"), "as_of": f"feed · bought {f.get('date') or ''}",
+            "note": f"{f.get('symbol')}: counted in the broker's total, not yet listed as a position"
+                    + (f"; ${float(f.get('fee') or 0):,.0f} fee paid" if f.get("fee") else ""),
+            "feed_symbol": f.get("symbol"), "source": "feed"}
+
+
+FUND_NAMES = {"opt:ab-security": "AB Security SMA", "opt:ctek": "CTEK (Coatue)", "opt:aci": "ACI (Ares)"}
 
 def _book_aid(st):
     """The AggregatorA account behind the current book's activity feed. A book with
@@ -670,7 +699,7 @@ def company_display(c):
 # Holdings. The watchlist, the research tree, the candidate boards and the system docs moved to
 # /research (research_inner / research_companies_inner / research_boards_inner below).
 NAV = [("personal", "Personal book"), ("dip", "DIP Venture"), ("agent", "BrokerB agent"),
-       ("research", "Research"), ("learn", "Learn")]
+       ("research", "Research"), ("thesis", "Thesis"), ("learn", "Learn")]
 PERSONAL_ROUTES = ("/", "", "/today", "/recommendation", "/journal", "/brokera")
 
 
@@ -690,6 +719,8 @@ def nav_key(path, view_path="", owners=None):
         return "agent"
     if _under(path, "/research") or path.startswith("/company/"):
         return "research"
+    if _under(path, "/thesis"):     # thesis_page.py (2026-09-29)
+        return "thesis"
     if _under(path, "/learn") or path in ("/primer", "/lookups"):
         return "learn"
     if path == "/advised":
@@ -835,11 +866,13 @@ def holdings():
             rows.append({"kind": "mark", "tk": "Structured note", "value": float(acct["structured_note"]),
                          "book": slug, "route": route, "tag": "broker mark",
                          "sub": f"as of {_mark_date(acct.get('as_of'))}"})
-        for x in _rj(bdir / "private.json", []):
+        feed = [f for f in (acct.get("funds") or []) if isinstance(f, dict)]
+        for x in _books.live_hand_rows(_rj(bdir / "private.json", []), _rj(bdir / "positions.json", {}), feed) + [
+                feed_row(f, acct.get("as_of")) for f in feed]:
             if isinstance(x, dict) and x.get("name"):
                 rows.append({"kind": "private", "tk": x["name"], "value": float(x.get("value") or 0) or None,
-                             "book": slug, "route": route, "tag": "private",
-                             "sub": f"marked {_mark_date(x.get('as_of'))}"})
+                             "book": slug, "route": route, "tag": str(x.get("tag") or "private")[:16],
+                             "sub": "broker feed" if x.get("source") == "feed" else f"marked {_mark_date(x.get('as_of'))}"})
         if rows:
             groups.append({"slug": slug, "label": label, "route": route, "rows": rows})
     ag = sorted(agent_positions(), key=lambda p: -float(p.get("value") or 0))
@@ -938,6 +971,18 @@ def _learn_link(icon):
     return link
 
 
+def _thesis_link():
+    """The Thesis row (thesis_page.py, 2026-09-29). If the module did not load, the row still
+    points at /thesis; the reason is in the server log, and the sidebar never breaks."""
+    tp = globals().get("thesis_page")
+    if tp is not None:
+        try:
+            return tp.sidebar_link()
+        except Exception:
+            pass
+    return f"<a class='leaf navtop' data-route='/thesis' href='/thesis'>{I_DOC}<span>Thesis</span></a>"
+
+
 def sidebar(route=None):
     """The left navigation. `route` = (path, view_path) of a full page render, so the right item
     is lit before any script runs; setActive() keeps it right across SPA navigation."""
@@ -950,6 +995,7 @@ def sidebar(route=None):
         "dip": dip_page.sidebar_link(I_BANK),
         "agent": f"<a class='leaf navtop' data-route='/agent' href='/agent'>{I_SPARK}<span>BrokerB agent</span></a>",
         "research": f"<a class='leaf navtop' data-route='/research' href='/research'>{I_LENS}<span>Research</span></a>",
+        "thesis": _thesis_link(),
         "learn": _learn_link(I_LEARN)}
     s = [f"<div class=sidetop><a class='brand' href='/' data-home>{I_LOGO}<span>Stocks</span></a></div>",
          "<form class=search onsubmit='return doSearch(event)'>" + I_SEARCH +
@@ -1090,28 +1136,81 @@ def render_plain_csv(p):
     o.append("</tbody></table></div>")
     return "".join(o)
 
-def render_file(p):
-    """Returns (html, toc_tokens) — toc_tokens only for markdown."""
+def _doc_link(p):
+    """resolve_link for the reader: a relative href in the doc at `p` → /view?path=<rel> (+ #mdr-frag) with
+    data-path for the SPA, or None (quiet text, not a 404) for an image or anything outside ROOT."""
+    from urllib.parse import unquote as _unq
+    def _link(href, kind):
+        if kind != "link":
+            return None
+        if href.startswith("/"):            # a dashboard route written into the doc (/ticker/X, /view?…)
+            return href
+        path, _, frag = href.partition("#")
+        path = _unq(path.split("?", 1)[0])
+        if not path:
+            return None
+        try:
+            tgt = (p.parent / path).resolve()
+        except Exception:
+            return None
+        if ROOT not in tgt.parents:
+            return None
+        rel = str(tgt.relative_to(ROOT))
+        return {"href": f"/view?path={rel}" + (f"#mdr-{frag}" if frag else ""), "attrs": {"data-path": rel}}
+    return _link
+
+_CODE_CAP = 256 * 1024
+
+def _code_view(p, raw):
+    """A non-markdown file as a wrapped code block (never parsed as markdown): JSON pretty-printed, capped."""
+    lang = p.suffix.lower().lstrip(".")
+    if lang == "json":
+        try:
+            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    note = ""
+    if len(raw) > _CODE_CAP:
+        cut = raw.rfind("\n", 0, _CODE_CAP)
+        note = (f"_Showing the first {_CODE_CAP // 1024} KB of {len(raw.encode('utf-8', 'ignore')) / 1024:,.0f} KB._\n\n")
+        raw = raw[:cut if cut > 0 else _CODE_CAP]
+    ticks = max([len(m) for m in re.findall(r"`+", raw)] + [2]) + 1
+    fence = "`" * ticks
+    return mdreader.render(f"{note}{fence}{lang if lang.isalnum() else ''}\n{raw}\n{fence}\n", toc=False, max_chars=0)
+
+def render_file(p, embed=False, drop_h1=True):
+    """Returns (html, toc_tokens) — toc_tokens only for markdown. Markdown goes through the shared reader
+    (vendored mdreader.py, Mission Control's one markdown reader); CSV keeps its own tables; anything else is a
+    code block. embed=True: a fold/drawer inside another page (no inline contents)."""
     if p.suffix.lower() == ".csv":
         body = render_financial(p) if p.parent.name == "financials" else render_plain_csv(p)
         return body, []
-    md = markdown.Markdown(extensions=MD_EXTS)
-    body = md.convert(p.read_text(encoding="utf-8", errors="ignore"))
-    # Relative links between docs (e.g. FINAL-REPORT's "see update-<date>.md") break
-    # under /view?path=… — resolve them against the doc's folder and route via the SPA.
-    import re as _re
-    def _fix(m):
-        href = m.group(1)
+    raw = p.read_text(encoding="utf-8", errors="ignore")
+    suf = p.suffix.lower()
+    if suf in (".md", ".markdown"):
+        return mdreader.render_with_toc(raw, resolve_link=_doc_link(p), drop_first_h1=drop_h1,
+                                        toc=False if embed else "auto")
+    if suf == ".txt":
+        return mdreader.render(raw, mode="text", toc=False), []
+    return _code_view(p, raw), []
+
+def doc_title(p):
+    """The page H1 for a document: its own leading '# ' line in full (the one the reader drops), else label()."""
+    if p.suffix.lower() in (".md", ".markdown"):
         try:
-            tgt = (p.parent / href).resolve().relative_to(ROOT)
+            body = mdreader.parse_frontmatter(p.read_text(encoding="utf-8", errors="ignore"))["body"]
         except Exception:
-            return m.group(0)
-        return f"href=\"/view?path={tgt}\" data-path=\"{tgt}\""
-    body = _re.sub(r'href="(?!(?:[a-z][a-z0-9+.-]*:|/|#))([^"]+)"', _fix, body)
-    # a markdown table is as wide as its widest row: the weekly digest's tables made /recommendation
-    # 680px wide on every phone. Each one scrolls inside its own box instead of the page.
-    body = _re.sub(r"<table(\s|>)", r"<div class=tablewrap><table\1", body).replace("</table>", "</table></div>")
-    return body, getattr(md, "toc_tokens", [])
+            body = ""
+        for line in body.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("# "):
+                t = re.sub(r"\*\*|__|`", "", s[2:]).strip().rstrip("#").strip()
+                if t:
+                    return t
+            break
+    return label(p)
 
 # ---------- thesis card (the one-page state summary; analysis/card.json) ----------
 def render_card(cdir):
@@ -1335,6 +1434,12 @@ def pfseg():
             return lp.seg(path)   # Learn: Guides · Glossary · Library
         except Exception:
             return ""
+    tp = globals().get("thesis_page")
+    if tp is not None and _under(path, "/thesis"):
+        try:
+            return tp.seg(path)   # Thesis: Theses · Data · Thoughts
+        except Exception:
+            return ""
     if path in {p for p, _ in PF_SEGS}:
         return _segbar(PF_SEGS, path)
     if path in {p for p, _ in RS_SEGS}:
@@ -1502,7 +1607,7 @@ def home_inner():
               f"<div class=arow><span>Money market{mmf_sub}</span><span class=amono>{f'${mmf:,.0f}' if acct_ok else '—'}</span></div>"
               + (f"<div class=arow><span title='{html.escape(note_lbl)}'>Structured note <span class=hint>2/2028</span></span>"
                  f"<span class=amono>${note_v:,.0f}</span></div>" if note_v else "")
-              + (f"<div class=arow><span>Private holdings <span class=hint>marked by hand</span></span><span class=amono>${priv_v:,.0f}</span></div>" if priv_v else "")
+              + (f"<div class=arow><span>Off-feed holdings <span class=hint>marked by hand</span></span><span class=amono>${priv_v:,.0f}</span></div>" if priv_v else "")
               + f"<div class='arow total'><span>Total account</span><span id=ac-total class=amono>—</span></div>"
               f"<div class=arow><span>Est. income · {yld*100:.1f}%</span><span class=amono>{f'~${inc:,.0f}/yr' if acct_ok else '—'}</span></div>"
               f"<div class=arow><span>Dry powder <span class=hint>cash + money market</span></span>"
@@ -1579,7 +1684,10 @@ def view_inner(rel):
     else:
         crumb += [html.escape(x) for x in parts[:-1]]
     body, toc = render_file(p)
-    head = f"<div class=crumb>{'<span class=csep>/</span>'.join(crumb)}</div><h1 class=doctitle>{html.escape(label(p))}</h1>"
+    title = doc_title(p)
+    # a session log's H1 is a whole sentence: a long title steps down a size instead of filling the screen
+    tcls = "doctitle long" if len(title) > 80 else "doctitle"
+    head = f"<div class=crumb>{'<span class=csep>/</span>'.join(crumb)}</div><h1 class='{tcls}'>{html.escape(title)}</h1>"
     return head + article_with_toc(body, toc)
 
 def article_with_toc(body, toc):
@@ -1634,7 +1742,7 @@ def rec_inner():
     latest = recs[0]
     d = latest.stem.replace("rec_", "")
     out.append(f"<div class=recdate><span class='badge mat'>Latest</span><span class=muted>{html.escape(d)}</span></div>")
-    body, toc = render_file(latest)
+    body, toc = render_file(latest, drop_h1=False)   # the page title is "Advice": the report's H1 is not a duplicate
     out.append(article_with_toc(body, toc))
     if len(recs) > 1:
         out.append("<div class=sec>Previous</div><div class=chips>")
@@ -1987,7 +2095,7 @@ def research_inner():
             "and the Brief. What we own is under Holdings.</p></div>"
             f"<div class=headactions>{add}</div></div>"
             "<div class=homegrid><div class=homemain>" + names_w() + dig_w +
-            "</div><div class=homerail>" + cal_w + "</div></div>")
+            "</div><div class=homerail>" + cal_w + "</div></div>" + stopped_w())
 
 
 def _writeup(cf):
@@ -2005,7 +2113,8 @@ def names_w():
     stocks and their performance along with research stocks"). One row per name we watch or
     have researched but do NOT own in any book — owned names live under Holdings. × stops
     watching a name; + Watch adds a researched one to the watchlist feed. Prices and returns
-    arrive from the single /api/perf batch."""
+    arrive from the single /api/perf batch. The last column's × stops following a name
+    (follow.py, 2026-09-27): out of this table and every refresh, with Undo on the toast."""
     pos = read_positions()
     held = held_all()
     wl = watchlist()
@@ -2032,7 +2141,7 @@ def names_w():
                  f"<td class='num p-price c-px'>·</td><td class='num p-d1 c-d1'></td><td class='num p-m1 c-wide'></td>"
                  f"<td class='num p-m6 c-mid'></td><td class='num p-ytd c-wide'></td>"
                  f"<td class=c-mid>{verdict}</td><td class=c-wide>{_writeup(cf) or '<span class=muted>—</span>'}</td>"
-                 f"<td class=rmc>{act}</td></tr>")
+                 f"<td class=rmc>{act}</td><td class=rmc>{_stop_btn(tk)}</td></tr>")
     # owned names that are still on the watchlist file keep feeding What's new and the Brief;
     # the old sidebar let you drop them, so this line still does
     owned = [t for t in wl if t in held]
@@ -2048,18 +2157,61 @@ def names_w():
             "<table class=dt id=nametable><thead><tr><th>Name</th><th class='num c-px'>Price</th>"
             "<th class='num c-d1'>Day</th><th class='num c-wide'>1M</th><th class='num c-mid'>6M</th>"
             "<th class='num c-wide'>YTD</th><th class=c-mid>Verdict</th><th class=c-wide>Write-up</th>"
-            "<th class=rmc>Watch</th>"
+            "<th class=rmc>Watch</th><th class=rmc>Stop<span class=wl> following</span></th>"
             f"</tr></thead><tbody>{rows}</tbody></table>{empty}{foot}</div></div>")
+
+
+def _stop_btn(tk, label=False):
+    """The one-tap Stop following control (David 2026-09-27: "need an easier way to remove
+    companies from watchlist/research"). No confirm(): the toast's Undo restores exactly what
+    the stop took. Never rendered for a held name — callers skip those."""
+    if label:
+        return (f"<button class='rlink fstop-l' title='Stop following {tk}' aria-label='Stop following {tk}' "
+                f"onclick='followStop(event,\"{tk}\")'>× Stop following</button>")
+    return (f"<button class=fstop title='Stop following {tk}' aria-label='Stop following {tk}' "
+            f"onclick='followStop(event,\"{tk}\")'><span aria-hidden=true>×</span></button>")
+
+
+_TK_SAFE = re.compile(r"[A-Z][A-Z0-9.\-]{0,11}")
+
+
+def stopped_w():
+    """The "Stopped following (N)" fold — the names follow.py took out of every list and refresh,
+    each one Restore away. Renders nothing when there are none. A stopped name a book has bought
+    since is followed again already (follow.stopped() leaves it out); its row says so, because
+    its price alert stays parked until Restore."""
+    reg = {tk: e for tk, e in _follow.load(CONF).items() if _TK_SAFE.fullmatch(tk)}
+    if not reg:
+        return ""
+    nm = ticker_names()
+    again = _follow.held_again(CONF)
+
+    def when(tk, e):
+        if tk in again:
+            return (f"held again in {html.escape(again[tk])} — followed; Restore puts back its "
+                    f"parked price alert")
+        return "stopped " + html.escape(str(e.get('at') or '')[:10] if isinstance(e, dict) else '')
+    rows = "".join(
+        f"<div class=fsrow data-tk='{tk}'><div class=fsname><a class=tklink data-tk='{tk}' href='/ticker/{tk}'>{tk}</a>"
+        f"<span class=subname>{html.escape(nm.get(tk) or '')}</span></div>"
+        f"<span class=hint>{when(tk, e)}</span>"
+        f"<button class=btn onclick='followRestore(event,\"{tk}\")'>Restore</button></div>"
+        for tk, e in sorted(reg.items()))
+    return (f"<details class=fold id=stopped><summary>Stopped following <span class=hint>({len(reg)}) — no "
+            f"pushes, filing pulls, research updates or one-pagers; the research stays on disk</span></summary>"
+            f"<div class=fslist>{rows}</div></details>")
 
 
 def research_companies_inner():
     """/research/companies — every research folder (what the sidebar's Research tree was):
     grouped Held / Watching / Researched, the verdict dot, the report / playbook / latest update,
     the live ticker, and archive (never for a name any book owns)."""
-    held = held_all(); wl = set(watchlist()); pos = read_positions()
+    held = held_all(); wl = set(watchlist()); pos = read_positions(); stop = _follow.stopped(CONF)
     groups = {"Held": [], "Watching": [], "Researched": []}
     for c in companies():
         tk = ticker_of(c)
+        if tk in stop and tk not in held:
+            continue
         nm = (pos.get(tk, {}).get("name") or ticker_names().get(tk)
               or c.name.rsplit("-", 1)[0].replace("_", " "))
         groups["Held" if tk in held else ("Watching" if tk in wl else "Researched")].append((tk, nm, c))
@@ -2086,6 +2238,8 @@ def research_companies_inner():
                 f"href='/view?path={html.escape(str(f.relative_to(ROOT)))}'>{html.escape(lab)}</a>"
                 for f, lab in picks if f.exists())
             links += f"<a class=rlink data-tk='{tk}' href='/ticker/{tk}'>Live ticker</a>"
+            if tk not in held:
+                links += _stop_btn(tk, label=True)
             out.append(f"<div class=rco data-co='{tk}'><div class=rco-top>{dot}"
                        f"<a class=rco-nm data-tk='{tk}' href='/ticker/{tk}'>{html.escape(nm)}</a>"
                        f"<span class=rco-tk>{tk}</span>{arch}</div>"
@@ -2095,7 +2249,8 @@ def research_companies_inner():
         out.append("<div class=pfempty2>No dossiers yet — open a ticker and run ✦ Research.</div>")
     return ("<div class=pagehead><div><h1>Companies</h1><p class=muted>Every company with a research "
             "folder. The dot is the verdict: green buy, amber buy-below or caution, red pass. "
-            "× archives a folder (it moves to _archive/, reversible).</p></div></div>" + "".join(out))
+            "× archives a folder (it moves to _archive/, reversible). Stop following keeps the folder "
+            "and ends every refresh for the name.</p></div></div>" + "".join(out) + stopped_w())
 
 
 def research_boards_inner():
@@ -2324,6 +2479,8 @@ def wl_api():
         action = b.get("action") or request.args.get("action", "")
         tk = str(b.get("ticker") or request.args.get("ticker", "")).upper().strip()
     f = CONF / "watchlist.txt"
+    if action == "add" and tk and _follow.is_stopped(tk, CONF):
+        _follow.restore(tk, CONF)   # watching a stopped name follows it again (2026-09-27)
     if action == "add" and tk and tk not in watchlist():
         txt = f.read_text() if f.exists() else ""
         if txt and not txt.endswith("\n"):
@@ -2393,17 +2550,87 @@ def _pos_value(p):
 
 _LAST_SYNC = [0.0]
 
-def _sync_accounts(st, qp, accts, bdir, watch):
+def _fund_account_row(st, qp, acc, key):
+    """An account that is ONE fund (books.json "funds": the AB Security SMA in its own J.P. Morgan
+    account): its value, its cash and its stocks, as one row of account.json "funds"."""
+    aid = acc.get("id")
+    value = float(((acc.get("balance") or {}).get("total") or {}).get("amount") or 0)
+    cash = 0.0
+    try:
+        for b in st.account_information.get_user_account_balance(query_params=qp, path_params={"accountId": aid}).body:
+            cash += float(b.get("cash") or 0)
+    except Exception:
+        pass
+    held = []
+    try:
+        for p in st.account_information.get_user_account_positions(query_params=qp, path_params={"accountId": aid}).body:
+            sy = ((p.get("symbol") or {}).get("symbol") or {})
+            tk = sy.get("symbol") if isinstance(sy, dict) else sy
+            held.append({"tk": str(tk or "").upper(), "name": (sy.get("description") if isinstance(sy, dict) else "") or "",
+                         "units": float(p.get("units") or 0), "value": round(_pos_value(p), 2)})
+    except Exception:
+        pass
+    held.sort(key=lambda h: -h["value"])
+    num = str(acc.get("number") or "")
+    return {"key": key, "kind": "account", "account": "…" + num[-4:] if num else "",
+            "account_name": acc.get("name"), "value": round(value, 2), "cash": round(cash, 2), "holdings": held}
+
+
+def _pending_subscriptions(st, qp, aids, held, room, days=150):
+    """Fund subscriptions the broker's total counts but its positions do not list yet — read from
+    the activity feed, never typed in (David 2026-09-29: everything viewed programmatically, the
+    private mark the only number by hand). A BUY of a symbol that is not held, never sold, within
+    `days`, with its FEE rows beside it (CTEK's subscription, 2026-09-28: a BUY and its FEE row). Kept only while the broker's unexplained money (`room`) can hold them all; once
+    the fund is itemized its symbol is held and the row goes by itself."""
+    cut = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    rows, sold = {}, set()
+    for aid in aids:
+        try:
+            act = st.account_information.get_account_activities(query_params=qp, path_params={"accountId": aid}).body
+            act = act if isinstance(act, list) else (act or {}).get("data", [])
+        except Exception:
+            continue
+        for r in act or []:
+            s = r.get("symbol") or {}
+            sym = str((s.get("symbol") if isinstance(s, dict) else s) or "").upper()
+            typ = str(r.get("type") or "").upper()
+            d = str(r.get("trade_date") or r.get("settlement_date") or "")[:10]
+            if not sym or sym in held or d < cut:
+                continue
+            if typ == "SELL":
+                sold.add(sym)
+                continue
+            if typ not in ("BUY", "FEE"):
+                continue
+            desc = str(r.get("description") or (s.get("description") if isinstance(s, dict) else "") or sym)
+            g = rows.setdefault(sym, {"kind": "subscription", "symbol": sym, "name": desc.split(" - ")[0].strip()[:90],
+                                      "value": 0.0, "fee": 0.0, "date": d})
+            amt = abs(float(r.get("amount") or 0))
+            if typ == "BUY":
+                g["value"] += amt
+                g["date"] = min(g["date"], d) if g["date"] else d
+            else:
+                g["fee"] += amt
+    out = [dict(g, value=round(g["value"], 2), fee=round(g["fee"], 2)) for k, g in rows.items() if k not in sold and g["value"] > 0.5]
+    return out if sum(g["value"] for g in out) <= room + max(100.0, 0.01 * room) else []
+
+
+def _sync_accounts(st, qp, accts, bdir, watch, funds=None, subscriptions=False):
     """Pull one BOOK's accounts into <bdir>/account.json + positions.json. Split out of
     st_sync 2026-09-11 when the DIP Venture account joined the same AggregatorA user:
     accounts are routed by _engine/books.py, never summed blindly. `watch` — only the
     BROKERA book feeds names into watchlist.txt (David's universe); other books keep their
-    holdings to their own page."""
+    holdings to their own page. `funds` {account id: plane key}: an account that is one fund is
+    written as a row of account.json "funds", not merged; `subscriptions`: fund subscriptions the
+    broker counts but does not list (from the activity feed) become rows too (2026-09-29)."""
     def _jread(name, default):
         try:
             return json.loads((bdir / name).read_text())
         except Exception:
             return default
+    funds = funds or {}
+    fund_rows = [_fund_account_row(st, qp, a, funds[a.get("id")]) for a in accts if a.get("id") in funds]
+    accts = [a for a in accts if a.get("id") not in funds]
     holdings = {}; total_value = cash = stock_val = note_live = mmf_held = 0.0; note_mark = None
     mmf_names = []
     for acc in accts:
@@ -2441,6 +2668,16 @@ def _sync_accounts(st, qp, accts, bdir, watch):
     # that no position explains (an un-itemized sweep). Keeping them separate matters:
     # the itemized part is a fact, the residual is a plug, and the widget says which.
     resid = round(total_value - cash - stock_val - note_v - mmf_held, 2)
+    # an off-feed entry flagged in_broker_total (private.json) is money the broker's total already holds
+    # but no position lists — a fund subscription before it is itemized (CTEK, 2026-09-28). It is its
+    # own row in the book, so it must not ALSO be read as money market (David 2026-09-29).
+    if subscriptions and accts:
+        fund_rows += _pending_subscriptions(st, qp, [a.get("id") for a in accts], set(holdings) | set(mmf_names), max(resid, 0.0))
+    subs = sum(f["value"] for f in fund_rows if f.get("kind") == "subscription")
+    inside = sum(float(x.get("value") or 0) for x in _books.live_hand_rows(
+                     _jread("private.json", []) or [], {t: {"shares": h["shares"]} for t, h in holdings.items()}, fund_rows)
+                 if isinstance(x, dict) and x.get("in_broker_total"))
+    resid = round(resid - subs - inside, 2)
     # A big negative residual means our valuation disagrees with the broker — keep the
     # last good number rather than poison the value chart.
     warn = ""
@@ -2458,7 +2695,7 @@ def _sync_accounts(st, qp, accts, bdir, watch):
     now_et = dt.datetime.now(ZoneInfo("America/New_York"))
     acct.update({"total_value": round(total_value, 2), "cash": round(cash, 2), "money_market": mmf,
                  "currency": "USD", "as_of": now_et.strftime("%b %-d, %-I:%M %p ET"),
-                 "as_of_epoch": round(time.time()),
+                 "as_of_epoch": round(time.time()), "funds": fund_rows,
                  "accounts": [{"id": a.get("id"), "number": str(a.get("number") or "")[-4:], "name": a.get("name")} for a in accts]})
     if note_live:
         acct["structured_note"] = note_v
@@ -2539,7 +2776,8 @@ def st_sync():
         for slug, group in by_book.items():
             if not group:
                 continue
-            r = _sync_accounts(st, qp, group, _books.book_dir(slug, bk), watch=(slug == "brokera"))
+            r = _sync_accounts(st, qp, group, _books.book_dir(slug, bk), watch=(slug == "brokera"),
+                               funds=_books.funds_of(slug, bk), subscriptions=(slug != "brokera"))
             synced[slug] = r["synced"]
             if r["warn"]:
                 warns.append(f"{bk[slug]['label']}: {r['warn']}")
@@ -2596,8 +2834,11 @@ def digest():
 
 def tracked_tickers():
     """Every name the operation follows: owned in any book (the BrokerB agent's positions
-    too, so the sidebar's Holdings quotes are pre-warmed), watched, or with a research folder."""
-    return sorted(held_all() | set(watchlist()) | {ticker_of(c) for c in companies()})
+    too, so the sidebar's Holdings quotes are pre-warmed), watched, or with a research folder —
+    minus the names David stopped following (follow.py, 2026-09-27), which leave the Research
+    table, the perf batch and the quote pre-warm. A held name is always followed."""
+    rest = (set(watchlist()) | {ticker_of(c) for c in companies()}) - _follow.stopped(CONF)
+    return sorted(held_all() | rest)
 
 @app.route("/api/sidebar")
 def api_sidebar():
@@ -3444,6 +3685,20 @@ border:1px solid var(--line);font-size:13.5px;font-weight:500;color:var(--acc)}
 #nametable th,#nametable td{padding-left:8px;padding-right:8px}}
 .dt .rmc .wbtn.on{background:var(--accbg);border-color:transparent;color:var(--acc)}
 #nametable th.rmc{font-size:12px;text-align:center}
+/* Stop following (2026-09-27): a 44px tap target around the same 26px circle as .rm; the Undo toast
+   is the one toast you can tap */
+.fstop{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;border:0;
+background:none;cursor:pointer;vertical-align:middle}
+.fstop>span{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border:1px solid var(--line);
+border-radius:50%;background:var(--panel);color:var(--mut);font-size:15px;line-height:1;transition:color .1s,border-color .1s}
+.fstop:hover>span,.fstop:focus-visible>span{color:var(--red);border-color:var(--red)}
+.rlink.fstop-l{min-height:44px;color:var(--mut);font:inherit;font-size:13.5px;cursor:pointer}
+.rlink.fstop-l:hover{color:var(--red);border-color:var(--red)}
+.fsrow{display:flex;align-items:center;flex-wrap:wrap;gap:6px 12px;padding:8px 0;border-top:1px solid var(--line)}
+.fsrow:first-child{border-top:none}.fsname{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px}
+.toast.act{pointer-events:auto;display:flex;align-items:center;gap:6px;padding:0 4px 0 18px;max-width:calc(100vw - 32px)}
+.toast.act button{min-height:44px;min-width:44px;padding:0 14px;border:0;background:none;color:inherit;font:inherit;
+font-weight:700;text-decoration:underline;cursor:pointer}
 /* WIDTH SYSTEM (2026-08-31, David: "nothing hard coded — adjusting accordingly,
    sizing flexible based on screen size"). The frame is FLUID: no pixel cap, padding
    scales with the viewport. Each content type carries its own INTRINSIC constraint
@@ -4094,6 +4349,29 @@ function removeWatch(e,tk,cb){if(e){e.stopPropagation();e.preventDefault();}
 function here(){return location.pathname+location.search;}
 function rsWatch(e,tk){e.stopPropagation();e.preventDefault();addWatch(tk,function(){nav(here(),false);});}
 function rsUnwatch(e,tk){e.stopPropagation();e.preventDefault();removeWatch(null,tk,function(){nav(here(),false);});}
+/* Stop following (David 2026-09-27): one tap takes a name out of every list and refresh (follow.py).
+   No confirm(): the toast's Undo puts back exactly what the stop took. A held name is refused by
+   the server and says why. */
+function followStop(e,tk){if(e){e.stopPropagation();e.preventDefault();}
+ var row=e&&e.target?e.target.closest('tr.nrow,.rco'):null;
+ postJson('/api/follow/stop',{ticker:tk}).then(function(r){return r.json()}).then(function(d){
+  if(!d.ok){toast(d.msg||('Could not stop following '+tk));return;}
+  if(row)row.remove();
+  var i=WATCH.indexOf(tk);if(i>=0)WATCH.splice(i,1);
+  toastAct(d.msg||('Stopped following '+tk),'Undo',function(){followRestore(null,tk);});
+  if(location.pathname.indexOf('/research')===0)nav(here(),false);
+ }).catch(function(){toast('error');});}
+function followRestore(e,tk){if(e){e.stopPropagation();e.preventDefault();}
+ postJson('/api/follow/restore',{ticker:tk}).then(function(r){return r.json()}).then(function(d){
+  toast(d.msg||('Following '+tk+' again'));
+  if(d.ok&&location.pathname.indexOf('/research')===0)nav(here(),false);
+ }).catch(function(){toast('error');});}
+function toastAct(msg,label,fn){var t=document.createElement('div');t.className='toast act';t.setAttribute('role','status');
+ var s=document.createElement('span');s.textContent=msg;var b=document.createElement('button');b.type='button';b.textContent=label;
+ var done=false;function close(){if(!t.parentNode)return;t.classList.remove('show');setTimeout(function(){t.remove()},260);}
+ b.onclick=function(){if(done)return;done=true;close();fn();};
+ t.appendChild(s);t.appendChild(b);document.body.appendChild(t);
+ requestAnimationFrame(function(){t.classList.add('show')});setTimeout(close,6000);}
 function archiveResearch(e,tk){e.stopPropagation();e.preventDefault();
  if(!confirm('Archive the '+tk+' research folder? It moves to _archive/ (reversible by moving it back).'))return;
  post('/api/research/archive?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
@@ -4332,7 +4610,7 @@ function paginate(tbl,size){var tb=tbl.tBodies[0];if(!tb)return;
  function render(){for(var i=0;i<rows.length;i++)rows[i].style.display=i<shown?'':'none';
   btn.textContent='Show '+Math.min(size,rows.length-shown)+' more  ·  '+shown+' of '+rows.length;if(shown>=rows.length)tr.style.display='none';}
  btn.onclick=function(e){e.stopPropagation();e.preventDefault();shown=Math.min(shown+size,rows.length);render();};render();}
-function paginateAll(){document.querySelectorAll('#main table').forEach(function(t){if(!t.dataset.pg){t.dataset.pg='1';paginate(t,10);}});}
+function paginateAll(){document.querySelectorAll('#main table').forEach(function(t){if(!t.dataset.pg&&!t.closest('.mdr')){t.dataset.pg='1';paginate(t,10);}});}   /* a document's own tables show every row */
 var _pollIvs={};
 function pollResearch(tk,box){
  if(_pollIvs['r'+tk])clearInterval(_pollIvs['r'+tk]);
@@ -4613,6 +4891,7 @@ function goHash(hash){if(!hash||hash.length<2)return false;var id=decodeURICompo
  if(document.querySelector('.tab[data-tab="'+id.replace(/"/g,'')+'"]'))return false;  /* a tab: restoreTab() owns it */
  var el=document.getElementById(id);if(!el)return false;if(el.tagName==='DETAILS')el.open=true;
  var d=el.closest&&el.closest('details');if(d)d.open=true;el.scrollIntoView({block:'start'});return true;}
+var _shown=location.pathname+location.search;   /* the page #main holds now (path+query, no hash) */
 function nav(route,push){
  var hi=route.indexOf('#'),hash=hi>=0?route.slice(hi):'';if(hi>=0)route=route.slice(0,hi);
  var url=route+(route.indexOf('?')>=0?'&':'?')+'partial=1';
@@ -4625,10 +4904,14 @@ function nav(route,push){
   if(x.ver&&typeof APPV!=='undefined'&&x.ver!==APPV){location.href=route;return null;} /* server redeployed — full reload */
   return x.text;}).then(function(h){if(h==null)return;
   /* inline, so it beats the stylesheet — keep it in step with #main{animation} */
+  /* leaving a page that had a sheet open: run its cleanup, drop its hook, and release the scroll
+     lock it put on <html> — else the next page cannot scroll (review 2026-09-28) */
+  if(typeof window.sheetCleanup==='function'){try{window.sheetCleanup();}catch(_){}}
+  window.sheetPop=null;window.sheetCleanup=null;document.documentElement.style.overflow='';
   var m=document.getElementById('main');m.innerHTML=h;m.style.animation='none';void m.offsetWidth;m.style.animation='fade .07s linear';
   /* a page module's own <script data-run> (charts on /dip/industries, 2026-09-20): innerHTML never executes scripts, so re-create them */
   m.querySelectorAll('script[data-run]').forEach(function(s){var n=document.createElement('script');n.textContent=s.textContent;s.parentNode.replaceChild(n,s);});
-  readBook();setActive(route);
+  readBook();setActive(route);_shown=route;
   if(push)history.pushState({route:route+hash},'',route+hash);
   var nv=document.getElementById('nav');if(nv)nv.checked=false;window.scrollTo(0,0);setTitle();enhance();
   if(hash)goHash(hash);
@@ -4741,7 +5024,18 @@ document.addEventListener('click',function(e){
  else nav('/view?path='+encodeURIComponent(el.dataset.path),true);
 });
 document.addEventListener('click',function(e){var fh=e.target.closest('.fhead');if(fh)fh.parentNode.classList.toggle('open');});
-window.addEventListener('popstate',function(e){var r=(e.state&&e.state.route)||(location.pathname+location.search);
+/* A page that opens a SHEET (bottom sheet on the phone, centered sheet on a laptop — the mobile-web
+   rule, 2026-09-28) pushes a history entry per step, so the phone's swipe-back and the browser's
+   Back close the sheet instead of leaving the page. Such a page sets window.sheetPop(e): it returns
+   true when it handled the popstate (opened or closed a sheet step), and the page is not re-fetched.
+   It runs FIRST: a sheet step keeps the page's URL, so the same-page rule below would swallow it.
+   nav() clears it, so a page that did not set it never sees another page's sheet.
+   A #fragment click (the reader's Contents list and rail) fires popstate in Chrome; the page shown is
+   already this one, so only jump — nav() would refetch it and reset the scroll to 0 (2026-09-28). */
+window.addEventListener('popstate',function(e){
+ if(typeof window.sheetPop==='function'){try{if(window.sheetPop(e))return;}catch(_){}}
+ if(location.pathname+location.search===_shown){goHash(location.hash);return;}
+ var r=(e.state&&e.state.route)||(location.pathname+location.search);
  nav(r.replace('&partial=1','').replace('?partial=1',''),false);});
 /* Exactly ONE nav item is lit for the current page (2026-09-22 redesign). navKey() is the
    route → item table, the same as app.nav_key() (tests/test_dashboard_nav.py runs both over
@@ -4755,6 +5049,7 @@ function navKey(route){
  if(under('/dip'))return 'dip';
  if(under('/agent'))return 'agent';
  if(under('/research')||p.indexOf('/company/')===0)return 'research';
+ if(under('/thesis'))return 'thesis';
  if(under('/learn')||p==='/primer'||p==='/lookups')return 'learn';
  if(p==='/advised')return 'paused';
  if(p==='/view'){v=(q.match(/(?:^|&)path=([^&#]*)/)||[])[1]||'';
@@ -4806,6 +5101,8 @@ lookups_page.register(app, wrap)
 
 import primer_page  # /primer — David's finance primer (terms + desk applications)
 primer_page.register(app, wrap)
+# /api/follow/stop|restore (POST) + /api/follow/stopped — one-tap Stop following (2026-09-27)
+_follow.register(app)
 JS += today_page.JS
 
 # /learn — guides built on live numbers from the desk, plus the glossary (/primer) and the library
@@ -4825,6 +5122,23 @@ if learn_page is not None:
     except Exception as _ex:   # noqa: BLE001
         print(f"learn_page.register failed ({type(_ex).__name__}: {_ex}) — /learn is off", file=sys.stderr)
         learn_page = None
+
+# /thesis — David's theses (the thesis project), the data they rest on and his thoughts on them
+# (2026-09-29). Everything it shows is another project's, read by catalog id through boxdata; a
+# thought goes to the memo bus, never into the thesis project. Guarded like Learn.
+try:
+    import thesis_page
+except Exception as _ex:   # noqa: BLE001
+    thesis_page = None
+    print(f"thesis_page not loaded ({type(_ex).__name__}: {_ex}) — /thesis is off", file=sys.stderr)
+if thesis_page is not None:
+    try:
+        thesis_page.register(app, wrap)
+        CSS += thesis_page.CSS
+        JS += thesis_page.JS
+    except Exception as _ex:   # noqa: BLE001
+        print(f"thesis_page.register failed ({type(_ex).__name__}: {_ex}) — /thesis is off", file=sys.stderr)
+        thesis_page = None
 
 def _fresh(k, ttl):
     return _fresh_hit(k, _CACHE.get(k), ttl)
@@ -5002,6 +5316,29 @@ def start_warmers():
         return
     threading.Thread(target=_warm_quotes, name="warm-quotes", daemon=True).start()
     threading.Thread(target=_warm_panes, name="warm-panes", daemon=True).start()
+
+# The shared markdown reader (mdreader, vendored — see render_file): its tokens mapped to this
+# dashboard's palette and type, then its stylesheet LAST so it wins ties with the global
+# code/pre/h2/th rules. Light ink-3 and warn are a step darker than --fade/--yel (3.4:1); code
+# never sits on --panel (white on white in a fold). tnum is off in prose (the reader resets
+# font-feature-settings), so "real-money" and "2026-09-05" have no hyphen gaps (David 2026-09-27).
+CSS += """
+:root{--mdr-font:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;--mdr-font-display:var(--mdr-font);
+--mdr-mono:ui-monospace,SFMono-Regular,Menlo,monospace;--mdr-ink:var(--fg);--mdr-ink-2:var(--mut);--mdr-ink-3:#5f6a78;
+--mdr-ink-4:#a3acb7;--mdr-rule:var(--line);--mdr-sunk:#eaeef2;--mdr-code-bg:#e8ecf1;--mdr-surface-2:var(--panel);
+--mdr-link:var(--acc);--mdr-warn:#8a6100;--mdr-bad:var(--neg);--mdr-scroll-margin:76px}
+@media(prefers-color-scheme:dark){:root{--mdr-ink-3:var(--fade);--mdr-ink-4:#5b6571;--mdr-sunk:#1b1f25;--mdr-code-bg:#1b1f25;--mdr-warn:var(--yel)}}
+@media(min-width:1151px){.docgrid .mdr-toc{display:none}}
+h1.doctitle,.doctoc{font-feature-settings:'cv11' 1}h1.doctitle{line-height:1.22}
+h1.doctitle.long{font-size:clamp(18px,.5vw + 15px,22px);line-height:1.35;letter-spacing:-.005em}
+/* the global sidebar-fold summary (uppercase, flex, padded) must not reach a document's own disclosures */
+.mdr details>summary{display:block;font-size:inherit;letter-spacing:normal;text-transform:none;font-weight:inherit;padding:0;user-select:auto}
+.mdr details>summary::before{padding:0;transition:none}
+.mdopen{font-size:12.5px;margin:10px 0 0}
+""" + mdreader.CSS + """
+.mdr th.num{font-variant-numeric:normal}
+"""   # reader 1.5.1 keeps tnum to td.mdr-num (the 1.5.0 table-wide override is gone), but this page's global
+      # th.num rule still reaches a reader table's numeric headers; Inter's tnum widens hyphens ("Open-mkt $")
 
 if __name__ == "__main__":
     print(f"Stocks dashboard -> http://<host-ip>:{PORT}")

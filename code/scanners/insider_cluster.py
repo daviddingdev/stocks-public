@@ -21,6 +21,7 @@ later stage once the warehouse has market caps; v1 emits the raw cluster signal.
 import argparse
 import datetime as dt
 import io
+import os
 import re
 import sys
 import time
@@ -31,6 +32,7 @@ from lxml import etree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from edgar_identity import UA  # SEC contact identity, config-driven
+import secdoor  # the box's one SEC door, with get()'s own fetch as fallback
 ENGINE = Path(__file__).resolve().parent.parent
 OUT = ENGINE / "candidate-boards"
 SEC = "https://www.sec.gov"
@@ -47,7 +49,35 @@ def _throttle(min_interval=0.11):
             time.sleep(min_interval - dtm)
         _last[0] = time.monotonic()
 
+# What SEC labels each file this scanner reads, so a door body decodes exactly as a direct
+# requests.get did: a daily form.idx is application/octet-stream (requests guesses the charset),
+# a full-submission .txt is text/plain (ISO-8859-1). Checked live 2026-10-01.
+_CTYPE = {".idx": "application/octet-stream", ".txt": "text/plain"}
+
+
+def _as_response(url, body):
+    """The door's bytes as the requests.Response the old fetch returned (status 200)."""
+    from requests.structures import CaseInsensitiveDict
+    from requests.utils import get_encoding_from_headers
+    r = requests.models.Response()
+    r.status_code, r.reason, r.url = 200, "OK", url
+    r._content, r._content_consumed = body, True
+    ext = os.path.splitext(url.split("?", 1)[0])[1].lower()
+    r.headers = CaseInsensitiveDict({"content-type": _CTYPE.get(ext, "application/octet-stream")})
+    r.encoding = get_encoding_from_headers(r.headers)
+    return r
+
+
 def get(url, tries=3):
+    # SEC through the box's one SEC door first (secdoor.py: one cross-process limit for the
+    # box, so this scanner no longer runs ~9 req/s beside grunt); the loop below is the
+    # unchanged fallback when the desk can't answer. A missing file is None, as before.
+    try:
+        body = secdoor.fetch(url, timeout=30)
+    except secdoor.Unavailable:
+        pass
+    else:
+        return None if body is None else _as_response(url, body)
     for i in range(tries):
         _throttle()
         try:
