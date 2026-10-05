@@ -114,6 +114,25 @@ def cik_from_path(p):
 
 _OWN_RE = re.compile(r"<ownershipDocument>.*?</ownershipDocument>", re.S)
 
+def issuer_non_us(txt):
+    """True when the SEC header puts the ISSUER's business address outside the US.
+
+    Form 4 XML has no currency field, and foreign issuers' insiders report prices in
+    local currency (Bradesco in reais, TSMC in NT$), which this scanner used to sum
+    as dollars (BBD read ~5x too big on 2026-09-27 and 10-04). We flag, not convert."""
+    hdr = txt.split("</SEC-HEADER>")[0]
+    i = hdr.find("ISSUER:")
+    if i < 0:
+        return False
+    seg = hdr[i:]
+    j = seg.find("REPORTING-OWNER:")
+    if j > 0:
+        seg = seg[:j]
+    b = seg.find("BUSINESS ADDRESS:")
+    if b >= 0:
+        seg = seg[b:].split("MAIL ADDRESS:")[0]
+    return re.search(r"ADDRESS IS A NON US LOCATION:\s*YES", seg) is not None
+
 def parse_purchases(txt):
     """Yield dicts of open-market purchases (code 'P', acquired) from a Form 4 submission."""
     m = _OWN_RE.search(txt)
@@ -193,7 +212,10 @@ def main():
     def fetch_parse(p):
         r = get(SEC + "/Archives/" + p)
         accession = Path(p).stem
-        return [dict(buy, accession=accession) for buy in parse_purchases(r.text)] if r else []
+        if not r:
+            return []
+        foreign = issuer_non_us(r.text)
+        return [dict(buy, accession=accession, foreign=foreign) for buy in parse_purchases(r.text)]
     with ThreadPoolExecutor(max_workers=6) as ex:
         for buys in ex.map(fetch_parse, cand_paths):
             n_forms += 1
@@ -203,7 +225,8 @@ def main():
                     continue
                 a = agg.setdefault(key, {"owners": set(), "value": 0.0,
                                          "symbol": buy["symbol"], "name": buy["issuer"],
-                                         "seen": set()})
+                                         "seen": set(), "foreign": False})
+                a["foreign"] = a["foreign"] or buy.get("foreign", False)
                 seen_key = (buy["accession"], buy["owner"], buy["value"])
                 if seen_key in a["seen"]:
                     continue
@@ -217,7 +240,7 @@ def main():
 
     rows = [{"cik": k, "symbol": v["symbol"], "issuer": v["name"],
              "n_buyers": len(v["owners"]), "buy_value": round(v["value"]),
-             "buyers": ", ".join(sorted(v["owners"]))}
+             "buyers": ", ".join(sorted(v["owners"])), "foreign": int(v["foreign"])}
             for k, v in agg.items() if len(v["owners"]) >= args.min_buyers]
     rows.sort(key=lambda x: (x["n_buyers"], x["buy_value"]), reverse=True)
 
@@ -226,7 +249,7 @@ def main():
     import csv
     csvp = OUT / f"insider-cluster_{stamp}.csv"
     with csvp.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["cik", "symbol", "issuer", "n_buyers", "buy_value", "buyers"])
+        w = csv.DictWriter(f, fieldnames=["cik", "symbol", "issuer", "n_buyers", "buy_value", "buyers", "foreign"])
         w.writeheader()
         w.writerows(rows)
     md = OUT / f"insider-cluster_{stamp}.md"
@@ -234,14 +257,26 @@ def main():
         f.write(f"# Insider cluster-buying scan — {stamp}\n\n")
         f.write(f"Window: last {args.days} days · min {args.min_buyers} distinct insider buyers · "
                 f"{n_forms} Form 4s scanned · {len(rows)} clustered issuers.\n\n")
+        dom = [r for r in rows if not r["foreign"]]
+        fgn = [r for r in rows if r["foreign"]]
         f.write("| Symbol | Issuer | # buyers | Open-mkt $ | Buyers |\n|---|---|--:|--:|---|\n")
-        for r in rows[:60]:
+        for r in dom[:60]:
             f.write(f"| {r['symbol'] or '—'} | {r['issuer'][:40]} | {r['n_buyers']} | "
                     f"${r['buy_value']:,} | {r['buyers'][:80]} |\n")
+        if fgn:
+            f.write(f"\n## Non-US issuers ({len(fgn)}): Form 4 prices may be in LOCAL currency\n\n"
+                    "The SEC header puts these issuers' business address outside the US. Form 4 XML "
+                    "carries no currency, so the amount column is the filed number, not dollars, "
+                    "and is not comparable with the table above.\n\n")
+            f.write("| Symbol | Issuer | # buyers | Open-mkt amount (filed ccy) | Buyers |\n|---|---|--:|--:|---|\n")
+            for r in fgn[:30]:
+                f.write(f"| {r['symbol'] or '—'} | {r['issuer'][:40]} | {r['n_buyers']} | "
+                        f"{r['buy_value']:,} | {r['buyers'][:80]} |\n")
     print(f"\n[insider_cluster] {n_forms} forms, {n_buys} open-market buys parsed, "
           f"{len(rows)} clustered issuers -> {md}", file=sys.stderr)
     for r in rows[:15]:
-        print(f"  {r['n_buyers']}x  {r['symbol'] or '?':6}  ${r['buy_value']:>12,}  {r['issuer'][:36]}")
+        print(f"  {r['n_buyers']}x  {r['symbol'] or '?':6}  {'' if r['foreign'] else '$'}{r['buy_value']:>12,}  "
+              f"{r['issuer'][:36]}{'  (non-US: filed ccy)' if r['foreign'] else ''}")
 
 if __name__ == "__main__":
     main()
