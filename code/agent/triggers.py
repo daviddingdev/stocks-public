@@ -27,7 +27,14 @@ data/trigger_state.json:
   4. Agent book drawdown >= agent_drawdown_alert_pct vs its funded baseline -> ALERT (David decides;
      no auto-liquidation — there are no kill conditions by design)
 
-CLI: triggers.py run | triggers.py test-push
+TEST MODE (David reopened Stocks for it 2026-10-03, decision:20b23fef): `triggers.py run --dry`
+(alias `triggers.py test`) evaluates every rule against live data and PRINTS what it would do —
+no alerts.json row, no push, no decision session, no trigger_state/industry_cache write, and the
+resting-order guard runs dry: it names the orders it would cancel, cancels none, and leaves
+guard_state.json alone, so a test run cannot vouch for a dead cron guard in C32. The COO and the
+signals engineer test with this; the bare `run` is cron's, and it can cancel live orders.
+
+CLI: triggers.py run [--dry] | triggers.py test | triggers.py test-push
 """
 import datetime as dt
 import json
@@ -232,11 +239,17 @@ def move_context(tk):
     return ctx
 
 
+_DRY = False   # set by run(dry=True): print instead of push/write/launch (TEST MODE above)
+
+
 def push(topic, title, msg, nkind=None):
     """Routed through Mission Control's notify.sh so box-wide tiering sees it
     (PROJECT_STANDARDS §1). `topic` is kept for signature compatibility and is the
     same string the `stocks` channel resolves to; the channel is what we pass now."""
     if not topic:
+        return
+    if _DRY:
+        print(f"  [dry] would push: {title} — {msg[:160]}")
         return
     import sys as _s, os as _o
     _s.path.insert(0, _o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))))
@@ -274,6 +287,9 @@ def alert(state, c, key, kind, symbol, msg, action=False, book=""):
     seen[key] = today
     if action and kind not in WINDDOWN_ACTION_KINDS and _lab_mode() == "winddown":
         action = False   # recorded and pushed as an alert; no session (see WINDDOWN_ACTION_KINDS)
+    if _DRY:
+        print(f"  [dry] would {'ACT' if action else 'alert'}: {book or 'Stocks'} · {kind} · {symbol} — {msg[:200]}")
+        return True
     alerts = _j(ALERTS_F, [])
     alerts.append({"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                    "kind": kind, "symbol": symbol, "msg": msg, "action": bool(action), "book": book})
@@ -294,7 +310,9 @@ def alert(state, c, key, kind, symbol, msg, action=False, book=""):
     return True
 
 
-def run():
+def run(dry=False):
+    global _DRY
+    _DRY = bool(dry)
     c = cfg()
     state = _j(STATE_F, {})
 
@@ -548,7 +566,8 @@ def run():
                     icache[tk] = prof.get("finnhubIndustry") or "unknown"
                 g = icache[tk]
             groups.setdefault(g, []).append((tk, p.get("value") or 0))
-        (DATA / "industry_cache.json").write_text(json.dumps(icache, indent=1))
+        if not _DRY:
+            (DATA / "industry_cache.json").write_text(json.dumps(icache, indent=1))
         for g, members in groups.items():
             if g == "unknown" or len(members) < 2:
                 continue
@@ -625,21 +644,23 @@ def run():
     # Runs every tick this engine runs, so the 13:00Z run sees overnight news before the open.
     try:
         import guard
-        for rec in guard.run():
+        for rec in (guard.run(dry=True, persist=False) if _DRY else guard.run()):
             if not rec["reasons"]:
                 continue
             line = guard.describe(rec)
             fired += alert(state, c, f"guard:{rec['intent_id']}", "order guard", rec["symbol"],
                            f"Resting order {line} — re-decide at the next session (intent {rec['intent_id'][:8]})",
                            action=rec["canceled"], book="Agent")
-            if not rec["canceled"]:
+            if not rec["canceled"] and not rec.get("dry"):
                 push(c["ntfy_topic"], "Stocks · agent · GUARD CANCEL FAILED",
                      f"{line} · {json.dumps(rec.get('cancel_result'), default=str)[:160]}")
     except Exception as e:
         print(f"  ! guard failed: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
 
-    _write_json(STATE_F, state)
-    print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} fired "
+    if not _DRY:
+        _write_json(STATE_F, state)
+    print(f"{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')} triggers: {fired} "
+          f"{'would fire (dry: nothing written, pushed, launched or cancelled)' if _DRY else 'fired'} "
           f"({len(jpm_pos)} brokera, {len(ag_pos)} agent holdings watched)")
 
 
@@ -648,6 +669,8 @@ if __name__ == "__main__":
         push(cfg()["ntfy_topic"], "Stocks · test", "Trigger engine connected — this is what alerts will look like.")
         print("test push sent to topic:", cfg()["ntfy_topic"])
     elif sys.argv[1:2] == ["run"]:
-        run()
+        run(dry="--dry" in sys.argv[2:])
+    elif sys.argv[1:2] == ["test"]:
+        run(dry=True)
     else:
-        sys.exit("usage: triggers.py run | triggers.py test-push")
+        sys.exit("usage: triggers.py run [--dry] | triggers.py test | triggers.py test-push")
