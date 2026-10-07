@@ -3574,7 +3574,7 @@ CSS = """
 --fade:#828d9a;--line:#262b32;--acc:#5e97f5;--accbg:#16263e;--neg:#e0685c;--pos:#3dbd85;--red:#e0685c;--yel:#dfa93c;--grn:#3dbd85;
 --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 26px rgba(0,0,0,.32)}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);display:flex;
-font:15.5px/1.6 Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-feature-settings:'tnum' 1,'cv11' 1;-webkit-font-smoothing:antialiased}
+font:15.5px/1.6 Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-feature-settings:'cv11' 1;-webkit-font-smoothing:antialiased}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 /* The click handlers run in under 6ms — everything that used to read as lag was the
    animation on top of them (David 2026-08-13: "still the slightest delay"). Selection
@@ -3821,6 +3821,10 @@ th,td{border-bottom:1px solid var(--line);padding:9px 12px;text-align:left;verti
 thead th{border-bottom:2px solid var(--line);font-weight:600;color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
 tbody tr{transition:background .1s}tbody tr:hover td{background:var(--panel)}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}td.neg{color:var(--neg)}
+/* number spacing (tnum) only on figures, never on the whole page: in Inter it gives every hyphen a
+   digit's width, so dates read "2026 - 09 - 25" (David 2026-10-07, decision:278c26c1). Tables,
+   holdings and stat tiles keep it; documents keep the reader's own split (numeric cells only). */
+table,.hrow,.kpi,.tile,.statgrid{font-variant-numeric:tabular-nums}.mdr table{font-variant-numeric:normal}
 .tklink{font-weight:600}.postable td{padding:11px 12px}.postable .price{font-weight:500}
 .chg.up{color:var(--pos)}.chg.down{color:var(--neg)}.cat{color:var(--mut);font-size:13px}
 .market{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);
