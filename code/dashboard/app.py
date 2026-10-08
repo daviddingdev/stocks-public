@@ -3568,7 +3568,7 @@ def api_search():
 
 CSS = """
 :root{--bg:#f4f6f8;--panel:#fff;--fg:#161b22;--mut:#4b5563;--fade:#7c8794;--line:#e3e7ed;
---acc:#2563eb;--accbg:#e9f0fe;--neg:#cf4444;--pos:#0e9160;--red:#cf4444;--yel:#b07d0a;--grn:#0e9160;
+--acc:#2563eb;--accbg:#e9f0fe;--neg:#cf4444;--pos:#0e9160;--red:#cf4444;--yel:#8a5f00;--grn:#0e9160;
 --shadow:0 1px 2px rgba(16,24,40,.05),0 8px 24px rgba(16,24,40,.05)}
 @media(prefers-color-scheme:dark){:root{--bg:#0c0e11;--panel:#15181d;--fg:#e8eaee;--mut:#a8b1bc;
 --fade:#828d9a;--line:#262b32;--acc:#5e97f5;--accbg:#16263e;--neg:#e0685c;--pos:#3dbd85;--red:#e0685c;--yel:#dfa93c;--grn:#3dbd85;
@@ -3804,6 +3804,7 @@ transition:border-color .12s,color .12s,background .12s;text-decoration:none}
 .btn:hover,.wbtn:hover,.connectbtn:hover{border-color:var(--acc);color:var(--acc);text-decoration:none}
 .btn.primary,.addbar button{background:var(--acc);border-color:var(--acc);color:#fff}
 .btn.primary:hover,.addbar button:hover{opacity:.92;color:#fff}
+@media(prefers-color-scheme:dark){.btn.primary,.addbar button,.btn.primary:hover,.addbar button:hover,.badge.earn{color:#0c0e11}}
 .rbtn2{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 40%,var(--line));background:var(--accbg)}
 .rbtn2:hover{border-color:var(--acc)}
 .wbtn.on{border-color:color-mix(in srgb,var(--grn) 55%,var(--line));color:var(--grn);
