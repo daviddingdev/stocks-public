@@ -1717,22 +1717,20 @@ def rec_inner():
             "<p class=muted>A strategist's weekly digest on the portfolio against your goals — "
             "generated on the Spark by a headless Claude session (Mondays 8:00 ET, or on demand).</p></div>"
             f"<div class=headactions>{btn}</div></div>")
+    # David 2026-10-17 (decision:f930e674): the "Tell the next digest something" box is retired for
+    # Mission Control's central composer. The PM writes a digest preference from an ask into
+    # feedback.json itself; runner.py rec still reads that file, shown here read-only.
     try:
         fb = json.loads(FEEDBACK.read_text()) if FEEDBACK.exists() else []
     except Exception:
         fb = []
     fbrows = "".join(f"<div class=fbitem><span class=fbdate>{html.escape(e.get('date',''))}</span>"
-                     f"<span class=fbmsg>{html.escape(e.get('msg',''))}</span>"
-                     f"<button class=rm title='withdraw' onclick='fbDel({e.get('id',0)})'>×</button></div>" for e in fb)
-    fb_w = ("<div class=widget style='margin-bottom:22px'><div class=whead><span class=wtitle>Your standing feedback"
+                     f"<span class=fbmsg>{html.escape(e.get('msg',''))}</span></div>" for e in fb)
+    fb_w = ("<div class=widget style='margin-bottom:22px'><div class=whead><span class=wtitle>Standing notes"
             "<span class=hint> — read by every future digest</span></span>"
             f"<span class=wcount>{len(fb)}</span></div><div class='wbody pad'>"
-            + (f"<div class=fblist>{fbrows}</div>" if fb else
-               "<p class='muted' style='margin:0 0 10px'>Talk to Claude indirectly: e.g. “I don't want the $75k VTI buy — stop recommending it” "
-               "or “focus ideas on industrials”. Each note is injected into every future weekly digest until you withdraw it.</p>")
-            + "<form class=fbform onsubmit='return fbSend(event)'>"
-              "<textarea id=fbmsg rows=2 placeholder='Tell the next digest something — a decline, a preference, a question…'></textarea>"
-              "<button class='btn primary' type=submit>Save note</button></form></div></div>")
+            + (f"<div class=fblist>{fbrows}</div>" if fb else "")
+            + "<p class=muted style='margin:8px 0 0'>To add, change or withdraw one: " + ASK_PM_LINK + ".</p></div></div>")
     out = [head, "<div id=rec-status class=rstatus style='display:none'></div>", fb_w]
     if not recs:
         out.append("<div class=widget><div class=pfempty2>No recommendations yet. Claude reads your investor profile, "
@@ -1761,7 +1759,7 @@ def journal_inner():
     tklist = "<datalist id=tklist>" + "".join(f"<option value='{t}'>" for t in known) + "</datalist>"
     head = ("<div class=pagehead><div><h1>Journal</h1>"
             "<p class=muted>Your dated thinking — quick notes and a decision log with thesis, expectation, and "
-            "kill-switch per trade. Claude reads all of it for context (the feedback box on /recommendation "
+            "kill-switch per trade. Claude reads all of it for context (an Ask the PM note on /recommendation "
             "<i>steers</i>; this <i>records</i> — and it's what your process gets scored on).</p></div></div>")
     nrows = "".join(
         f"<div class=fbitem><span class=fbdate>{html.escape(e.get('date',''))}</span>"
@@ -3398,24 +3396,10 @@ def board_refresh():
 def api_external():
     return jsonify(read_external())
 
-FEEDBACK = ROOT / "_engine" / "recommendations" / "feedback.json"
-
-@app.route("/api/feedback", methods=["GET", "POST"])
-def api_feedback():
-    try:
-        items = json.loads(FEEDBACK.read_text()) if FEEDBACK.exists() else []
-    except Exception:
-        items = []
-    if request.method == "POST":
-        b = request.get_json(silent=True) or {}
-        msg = (b.get("msg") or "").strip()
-        if b.get("action") == "remove":  # POST-only since PLUMB-8 (2026-09-22) — a GET just lists
-            items = [e for e in items if str(e.get("id")) != str(b.get("id", ""))]
-            FEEDBACK.write_text(json.dumps(items, indent=2))
-        elif msg:
-            items.append({"id": int(time.time() * 1000), "date": dt.date.today().isoformat(), "msg": msg[:1000]})
-            FEEDBACK.write_text(json.dumps(items, indent=2))
-    return jsonify(items)
+FEEDBACK = ROOT / "_engine" / "recommendations" / "feedback.json"   # read-only here; the PM writes it (decision:f930e674)
+# Mission Control's central composer, addressed to the PM, carrying the page it was opened from.
+ASK_PM_LINK = ("<a class=askpm href='#' target=_blank rel=noopener onclick='return askPM(this)'>"
+               "Ask the PM</a>")
 
 @app.route("/api/research/archive", methods=["POST"])
 def api_archive():
@@ -4382,11 +4366,7 @@ function archiveResearch(e,tk){e.stopPropagation();e.preventDefault();
  post('/api/research/archive?ticker='+encodeURIComponent(tk)).then(function(r){return r.json()}).then(function(d){
   toast(d.msg||'done');if(d.ok)nav(location.pathname.indexOf('/research')===0?here():'/ticker/'+tk,false);
  }).catch(function(){toast('error');});}
-function fbSend(e){e.preventDefault();var t=document.getElementById('fbmsg'),v=t.value.trim();if(!v)return false;
- fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:v})})
-  .then(function(){toast('Saved — every future digest will honor it');nav('/recommendation',false);}).catch(function(){toast('error');});
- return false;}
-function fbDel(id){postJson('/api/feedback',{action:'remove',id:id}).then(function(){toast('Note withdrawn');nav('/recommendation',false);});}
+function askPM(a){a.href='http://'+location.hostname+':8900/#ask?to=stocks&ctx='+encodeURIComponent(location.href);return true;}
 function toggleWatch(e,tk){e.stopPropagation();var b=e.target,on=b.classList.contains('on'),act=on?'remove':'add';
  postJson('/api/watchlist',{action:act,ticker:tk}).then(function(){b.classList.toggle('on');b.textContent=on?'+ Watchlist':'✓ Watching';toast(tk+(on?' removed':' added'));});}
 function doAdd(e){e.preventDefault();var v=document.getElementById('addtk').value.trim().toUpperCase();if(v)addWatch(v,function(){nav(here(),false);});return false;}
