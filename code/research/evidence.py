@@ -32,8 +32,11 @@ import urllib.request
 ROOT = Path("~/Stocks").expanduser()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from edgar_identity import UA  # SEC contact identity, config-driven
-KEY_FORMS = ["10-K", "10-Q", "DEF 14A", "8-K"]
-N_PER_FORM = {"10-K": 1, "10-Q": 3, "DEF 14A": 1, "8-K": 5}
+# a foreign private issuer files a 20-F a year and furnishes 6-Ks (results, AGM, deals) in
+# place of the 10-K/10-Q/8-K set; a US filer has none, so its picks are unchanged (SRAD 2026-10-25)
+KEY_FORMS = ["10-K", "10-Q", "DEF 14A", "8-K", "20-F", "6-K"]
+N_PER_FORM = {"10-K": 1, "10-Q": 3, "DEF 14A": 1, "8-K": 5, "20-F": 1, "6-K": 6}
+ANNUAL_FORMS = ("10-K", "20-F")
 # XBRL us-gaap tags worth a time series (first match wins per concept)
 FACT_MAP = {
     "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -51,6 +54,22 @@ FACT_MAP = {
     "sga": ["SellingGeneralAndAdministrativeExpense"],
     "nci": ["NetIncomeLossAttributableToNoncontrollingInterest"],
 }
+# the same concepts for a 20-F filer, whose companyfacts carry ifrs-full and no us-gaap
+IFRS_FACT_MAP = {
+    "revenue": ["Revenue", "RevenueFromContractsWithCustomers"],
+    "net_income": ["ProfitLoss"],
+    "op_income": ["ProfitLossFromOperatingActivities"],
+    "cfo": ["CashFlowsFromUsedInOperatingActivities"],
+    "capex": ["PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+              "PurchaseOfPropertyPlantAndEquipment"],
+    "cash": ["CashAndCashEquivalents"],
+    "debt": ["NoncurrentPortionOfNoncurrentBorrowings", "LongtermBorrowings", "Borrowings"],
+    "equity": ["Equity", "EquityAttributableToOwnersOfParent"],
+    "shares": ["NumberOfSharesOutstanding", "WeightedAverageShares"],
+    "rnd": ["ResearchAndDevelopmentExpense"],
+    "sga": ["SellingGeneralAndAdministrativeExpense"],
+    "nci": ["ProfitLossAttributableToNoncontrollingInterests"],
+}
 # per-concept history floor: a straight recency cap starves FY 10-K rows on names with
 # heavy 10-Q comparative restatements (AMRC's cap held 3 FYs where the teardown quoted 8,
 # hunt ask evidence.py-164) — reserve slots for FY 10-K rows separately from the rest.
@@ -65,6 +84,8 @@ OTHER_KEEP = 16
 FY_DAYS = (350, 380)
 Q_DAYS = (80, 100)
 ITEM_RE = re.compile(r"(?im)^\s*(item\s+(?:1a?|2|3|5|7a?|8|9a?)\.?[^\n]{0,80})$")
+# 20-F: key info + risk factors, the business, OFR, directors, holders, legal, controls, statements
+ITEM_20F_RE = re.compile(r"(?im)^\s*(item\s+(?:3|4|5|6|7|8|10|15|18)\.?[^\n]{0,80})$")
 
 
 def get(url, binary=False):
@@ -99,36 +120,69 @@ def pick_series(gaap, tags):
     best = None
     for tag in tags:
         units = gaap.get(tag, {}).get("units", {})
-        series = tidy_series(units.get("USD") or units.get("shares") or [])
+        series = tidy_series(_money(units) or units.get("shares") or [])
         if series and (best is None or series[-1]["end"] > best[1][-1]["end"]):
             best = (tag, series)
     return best
 
 
+def _money(units):
+    """A tag's money rows: USD first, else the one currency a foreign filer reports in.
+    Sportradar's companyfacts carry EUR only, which a USD-only lookup read as no data at all."""
+    if units.get("USD"):
+        return units["USD"]
+    return next((v for k, v in units.items() if re.fullmatch(r"[A-Z]{3}", k)), None)
+
+
+def money_unit(gaap, tags):
+    """The currency code pick_series would read for the first of `tags` that has one."""
+    for tag in tags:
+        units = gaap.get(tag, {}).get("units", {})
+        if units.get("USD"):
+            return "USD"
+        cur = next((k for k in units if re.fullmatch(r"[A-Z]{3}", k)), None)
+        if cur:
+            return cur
+    return None
+
+
 def tidy_series(vals):
-    """One tag's companyfacts rows -> the facts.json series: a 10-K duration row only when
+    """One tag's companyfacts rows -> the facts.json series: a 10-K/20-F duration row only when
     it spans a full year, a 10-Q duration row only when it spans one quarter, deduped on
     (start, end, fp) so no period can overwrite another that shares its end date."""
     seen = {}
     for v in vals:
-        if v.get("form") not in ("10-K", "10-Q") or not v.get("end"):
+        if v.get("form") not in ANNUAL_FORMS + ("10-Q",) or not v.get("end"):
             continue
         if v.get("start"):
             try:
                 days = (dt.date.fromisoformat(v["end"]) - dt.date.fromisoformat(v["start"])).days
             except ValueError:
                 continue
-            lo, hi = FY_DAYS if v["form"] == "10-K" else Q_DAYS
+            lo, hi = FY_DAYS if v["form"] in ANNUAL_FORMS else Q_DAYS
             if not lo <= days <= hi:
                 continue
         key = (v.get("start"), v["end"], v.get("fp", ""))
         seen[key] = {"start": v.get("start"), "end": v["end"], "val": v["val"], "fy": v.get("fy"),
                      "fp": v.get("fp"), "form": v.get("form"), "filed": v.get("filed")}
-    fy10k = sorted((r for r in seen.values() if r["fp"] == "FY" and r["form"] == "10-K"),
+    fy10k = sorted((r for r in seen.values() if r["fp"] == "FY" and r["form"] in ANNUAL_FORMS),
                    key=lambda x: x["end"])[-FY_KEEP:]
-    other = sorted((r for r in seen.values() if not (r["fp"] == "FY" and r["form"] == "10-K")),
+    other = sorted((r for r in seen.values() if not (r["fp"] == "FY" and r["form"] in ANNUAL_FORMS)),
                    key=lambda x: x["end"])[-OTHER_KEEP:]
     return sorted(fy10k + other, key=lambda x: x["end"])
+
+
+def sixk_exhibits(cik, acc):
+    """A 6-K's primary document is a cover page; the results release, slides and deal
+    announcements are its EX-99 exhibits. Their stripped text, to append to the cover."""
+    folder = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}"
+    items = json.loads(get(f"{folder}/index.json"))["directory"]["item"]
+    out = []
+    for it in items:
+        n = it["name"]
+        if re.search(r"ex[-_]?99", n, re.I) and n.lower().endswith((".htm", ".html", ".txt")):
+            out.append(f"\n\n===== {n} =====\n\n" + strip_html(get(f"{folder}/{n}")))
+    return "".join(out)
 
 
 def build(tk, skip_local=False):
@@ -155,8 +209,12 @@ def build(tk, skip_local=False):
     # or the Bench corpus (2,491 filers) use the identical <date>_<FORM>.txt name; reading it
     # from disk saves the download and the strip (David 2026-09-04: "repeat work")
     agent = Path(__file__).resolve().parent.parent / "agent"
+    used = set()
     for f in picked:
         fname = f"{f['date']}_{f['form'].replace(' ', '').replace('/', '')}.txt"
+        if fname in used:   # two same-form filings on one day: SRAD's 6-Ks of 2026-04-28 overwrote
+            fname = f"{fname[:-4]}_{f['acc'][-6:]}.txt"
+        used.add(fname)
         local = next((p for p in (agent / "names" / tk / "filings" / fname,
                                   agent / "data" / "bench_corpus" / tk / fname) if p.exists()), None)
         if local:
@@ -169,6 +227,8 @@ def build(tk, skip_local=False):
             url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{f['acc'].replace('-', '')}/{f['doc']}"
             try:
                 txt = strip_html(get(url))
+                if f["form"] == "6-K":
+                    txt += sixk_exhibits(cik, f["acc"])
             except Exception as e:
                 f["error"] = str(e)[:80]
                 continue
@@ -177,19 +237,24 @@ def build(tk, skip_local=False):
         if len(txt) > 3_000_000:
             txt = txt[:3_000_000]
             f["truncated"] = True
-        name = f"{f['date']}_{f['form'].replace(' ', '').replace('/', '')}.txt"
+        name = fname
         (ev / "filings" / name).write_text(txt)
         f["file"] = f"filings/{name}"
         f["chars"] = len(txt)
+        item_re = ITEM_20F_RE if f["form"] == "20-F" else ITEM_RE
         sections[name] = [{"item": m.group(1).strip()[:70], "offset": m.start()}
-                          for m in ITEM_RE.finditer(txt)][:40]
+                          for m in item_re.finditer(txt)][:40]
 
     # --- XBRL facts -> tidy series ---
     facts_out = {}
     try:
         cf = json.loads(get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"))
-        gaap = cf.get("facts", {}).get("us-gaap", {})
-        for concept, tags in FACT_MAP.items():
+        gaap, fmap = cf.get("facts", {}).get("us-gaap", {}), FACT_MAP
+        if not gaap and cf.get("facts", {}).get("ifrs-full"):
+            gaap, fmap = cf["facts"]["ifrs-full"], IFRS_FACT_MAP
+            facts_out["_taxonomy"] = "ifrs-full"
+            facts_out["_currency"] = money_unit(gaap, fmap["revenue"])
+        for concept, tags in fmap.items():
             best = pick_series(gaap, tags)
             if best:
                 facts_out[concept] = {"tag": best[0], "series": best[1]}
@@ -201,8 +266,8 @@ def build(tk, skip_local=False):
     # FY2025 10-K, hunt ask evidence.py-160). Cross-check the pack's own filing list against
     # the distinct "filed" dates the companyfacts API actually returned.
     tenk_filed = {row.get("filed") for d in facts_out.values() if isinstance(d, dict)
-                  for row in d.get("series", []) if row.get("form") == "10-K"}
-    xbrl_gaps = [f["date"] for f in picked if f["form"] == "10-K" and f["date"] not in tenk_filed]
+                  for row in d.get("series", []) if row.get("form") in ANNUAL_FORMS}
+    xbrl_gaps = [f["date"] for f in picked if f["form"] in ANNUAL_FORMS and f["date"] not in tenk_filed]
 
     # a capex tag that resolves to well under 1% of CFO is very likely the wrong series for
     # an asset-owning issuer (PaymentsToAcquirePropertyPlantAndEquipment catching only office
@@ -241,6 +306,11 @@ def build(tk, skip_local=False):
         idx.append("")
     for w in warnings:
         idx.append(f"**WARNING: {w}**")
+        idx.append("")
+    if facts_out.get("_taxonomy") == "ifrs-full":
+        idx.append(f"**IFRS filer (20-F/6-K): facts.json carries ifrs-full tags and its money values "
+                   f"are in {facts_out.get('_currency') or 'the reporting currency'}, not USD. Quarterly "
+                   f"figures are in the 6-K results exhibits, not in XBRL.**")
         idx.append("")
     idx += ["## Financial series (facts.json)",
             ", ".join(k for k in facts_out if not k.startswith("_")) or "(XBRL fetch failed)",
