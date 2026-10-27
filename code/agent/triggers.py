@@ -344,6 +344,18 @@ def run(dry=False):
             books.append("Agent")
         return " · ".join(parts), "+".join(books)
 
+    # The event sleeve's symbols (mode.event_sleeve_symbols, 2026-10-26) are traded by
+    # event_trader.py's own stop/take/reaction rules and refused to the PM (EVENT_SLEEVE_OWNED):
+    # a price move still ALERTS but never launches a PM session (rule 1), rule 6's re-underwrite
+    # skips them (the sleeve's stop owns its drawdown), and rule 8 alerts without an action.
+    # Rule 4's book drawdown counts them and alerts as before; it launches nothing.
+    try:
+        sys.path.insert(0, str(ENGINE))
+        import mode as _m
+        sleeve = _m.event_sleeve_symbols()
+    except Exception:
+        sleeve = set()
+
     # --- 1: price moves on HELD names only (watchlist noise removed 2026-07-30) ---
     for tk in held:
         q = feeds.fh_get("quote", symbol=tk) or {}
@@ -369,7 +381,7 @@ def run(dry=False):
             if mv:
                 msg += f" — {mv}"
             fired += alert(state, c, f"move:{tk}", "price move", tk, msg,
-                           action=is_agent, book=book)
+                           action=is_agent and tk not in sleeve, book=book)
 
     # --- 1b: named price levels (sell/entry plans) — config "price_levels" ---
     for tk, lv in level_plans(c).items():
@@ -533,7 +545,7 @@ def run(dry=False):
     # must re-derive the thesis from documents FIRST, then read its own memos.
     for tk, p in ag_pos.items():
         pnl_pct = p.get("pnl_pct")
-        if pnl_pct is None:
+        if pnl_pct is None or tk in sleeve:     # the sleeve's stop owns its drawdown
             continue
         # pnl_pct (from portfolio.json, via mcp_sync) is price-vs-cost only — it doesn't know
         # about cash already paid out. Add distributions received back as a % of cost so a
@@ -596,7 +608,7 @@ def run(dry=False):
         fresh = _trading_days_since(_kpi_set_ts(tk, b["kpi"])) < 1
         fired += alert(state, c, f"kpi:{tk}:{b['kpi']}", "kpi breach", tk,
                        f"{tk} {b['kpi']} {vs} vs expect {b['expect']} — {b['why']}",
-                       action=(tk in ag_pos and not fresh), book=book)
+                       action=(tk in ag_pos and not fresh and tk not in sleeve), book=book)
 
     # --- 9: buy_below price alert from every researched name's lenses.json (added
     # 2026-09-08, pm-167) — STRATEGY-PROPOSAL-v3 §7 stage 6 turns a verdict >=25% from

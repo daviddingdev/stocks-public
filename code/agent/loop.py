@@ -128,10 +128,22 @@ def lab_mode_block():
         m = _labmode.read()
     except Exception:
         return "LAB MODE: build (mode.py unavailable — assume full mandate)."
+    sleeve_txt = ""
+    try:
+        owned = sorted(_labmode.event_sleeve_symbols())
+        if owned:
+            sleeve_txt = (f" THE EVENT SLEEVE ({', '.join(owned)}; MANDATE.md 'Event sleeve', David 2026-10-26) IS NOT YOURS: "
+                          "agent/event_trader.py trades it from a written playbook. Do not trade those symbols (the gateway "
+                          "refuses you, EVENT_SLEEVE_OWNED), do not count them as held names when deciding the book is "
+                          "closed (the closing stance says what the sleeve still holds), and leave the cash the sleeve "
+                          "reserved (`python3 ~/Stocks/_engine/agent/event_trader.py status`; an SGOV sweep that would "
+                          "spend it is refused, EVENT_SLEEVE_RESERVED).")
+    except Exception:
+        pass
     if m["lab"] == "build":
-        return "LAB MODE: build — the full MANDATE applies."
+        return "LAB MODE: build — the full MANDATE applies." + sleeve_txt
     if m["lab"] == "lean":
-        return (f"LAB MODE: LEAN (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+        return (f"LAB MODE: LEAN (set {(m.get('since') or '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
                 "That note is from the day the mode was set; David AMENDED it on 2026-09-21 and the "
                 "amendment is what follows, so read the staffing below over the note above. "
                 "The full MANDATE applies to your trades and you run daily as before. What changed is your STAFF. "
@@ -143,9 +155,9 @@ def lab_mode_block():
                 "streams have the night GPU. So: verify numbers from the fincards yourself on any name the analyst "
                 "would have re-underwritten, file asks only when they block a trade (they queue for a build week; "
                 "nobody reads them tomorrow), do not file research or extra strategy sessions, and say in one "
-                "paragraph of the session log what a fully staffed desk would have caught that you could not.")
+                "paragraph of the session log what a fully staffed desk would have caught that you could not.") + sleeve_txt
     if m["lab"] == "winddown":
-        return (f"LAB MODE: WINDDOWN (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+        return (f"LAB MODE: WINDDOWN (set {(m.get('since') or '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
                 "David is closing this book: read DIRECTIVES.md 2026-09-29 and STRATEGY.md §W before anything else. "
                 "You buy NOTHING except the cash sleeve (SGOV). The gateway refuses every other buy, whether a new "
                 "name or an add (safety.py LAB_MODE_NO_NEW_POSITIONS / LAB_MODE_NO_ADDS, both HARD). A session is "
@@ -158,16 +170,16 @@ def lab_mode_block():
                 "an order-guard cancel lands on a held name. No origination (no funnel, EDGAR passes, parks or "
                 "bench questions), no staff management, no strategy or research sessions, no asks unless one "
                 "blocks an exit. When the last held name other than SGOV is sold, write one closing BOOK.md "
-                "stance. David then re-evaluates the project.")
+                "stance. David then re-evaluates the project.") + sleeve_txt
     day = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}.get(_labmode.pm_day(), "the scheduled day")
-    return (f"LAB MODE: {m['lab'].upper()} (set {m.get('since', '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
+    return (f"LAB MODE: {m['lab'].upper()} (set {(m.get('since') or '?')[:10]} by {m.get('by', '?')}; {m.get('note', '') or 'no note'}). "
             "David has put this book at minimum capacity while the desk's resources go to his own books. "
             "You open NO NEW POSITION: the execution gateway refuses a buy on any symbol not already held "
             "(safety.py LAB_MODE_NO_NEW_POSITIONS, HARD). Sells, trims and adds to held names are yours as before. "
             f"You run once a week ({day}) plus a session when a trigger trips; there is no nightly analyst except "
             "before your day, so re-underwrite from the fincards yourself when a held name moves. Do not file "
             "strategy sessions or new research; file asks that matter to the exits and say what you would have "
-            "done with a full mandate in one paragraph of the session log.")
+            "done with a full mandate in one paragraph of the session log.") + sleeve_txt
 
 
 # NYSE full-day closures for 2026 — the trade cron does not know a holiday from a Monday.

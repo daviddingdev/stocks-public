@@ -357,6 +357,24 @@ ROLES = [
         "charter": [],
     },
     {
+        # NEW 2026-10-26 (David, after Lula's re-election: "programmatic monitoring of these
+        # news/triggers to instantly trade when something occurs ... use the 5k in brokerb")
+        "id": "event_trader", "name": "event trader — playbook execution",
+        "who": "pure code · local model reads headlines · zero Claude tokens",
+        "cron": "event_trader.py run",
+        "purpose": "Executes a playbook written in advance (journal/event/<id>.json + memo) the moment "
+                   "its trigger fires — Copom decision, a confirmed appointment, a price — through "
+                   "execute.py, inside the capped, dated event sleeve (mode.py). One long-lived process, "
+                   "a pass every 1-5 s; cron restarts it within a minute.",
+        "reads": ["_engine/agent/journal/event/", "BCB comunicados API", "Google News RSS",
+                  "Brazilian outlets' RSS (Folha, Estadão, Globo, Poder360, Metrópoles, Agência Brasil, ...)",
+                  "_engine/agent/data/portfolio.json"],
+        "writes": ["_engine/agent/data/event_state.json", "_engine/agent/data/event_log.jsonl",
+                   "_engine/agent/data/event_run.json", "_engine/agent/data/orders.db", "phone (notify.sh)"],
+        "charter": ["never writes a playbook or a memo; a session with David does",
+                    "buys only sleeve symbols, with the playbook memo, under the sleeve cap (safety.py)"],
+    },
+    {
         "id": "feeds", "name": "feeds + relevance — intel collection and scoring",
         "who": "code fetches · local model scores · zero Claude tokens",
         "cron": "feeds.py refresh",
@@ -710,8 +728,8 @@ def _dow_text(field):
 
 
 def _hour_text(minute, hour):
-    if minute.startswith("*/"):
-        every = f"every {minute[2:]} min"
+    if minute == "*" or minute.startswith("*/"):
+        every = "every minute" if minute == "*" else f"every {minute[2:]} min"
         if hour == "*":
             return f"{every}, all day"
         if "-" in hour and hour.replace("-", "").isdigit():
