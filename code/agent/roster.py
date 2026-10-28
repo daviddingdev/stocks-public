@@ -375,6 +375,36 @@ ROLES = [
                     "buys only sleeve symbols, with the playbook memo, under the sleeve cap (safety.py)"],
     },
     {
+        # NEW 2026-10-28 (David 10-27: "let's also add something to track us brazil tensions to incorporate")
+        "id": "us_tensions", "name": "US-Brazil tensions watch — official US actions",
+        "who": "pure code · zero Claude tokens · no GPU",
+        "cron": "us_tensions.py run",
+        "purpose": "Every 10 minutes, reads only what the US government publishes (White House presidential "
+                   "actions, Federal Register public inspection, State, USTR, OFAC) and sorts each item naming "
+                   "Brazil: punitive (a new US measure: critical push, and the event playbook's `watch` trigger "
+                   "disarms its buys), review, relief, mention or routine. Never trades.",
+        "reads": ["White House presidential actions RSS", "Federal Register public-inspection API",
+                  "State Department press releases RSS", "USTR RSS", "OFAC recent actions"],
+        "writes": ["_engine/agent/data/us_tensions.json", "_engine/agent/data/us_tensions_log.jsonl", "phone (notify.sh)"],
+        "charter": ["official sources only: a US measure exists when the US government publishes it",
+                    "never trades and never takes the engine's lock; anything ambiguous is `review`, never `punitive`"],
+    },
+    {
+        # NEW 2026-10-28 (David 10-27: "let's mainly follow if what we built works and if our thesis had any merit")
+        "id": "event_score", "name": "event sleeve scorecard — engine and thesis",
+        "who": "pure code · zero Claude tokens",
+        "cron": "event_score.py update",
+        "purpose": "Daily: the event engine's own record (detection, order and fill latency, slippage, written "
+                   "actions done, errors) and the thesis's (forecasts registered before the events, Brier against "
+                   "the market's odds; each signal's move for the rules as run and as first written). One push "
+                   "when the window has closed.",
+        "reads": ["_engine/agent/data/event_state.json", "_engine/agent/data/event_log.jsonl",
+                  "_engine/agent/data/us_tensions.json", "_engine/agent/journal/event/",
+                  "Yahoo daily charts (EWZ, EEM, SGOV)"],
+        "writes": ["_engine/agent/data/event_score.json", "_engine/agent/data/event_prices.json", "phone (notify.sh)"],
+        "charter": ["scores calibration and rule-following; P&L over two or three events is anecdote, said so in the report"],
+    },
+    {
         "id": "feeds", "name": "feeds + relevance — intel collection and scoring",
         "who": "code fetches · local model scores · zero Claude tokens",
         "cron": "feeds.py refresh",
